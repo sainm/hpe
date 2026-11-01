@@ -1,16 +1,36 @@
+# Rust
 /target
+
+# Node / pnpm / turbo
 /node_modules
+node_modules/
 /dist
+dist/
 /build
 /coverage
-node_modules/
-dist/
 coverage/
+.turbo/
+*.tsbuildinfo
+
+# VS Code extension
 .vscode-test/
+*.vsix
+
+# Local runtime data, logs and secrets
 /.hpa
+*.log
 /.env
 /.env.*
 !.env.example
+
+# Agent workspace data (local memory, caches)
+/.workbuddy/
+/.claude/
+/.idea/
+/.vscode/
+
+# OS noise
 .DS_Store
+
+# Root npm lockfile is an artifact of `npm install`; the workspace uses pnpm
 package-lock.json
-*.vsix
