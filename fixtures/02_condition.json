@@ -1,0 +1,28 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_condition",
+  "name": "Condition",
+  "description": "branch on input amount",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "amount", "type": "number", "required": true }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    { "id": "check", "type": "condition", "typeVersion": "1.0.0", "config": { "condition": { "$expr": ".input.amount > 1000" } }, "ui": { "x": 200, "y": 0 } },
+    { "id": "high", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "band": "high" } }, "ui": { "x": 420, "y": -80 } },
+    { "id": "low", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "band": "low" } }, "ui": { "x": 420, "y": 80 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 680, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "check", "targetPort": "in" },
+    { "id": "e2", "source": "check", "sourcePort": "true", "target": "high", "targetPort": "in" },
+    { "id": "e3", "source": "check", "sourcePort": "false", "target": "low", "targetPort": "in" },
+    { "id": "e4", "source": "high", "sourcePort": "out", "target": "end", "targetPort": "in" },
+    { "id": "e5", "source": "low", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

@@ -1,0 +1,10 @@
+.vscode/**
+node_modules/**
+src/**
+test/**
+coverage/**
+esbuild.mjs
+tsconfig.json
+vitest.config.ts
+hpa-workbench.vsix
+**/*.map

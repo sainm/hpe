@@ -1,0 +1,43 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_switch",
+  "name": "Switch",
+  "description": "three-way switch",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "kind", "type": "string", "required": true }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "route",
+      "type": "switch",
+      "typeVersion": "1.0.0",
+      "config": {
+        "cases": [
+          { "port": "case_a", "condition": { "$expr": ".input.kind == \"a\"" } },
+          { "port": "case_b", "condition": { "$expr": ".input.kind == \"b\"" } }
+        ],
+        "defaultPort": "default"
+      },
+      "ui": { "x": 200, "y": 0 }
+    },
+    { "id": "a", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "result": "A" } }, "ui": { "x": 420, "y": -100 } },
+    { "id": "b", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "result": "B" } }, "ui": { "x": 420, "y": 0 } },
+    { "id": "other", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "result": "OTHER" } }, "ui": { "x": 420, "y": 100 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 700, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "route", "targetPort": "in" },
+    { "id": "e2", "source": "route", "sourcePort": "case_a", "target": "a", "targetPort": "in" },
+    { "id": "e3", "source": "route", "sourcePort": "case_b", "target": "b", "targetPort": "in" },
+    { "id": "e4", "source": "route", "sourcePort": "default", "target": "other", "targetPort": "in" },
+    { "id": "e5", "source": "a", "sourcePort": "out", "target": "end", "targetPort": "in" },
+    { "id": "e6", "source": "b", "sourcePort": "out", "target": "end", "targetPort": "in" },
+    { "id": "e7", "source": "other", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

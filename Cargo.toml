@@ -1,0 +1,41 @@
+[workspace]
+resolver = "3"
+members = ["crates/hpa-core", "crates/hpa-local", "crates/hpa-skill"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+publish = false
+
+[workspace.dependencies]
+axum = { version = "0.8.9", features = ["json", "tokio", "http1", "tracing"] }
+base64 = "0.22"
+clap = { version = "4.6.7", features = ["derive"] }
+ed25519-dalek = "2.2"
+getrandom = "0.2"
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+hpa-core = { path = "crates/hpa-core" }
+hpa-skill = { path = "crates/hpa-skill" }
+jaq-core = "3.1.2"
+jaq-json = { version = "2.0.3", features = ["serde"] }
+jaq-std = "3.0.4"
+jsonschema = { version = "0.60.2", default-features = false }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "http2", "charset", "stream", "form"] }
+rust-embed = "8.13.0"
+saphyr = "0.3.3"
+serde = { version = "1.0.229", features = ["derive"] }
+semver = "1"
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9.0", features = ["runtime-tokio", "sqlite-bundled", "migrate", "uuid", "time", "json", "macros"] }
+tar = "0.4"
+thiserror = "2.0.17"
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process", "fs", "net", "io-util", "io-std"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6.8", features = ["trace", "cors", "fs", "compression-gzip"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.29.0", features = ["v7", "serde"] }

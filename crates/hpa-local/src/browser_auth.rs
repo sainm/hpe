@@ -1,0 +1,1109 @@
+use std::fmt;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::Url;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
+
+use crate::enterprise_ops::{OidcPrincipal, OpsError, OpsService};
+
+const SESSION_COOKIE: &str = "hpa_session";
+const FLOW_TTL_MS: i64 = 600_000;
+const DEFAULT_SCOPES: &str = "openid email profile";
+const DEFAULT_SESSION_TTL: i64 = 28_800;
+const MIN_SESSION_TTL: i64 = 300;
+const MAX_SESSION_TTL: i64 = 604_800;
+
+#[derive(Clone)]
+pub struct BrowserAuth {
+    control: SqlitePool,
+    ops: OpsService,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct SessionPrincipal {
+    pub session_id: String,
+    pub csrf_token: String,
+    pub tenant_id: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub role: String,
+    pub platform_admin: bool,
+    pub expires_at: i64,
+}
+
+pub struct LoginStart {
+    pub location: String,
+}
+
+pub struct LoginResult {
+    pub principal: SessionPrincipal,
+    pub cookie: String,
+    pub redirect: String,
+}
+
+#[derive(Debug)]
+pub enum BrowserAuthError {
+    Invalid(String),
+    NotFound(String),
+    Forbidden(String),
+    Upstream(String),
+    Db(sqlx::Error),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for BrowserAuthError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(message) => write!(formatter, "invalid browser auth request: {message}"),
+            Self::NotFound(message) => {
+                write!(formatter, "browser auth resource not found: {message}")
+            }
+            Self::Forbidden(message) => write!(formatter, "browser auth forbidden: {message}"),
+            Self::Upstream(message) => write!(formatter, "browser auth upstream error: {message}"),
+            Self::Db(error) => write!(formatter, "browser auth database error: {error}"),
+            Self::Json(error) => write!(formatter, "browser auth json error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for BrowserAuthError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Db(error) => Some(error),
+            Self::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<sqlx::Error> for BrowserAuthError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl From<serde_json::Error> for BrowserAuthError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Clone)]
+pub struct BrowserConfig {
+    pub client_id: String,
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub redirect_uri: String,
+    pub scopes: String,
+    pub admin_subjects: Vec<String>,
+    pub cookie_secure: bool,
+    pub session_ttl_seconds: i64,
+}
+
+impl BrowserConfig {
+    fn from_value(value: &Value) -> Option<Self> {
+        let text = |name: &str| value.get(name).and_then(Value::as_str).unwrap_or("");
+        let client_id = text("clientId");
+        let authorization_endpoint = text("authorizationEndpoint");
+        let token_endpoint = text("tokenEndpoint");
+        let redirect_uri = text("redirectUri");
+        if text("issuer").is_empty()
+            || text("audience").is_empty()
+            || text("jwksUrl").is_empty()
+            || client_id.is_empty()
+            || authorization_endpoint.is_empty()
+            || token_endpoint.is_empty()
+            || redirect_uri.is_empty()
+        {
+            return None;
+        }
+        let admin_subjects = value
+            .get("adminSubjects")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let scopes = text("scopes");
+        let session_ttl_seconds = value
+            .get("sessionTtlSeconds")
+            .and_then(Value::as_i64)
+            .filter(|ttl| (MIN_SESSION_TTL..=MAX_SESSION_TTL).contains(ttl))
+            .unwrap_or(DEFAULT_SESSION_TTL);
+        Some(Self {
+            client_id: client_id.to_string(),
+            authorization_endpoint: authorization_endpoint.to_string(),
+            token_endpoint: token_endpoint.to_string(),
+            redirect_uri: redirect_uri.to_string(),
+            scopes: if scopes.is_empty() {
+                DEFAULT_SCOPES.to_string()
+            } else {
+                scopes.to_string()
+            },
+            admin_subjects,
+            cookie_secure: value
+                .get("cookieSecure")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            session_ttl_seconds,
+        })
+    }
+}
+
+struct StoredFlow {
+    code_verifier: String,
+    nonce: String,
+    redirect: String,
+}
+
+struct MemberRecord {
+    display_name: String,
+    role: String,
+    status: String,
+}
+
+struct CreatedSession {
+    id: String,
+    token: String,
+    csrf_token: String,
+    expires_at: i64,
+}
+
+impl BrowserAuth {
+    pub fn new(control: SqlitePool, ops: OpsService) -> Self {
+        Self { control, ops }
+    }
+
+    pub async fn ensure_schema(&self) -> Result<(), BrowserAuthError> {
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS enterprise_auth_flows (
+                state_hash TEXT PRIMARY KEY,
+                code_verifier TEXT NOT NULL,
+                nonce TEXT NOT NULL,
+                redirect TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&self.control)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS enterprise_sessions (
+                id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL UNIQUE,
+                csrf_token TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                email TEXT,
+                display_name TEXT,
+                role TEXT NOT NULL,
+                platform_admin INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                revoked_at INTEGER,
+                last_seen_at INTEGER
+            )",
+        )
+        .execute(&self.control)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS enterprise_sessions_tenant
+             ON enterprise_sessions (tenant_id, created_at DESC)",
+        )
+        .execute(&self.control)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn begin_login(
+        &self,
+        redirect: Option<&str>,
+    ) -> Result<LoginStart, BrowserAuthError> {
+        let config = self
+            .config()
+            .await?
+            .ok_or_else(|| BrowserAuthError::Invalid("sso_unavailable".to_string()))?;
+        let redirect = validate_redirect(redirect)?;
+        let state = random_token()?;
+        let nonce = random_token()?;
+        let code_verifier = random_token()?;
+        let challenge = pkce_challenge(&code_verifier);
+        let state_hash = sha256_hex(state.as_bytes());
+        let now = now_ms();
+        let inserted = sqlx::query(
+            "INSERT INTO enterprise_auth_flows
+             (state_hash, code_verifier, nonce, redirect, created_at, expires_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(state_hash) DO NOTHING",
+        )
+        .bind(&state_hash)
+        .bind(&code_verifier)
+        .bind(&nonce)
+        .bind(&redirect)
+        .bind(now)
+        .bind(now + FLOW_TTL_MS)
+        .execute(&self.control)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(BrowserAuthError::Invalid("state_collision".to_string()));
+        }
+        let mut url = Url::parse(&config.authorization_endpoint)
+            .map_err(|_| BrowserAuthError::Invalid("sso_unavailable".to_string()))?;
+        url.set_fragment(None);
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &config.client_id)
+            .append_pair("redirect_uri", &config.redirect_uri)
+            .append_pair("scope", &config.scopes)
+            .append_pair("state", &state)
+            .append_pair("nonce", &nonce)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        Ok(LoginStart {
+            location: url.to_string(),
+        })
+    }
+
+    pub async fn complete_login(
+        &self,
+        code: &str,
+        state: &str,
+    ) -> Result<LoginResult, BrowserAuthError> {
+        if code.trim().is_empty() {
+            return Err(BrowserAuthError::Invalid("code_invalid".to_string()));
+        }
+        if state.trim().is_empty() {
+            return Err(BrowserAuthError::Invalid("state_invalid".to_string()));
+        }
+        let flow = self.take_flow(state).await?;
+        let redirect = validate_redirect(Some(&flow.redirect))?;
+        let config = self
+            .config()
+            .await?
+            .ok_or_else(|| BrowserAuthError::Invalid("sso_unavailable".to_string()))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+        let form = [
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", config.redirect_uri.as_str()),
+            ("client_id", config.client_id.as_str()),
+            ("code_verifier", flow.code_verifier.as_str()),
+        ];
+        let response = client
+            .post(&config.token_endpoint)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .form(&form)
+            .send()
+            .await
+            .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(BrowserAuthError::Upstream(
+                "token endpoint rejected the authorization code".to_string(),
+            ));
+        }
+        let document: Value = response
+            .json()
+            .await
+            .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+        let id_token = document
+            .get("id_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                BrowserAuthError::Upstream("token response has no id_token".to_string())
+            })?;
+        let principal: OidcPrincipal = self
+            .ops
+            .verify_id_token(id_token, &flow.nonce)
+            .await
+            .map_err(browser_ops_error)?;
+        self.ensure_active_tenant(&principal.tenant_id).await?;
+        let member = self
+            .find_member(
+                &principal.tenant_id,
+                &principal.subject,
+                principal.email.as_deref(),
+            )
+            .await?;
+        let mut role = principal.role.clone();
+        let mut display_name = principal.name.clone();
+        if let Some(member) = &member {
+            if member.status != "active" {
+                return Err(BrowserAuthError::Forbidden("member_disabled".to_string()));
+            }
+            role = member.role.clone();
+            if !member.display_name.trim().is_empty() {
+                display_name = Some(member.display_name.clone());
+            }
+        }
+        let platform_admin = is_platform_admin(
+            &config.admin_subjects,
+            &principal.subject,
+            principal.email.as_deref(),
+        );
+        let display_name = display_name
+            .or_else(|| principal.email.clone())
+            .unwrap_or_else(|| principal.subject.clone());
+        let session = self
+            .insert_session(
+                &principal.tenant_id,
+                &principal.subject,
+                principal.email.as_deref(),
+                Some(&display_name),
+                &role,
+                platform_admin,
+                config.session_ttl_seconds,
+            )
+            .await?;
+        let cookie = session_cookie(
+            &session.token,
+            config.session_ttl_seconds,
+            config.cookie_secure,
+        );
+        Ok(LoginResult {
+            principal: SessionPrincipal {
+                session_id: session.id,
+                csrf_token: session.csrf_token,
+                tenant_id: principal.tenant_id,
+                subject: principal.subject,
+                email: principal.email,
+                display_name: Some(display_name),
+                role,
+                platform_admin,
+                expires_at: session.expires_at,
+            },
+            cookie,
+            redirect,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub async fn session(
+        &self,
+        cookie_header: Option<&str>,
+    ) -> Result<Option<SessionPrincipal>, BrowserAuthError> {
+        let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
+            return Ok(None);
+        };
+        let token_hash = sha256_hex(token.as_bytes());
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            i64,
+            Option<i64>,
+        )> = sqlx::query_as(
+            "SELECT id, csrf_token, tenant_id, subject, email, display_name, role,
+                    platform_admin, expires_at, revoked_at
+             FROM enterprise_sessions WHERE token_hash = ?",
+        )
+        .bind(&token_hash)
+        .fetch_optional(&self.control)
+        .await?;
+        let Some((
+            session_id,
+            csrf_token,
+            tenant_id,
+            subject,
+            email,
+            display_name,
+            stored_role,
+            platform_admin,
+            expires_at,
+            revoked_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        if revoked_at.is_some() || expires_at <= now {
+            return Ok(None);
+        }
+        self.ensure_active_tenant(&tenant_id).await?;
+        let member = self
+            .find_member(&tenant_id, &subject, email.as_deref())
+            .await?;
+        let role = match member {
+            Some(member) if member.status != "active" => {
+                return Err(BrowserAuthError::Forbidden("member_disabled".to_string()));
+            }
+            Some(member) => member.role,
+            None => stored_role,
+        };
+        let _ = sqlx::query("UPDATE enterprise_sessions SET last_seen_at = ? WHERE id = ?")
+            .bind(now)
+            .bind(&session_id)
+            .execute(&self.control)
+            .await;
+        Ok(Some(SessionPrincipal {
+            session_id,
+            csrf_token,
+            tenant_id,
+            subject,
+            email,
+            display_name,
+            role,
+            platform_admin: platform_admin != 0,
+            expires_at,
+        }))
+    }
+
+    pub async fn logout(&self, cookie_header: Option<&str>) -> Result<bool, BrowserAuthError> {
+        let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
+            return Ok(false);
+        };
+        let token_hash = sha256_hex(token.as_bytes());
+        let revoked = sqlx::query(
+            "UPDATE enterprise_sessions SET revoked_at = ?
+             WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(now_ms())
+        .bind(&token_hash)
+        .execute(&self.control)
+        .await?;
+        Ok(revoked.rows_affected() > 0)
+    }
+
+    #[allow(dead_code)]
+    pub async fn sso_configured(&self) -> Result<bool, BrowserAuthError> {
+        Ok(self.config().await?.is_some())
+    }
+
+    #[cfg(test)]
+    pub async fn validate_csrf(
+        &self,
+        cookie_header: Option<&str>,
+        csrf_header: Option<&str>,
+    ) -> Result<bool, BrowserAuthError> {
+        let Some(principal) = self.session(cookie_header).await? else {
+            return Ok(false);
+        };
+        let Some(csrf_header) = csrf_header else {
+            return Ok(false);
+        };
+        Ok(csrf_header == principal.csrf_token)
+    }
+
+    #[cfg(test)]
+    pub async fn revoke_tenant_sessions(&self, tenant_id: &str) -> Result<usize, BrowserAuthError> {
+        let revoked = sqlx::query(
+            "UPDATE enterprise_sessions SET revoked_at = ?
+             WHERE tenant_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now_ms())
+        .bind(tenant_id)
+        .execute(&self.control)
+        .await?;
+        Ok(revoked.rows_affected() as usize)
+    }
+
+    async fn config(&self) -> Result<Option<BrowserConfig>, BrowserAuthError> {
+        let value = self
+            .ops
+            .get_oidc_config()
+            .await
+            .map_err(browser_ops_error)?;
+        Ok(BrowserConfig::from_value(&value))
+    }
+
+    async fn take_flow(&self, state: &str) -> Result<StoredFlow, BrowserAuthError> {
+        let state_hash = sha256_hex(state.as_bytes());
+        let row: Option<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT code_verifier, nonce, redirect, expires_at
+             FROM enterprise_auth_flows WHERE state_hash = ?",
+        )
+        .bind(&state_hash)
+        .fetch_optional(&self.control)
+        .await?;
+        let Some((code_verifier, nonce, redirect, expires_at)) = row else {
+            return Err(BrowserAuthError::Invalid("state_invalid".to_string()));
+        };
+        let deleted = sqlx::query("DELETE FROM enterprise_auth_flows WHERE state_hash = ?")
+            .bind(&state_hash)
+            .execute(&self.control)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            return Err(BrowserAuthError::Invalid("state_invalid".to_string()));
+        }
+        if expires_at <= now_ms() {
+            return Err(BrowserAuthError::Invalid("state_invalid".to_string()));
+        }
+        Ok(StoredFlow {
+            code_verifier,
+            nonce,
+            redirect,
+        })
+    }
+
+    async fn ensure_active_tenant(&self, tenant_id: &str) -> Result<(), BrowserAuthError> {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.control)
+        .await?;
+        if status.is_none() {
+            return Err(BrowserAuthError::Forbidden("tenant_inactive".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn find_member(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> Result<Option<MemberRecord>, BrowserAuthError> {
+        let row = sqlx::query(
+            "SELECT display_name, role, status FROM enterprise_members
+             WHERE tenant_id = ?
+               AND (subject = ?
+                    OR (? IS NOT NULL AND email IS NOT NULL
+                        AND lower(email) = lower(?)))
+             ORDER BY CASE WHEN subject = ? THEN 0 ELSE 1 END
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(subject)
+        .bind(email)
+        .bind(email)
+        .bind(subject)
+        .fetch_optional(&self.control)
+        .await?;
+        Ok(row.map(|row| MemberRecord {
+            display_name: row.get("display_name"),
+            role: row.get("role"),
+            status: row.get("status"),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_session(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        role: &str,
+        platform_admin: bool,
+        ttl_seconds: i64,
+    ) -> Result<CreatedSession, BrowserAuthError> {
+        let token = random_token()?;
+        let csrf_token = random_token()?;
+        let token_hash = sha256_hex(token.as_bytes());
+        let id = format!("sess_{}", Uuid::now_v7());
+        let now = now_ms();
+        let expires_at = now + ttl_seconds.max(1) * 1000;
+        sqlx::query(
+            "INSERT INTO enterprise_sessions
+             (id, token_hash, csrf_token, tenant_id, subject, email, display_name, role,
+              platform_admin, created_at, expires_at, revoked_at, last_seen_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind(&id)
+        .bind(&token_hash)
+        .bind(&csrf_token)
+        .bind(tenant_id)
+        .bind(subject)
+        .bind(email)
+        .bind(display_name)
+        .bind(role)
+        .bind(platform_admin as i64)
+        .bind(now)
+        .bind(expires_at)
+        .bind(now)
+        .execute(&self.control)
+        .await?;
+        Ok(CreatedSession {
+            id,
+            token,
+            csrf_token,
+            expires_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+pub fn clear_cookie(secure: bool) -> String {
+    let mut cookie = format!("{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn browser_ops_error(error: OpsError) -> BrowserAuthError {
+    match error {
+        OpsError::Db(error) => BrowserAuthError::Db(error),
+        OpsError::Json(error) => BrowserAuthError::Json(error),
+        OpsError::Io(error) => BrowserAuthError::Upstream(error.to_string()),
+        OpsError::Invalid(message) => BrowserAuthError::Invalid(message),
+        OpsError::NotFound(message) => BrowserAuthError::NotFound(message),
+        OpsError::Upstream(message) => BrowserAuthError::Upstream(message),
+        OpsError::Forbidden(message) => BrowserAuthError::Forbidden(message),
+    }
+}
+
+fn validate_redirect(redirect: Option<&str>) -> Result<String, BrowserAuthError> {
+    let redirect = redirect.unwrap_or("/");
+    if redirect.is_empty()
+        || !redirect.starts_with('/')
+        || redirect.starts_with("//")
+        || redirect.contains('\\')
+        || redirect.chars().any(char::is_control)
+    {
+        return Err(BrowserAuthError::Invalid("redirect_invalid".to_string()));
+    }
+    Ok(redirect.to_string())
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn random_token() -> Result<String, BrowserAuthError> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn session_cookie(token: &str, ttl_seconds: i64, cookie_secure: bool) -> String {
+    let mut cookie =
+        format!("{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={ttl_seconds}");
+    if cookie_secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+fn cookie_value<'a>(cookie_header: Option<&'a str>, name: &str) -> Option<&'a str> {
+    for part in cookie_header?.split(';') {
+        let part = part.trim();
+        if let Some((key, value)) = part.split_once('=')
+            && key == name
+            && !value.is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn is_platform_admin(subjects: &[String], subject: &str, email: Option<&str>) -> bool {
+    subjects.iter().any(|entry| {
+        entry == subject || email.is_some_and(|email| entry.eq_ignore_ascii_case(email))
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    async fn test_auth() -> BrowserAuth {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let ops = OpsService::new(
+            pool.clone(),
+            std::env::temp_dir().join(format!("hpa-browser-{}", Uuid::now_v7())),
+        );
+        ops.ensure_schema().await.unwrap();
+        let auth = BrowserAuth::new(pool.clone(), ops);
+        auth.ensure_schema().await.unwrap();
+        sqlx::query("CREATE TABLE enterprise_tenants (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE enterprise_members (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                email TEXT,
+                role TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO enterprise_tenants (id, status) VALUES ('acme', 'active')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        auth
+    }
+
+    async fn configure_local(auth: &BrowserAuth) {
+        auth.ops
+            .set_browser_oidc_config(
+                "https://issuer.example/",
+                "hpa",
+                "http://127.0.0.1:9/jwks",
+                vec!["*".to_string()],
+                "client-1",
+                "http://127.0.0.1:9/authorize",
+                "http://127.0.0.1:9/token",
+                "http://127.0.0.1:9/auth/oidc/callback",
+                "openid email profile",
+                vec!["admin@example.com".to_string()],
+                false,
+                3600,
+            )
+            .await
+            .unwrap();
+    }
+
+    fn encode(value: &Value) -> String {
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap())
+    }
+
+    fn ed_token(signing: &SigningKey, header: Value, claims: Value) -> String {
+        let input = format!("{}.{}", encode(&header), encode(&claims));
+        let signature = signing.sign(input.as_bytes());
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes()))
+    }
+
+    fn idp_server(jwks: String, id_token: String) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..4 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0u8; 8192];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let body = if request.starts_with("GET /jwks") {
+                    jwks.clone()
+                } else {
+                    json!({"id_token": id_token}).to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn pkce_s256_matches_rfc_vector() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn redirect_validator_rejects_escapes() {
+        assert_eq!(validate_redirect(None).unwrap(), "/");
+        assert_eq!(validate_redirect(Some("/")).unwrap(), "/");
+        assert_eq!(
+            validate_redirect(Some("/enterprise?tab=members")).unwrap(),
+            "/enterprise?tab=members"
+        );
+        assert!(validate_redirect(Some("//evil.example")).is_err());
+        assert!(validate_redirect(Some("https://evil.example")).is_err());
+        assert!(validate_redirect(Some("/\\evil.example")).is_err());
+        assert!(validate_redirect(Some("/ok\nSet-Cookie: x")).is_err());
+    }
+
+    #[tokio::test]
+    async fn flow_is_one_time_and_expires() {
+        let auth = test_auth().await;
+        configure_local(&auth).await;
+        let start = auth.begin_login(Some("/enterprise")).await.unwrap();
+        let url = Url::parse(&start.location).unwrap();
+        let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some("client-1")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let state = params.get("state").unwrap().clone();
+        let challenge = params.get("code_challenge").unwrap().clone();
+        let flow = auth.take_flow(&state).await.unwrap();
+        assert_eq!(pkce_challenge(&flow.code_verifier), challenge);
+        assert_eq!(flow.redirect, "/enterprise");
+        assert!(auth.take_flow(&state).await.is_err());
+
+        let expired_state = "expired-state";
+        sqlx::query(
+            "INSERT INTO enterprise_auth_flows
+             (state_hash, code_verifier, nonce, redirect, created_at, expires_at)
+             VALUES (?, 'verifier', 'nonce', '/', ?, ?)",
+        )
+        .bind(sha256_hex(expired_state.as_bytes()))
+        .bind(now_ms() - 1_000)
+        .bind(now_ms() - 1)
+        .execute(&auth.control)
+        .await
+        .unwrap();
+        assert!(auth.take_flow(expired_state).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn sessions_support_lookup_csrf_expiry_and_revoke() {
+        let auth = test_auth().await;
+        let created = auth
+            .insert_session(
+                "acme",
+                "sub-1",
+                Some("user@example.com"),
+                Some("User One"),
+                "developer",
+                false,
+                3600,
+            )
+            .await
+            .unwrap();
+        let cookie = format!("{SESSION_COOKIE}={}", created.token);
+        let principal = auth.session(Some(&cookie)).await.unwrap().unwrap();
+        assert_eq!(principal.tenant_id, "acme");
+        assert_eq!(principal.role, "developer");
+        assert_eq!(principal.display_name.as_deref(), Some("User One"));
+        assert_eq!(principal.csrf_token, created.csrf_token);
+        assert!(!principal.platform_admin);
+        assert!(principal.expires_at > now_ms());
+        assert!(
+            auth.validate_csrf(Some(&cookie), Some(&created.csrf_token))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !auth
+                .validate_csrf(Some(&cookie), Some("wrong"))
+                .await
+                .unwrap()
+        );
+        assert!(!auth.validate_csrf(Some(&cookie), None).await.unwrap());
+        assert!(!auth.validate_csrf(None, Some("x")).await.unwrap());
+
+        sqlx::query("UPDATE enterprise_sessions SET expires_at = ? WHERE id = ?")
+            .bind(now_ms() - 1)
+            .bind(&created.id)
+            .execute(&auth.control)
+            .await
+            .unwrap();
+        assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
+
+        let created = auth
+            .insert_session("acme", "sub-2", None, None, "viewer", false, 3600)
+            .await
+            .unwrap();
+        let cookie = format!("{SESSION_COOKIE}={}", created.token);
+        assert_eq!(auth.revoke_tenant_sessions("acme").await.unwrap(), 2);
+        assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
+        assert!(!auth.logout(Some(&cookie)).await.unwrap());
+
+        let created = auth
+            .insert_session("acme", "sub-3", None, None, "viewer", false, 3600)
+            .await
+            .unwrap();
+        let cookie = format!("{SESSION_COOKIE}={}", created.token);
+        assert!(auth.logout(Some(&cookie)).await.unwrap());
+        assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
+        assert!(!auth.logout(None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sessions_follow_member_and_tenant_status() {
+        let auth = test_auth().await;
+        sqlx::query(
+            "INSERT INTO enterprise_members
+             (id, tenant_id, subject, display_name, email, role, status)
+             VALUES ('m1', 'acme', 'sub-1', 'Directory Name', 'user@example.com',
+                     'auditor', 'active')",
+        )
+        .execute(&auth.control)
+        .await
+        .unwrap();
+        let created = auth
+            .insert_session(
+                "acme",
+                "sub-1",
+                Some("USER@example.com"),
+                Some("Token Name"),
+                "developer",
+                false,
+                3600,
+            )
+            .await
+            .unwrap();
+        let cookie = format!("{SESSION_COOKIE}={}", created.token);
+        let principal = auth.session(Some(&cookie)).await.unwrap().unwrap();
+        assert_eq!(principal.role, "auditor");
+        assert_eq!(principal.display_name.as_deref(), Some("Token Name"));
+
+        sqlx::query("UPDATE enterprise_members SET status = 'disabled' WHERE id = 'm1'")
+            .execute(&auth.control)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.session(Some(&cookie)).await,
+            Err(BrowserAuthError::Forbidden(_))
+        ));
+
+        sqlx::query("UPDATE enterprise_members SET status = 'active' WHERE id = 'm1'")
+            .execute(&auth.control)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE enterprise_tenants SET status = 'disabled' WHERE id = 'acme'")
+            .execute(&auth.control)
+            .await
+            .unwrap();
+        assert!(matches!(
+            auth.session(Some(&cookie)).await,
+            Err(BrowserAuthError::Forbidden(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_login_creates_session_and_consumes_state() {
+        let auth = test_auth().await;
+        sqlx::query(
+            "INSERT INTO enterprise_members
+             (id, tenant_id, subject, display_name, email, role, status)
+             VALUES ('m1', 'acme', 'sub-1', 'Directory Name', 'user@example.com',
+                     'auditor', 'active')",
+        )
+        .execute(&auth.control)
+        .await
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let jwks = json!({"keys": [{
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "kid": "primary",
+            "x": URL_SAFE_NO_PAD.encode(signing.verifying_key().to_bytes())
+        }]})
+        .to_string();
+        let now = now_ms() / 1000;
+        let id_token = ed_token(
+            &signing,
+            json!({"alg": "EdDSA", "typ": "JWT", "kid": "primary"}),
+            json!({
+                "iss": "https://issuer.example/",
+                "aud": "hpa",
+                "sub": "sub-1",
+                "tenant_id": "acme",
+                "role": "viewer",
+                "email": "USER@example.com",
+                "name": "Claim Name",
+                "nonce": "flow-nonce",
+                "exp": now + 3600
+            }),
+        );
+        let port = idp_server(jwks, id_token);
+        auth.ops
+            .set_browser_oidc_config(
+                "https://issuer.example/",
+                "hpa",
+                &format!("http://127.0.0.1:{port}/jwks"),
+                vec!["*".to_string()],
+                "client-1",
+                &format!("http://127.0.0.1:{port}/authorize"),
+                &format!("http://127.0.0.1:{port}/token"),
+                &format!("http://127.0.0.1:{port}/auth/oidc/callback"),
+                "openid email profile",
+                vec!["user@example.com".to_string()],
+                true,
+                3600,
+            )
+            .await
+            .unwrap();
+        let state = "flow-state";
+        sqlx::query(
+            "INSERT INTO enterprise_auth_flows
+             (state_hash, code_verifier, nonce, redirect, created_at, expires_at)
+             VALUES (?, 'flow-verifier', 'flow-nonce', '/enterprise', ?, ?)",
+        )
+        .bind(sha256_hex(state.as_bytes()))
+        .bind(now_ms())
+        .bind(now_ms() + 600_000)
+        .execute(&auth.control)
+        .await
+        .unwrap();
+        let result = auth.complete_login("code-1", state).await.unwrap();
+        assert_eq!(result.redirect, "/enterprise");
+        assert_eq!(result.principal.tenant_id, "acme");
+        assert_eq!(result.principal.role, "auditor");
+        assert_eq!(
+            result.principal.display_name.as_deref(),
+            Some("Directory Name")
+        );
+        assert!(result.principal.platform_admin);
+        assert!(result.cookie.contains("HttpOnly"));
+        assert!(result.cookie.contains("SameSite=Lax"));
+        assert!(result.cookie.contains("Path=/"));
+        assert!(result.cookie.contains("; Secure"));
+        let principal = auth.session(Some(&result.cookie)).await.unwrap().unwrap();
+        assert_eq!(principal.subject, "sub-1");
+        assert!(auth.complete_login("code-1", state).await.is_err());
+    }
+}

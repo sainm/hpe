@@ -1,0 +1,90 @@
+{
+  "schemaVersion": "hpa.skill/v1",
+  "id": "skill_invoice_audit",
+  "name": "invoice-audit",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
+  "entry": {
+    "kind": "script",
+    "defaultScript": "audit"
+  },
+  "unknownTopLevel": {
+    "keep": true,
+    "note": "unknown fields must survive import and export"
+  },
+  "scripts": [
+    {
+      "id": "audit",
+      "path": "scripts/audit.py",
+      "runtime": "python3",
+      "args": ["--input", "${inputFile}", "--output", "${artifactDir}"],
+      "timeoutMs": 10000,
+      "network": "none",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "invoiceId": { "type": "string" },
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": { "type": "string" },
+                "amount": { "type": "number" }
+              },
+              "required": ["amount"]
+            }
+          }
+        },
+        "required": ["invoiceId", "items"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "invoiceId": { "type": "string" },
+          "total": { "type": "number" }
+        },
+        "required": ["ok", "invoiceId", "total"]
+      },
+      "unknownScriptField": "preserve-me"
+    }
+  ],
+  "permissions": {
+    "filesystem": {
+      "read": ["${inputDir}"],
+      "write": ["${artifactDir}"]
+    },
+    "network": [],
+    "commands": ["python3"],
+    "env": ["LANG"],
+    "resources": {
+      "cpu": 10,
+      "memoryMb": 256,
+      "maxOutputBytes": 1048576
+    }
+  },
+  "dependencies": [],
+  "tests": [
+    {
+      "name": "smoke",
+      "script": "audit",
+      "input": {
+        "invoiceId": "inv_1001",
+        "items": [
+          { "name": "license", "amount": 120.5 },
+          { "name": "support", "amount": 79.5 }
+        ]
+      },
+      "expect": {
+        "exitCode": 0,
+        "artifacts": ["summary.json"]
+      },
+      "unknownTestField": "preserve-me"
+    }
+  ],
+  "trust": {
+    "level": "community",
+    "signature": null
+  }
+}

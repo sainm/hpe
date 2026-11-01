@@ -1,0 +1,47 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_parallel",
+  "name": "Parallel",
+  "description": "two parallel branches joined with all",
+  "workflowVersion": "1.0.0",
+  "inputs": [],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "parallel",
+      "type": "parallel",
+      "typeVersion": "1.0.0",
+      "config": { "join": "all", "failFast": false, "maxConcurrency": 2 },
+      "branches": [
+        {
+          "id": "left",
+          "graph": {
+            "nodes": [
+              { "id": "left_map", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "branch": "left" } } }
+            ],
+            "edges": []
+          }
+        },
+        {
+          "id": "right",
+          "graph": {
+            "nodes": [
+              { "id": "right_map", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "branch": "right" } } }
+            ],
+            "edges": []
+          }
+        }
+      ],
+      "ui": { "x": 200, "y": 0 }
+    },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 500, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "parallel", "targetPort": "in" },
+    { "id": "e2", "source": "parallel", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_mapping",
+  "name": "Mapping",
+  "description": "expression and template mapping",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "order", "type": "object", "required": true },
+    { "name": "currency", "type": "string", "default": "JPY" }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "map",
+      "type": "transform",
+      "typeVersion": "1.0.0",
+      "config": {
+        "mapping": {
+          "orderId": { "$expr": ".input.order.id" },
+          "amount": { "$expr": ".input.order.total * 100" },
+          "currency": { "$expr": ".input.currency // \"JPY\"" },
+          "label": { "$template": "Order ${.input.order.id} / ${.input.currency}" },
+          "items": { "$expr": "[.input.order.items[] | {sku: .sku, qty: .qty}]" }
+        }
+      },
+      "ui": { "x": 240, "y": 0 }
+    },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 520, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "map", "targetPort": "in" },
+    { "id": "e2", "source": "map", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

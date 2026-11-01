@@ -1,0 +1,12 @@
+{
+  "schemaVersion": "hpa.skill/v1",
+  "id": "skill_proprietary_demo",
+  "name": "proprietary-demo",
+  "version": "1.0.0",
+  "license": "Proprietary",
+  "entry": {
+    "kind": "instructions"
+  },
+  "scripts": [],
+  "tests": []
+}

@@ -1,0 +1,16 @@
+/target
+/node_modules
+/dist
+/build
+/coverage
+node_modules/
+dist/
+coverage/
+.vscode-test/
+/.hpa
+/.env
+/.env.*
+!.env.example
+.DS_Store
+package-lock.json
+*.vsix

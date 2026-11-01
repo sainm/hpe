@@ -1,0 +1,37 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_subflow",
+  "name": "Subflow",
+  "description": "inline subflow invocation",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "value", "type": "integer", "required": true }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    { "id": "call", "type": "subflow", "typeVersion": "1.0.0", "config": { "subflowId": "sub_double" }, "ui": { "x": 220, "y": 0 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 500, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "call", "targetPort": "in" },
+    { "id": "e2", "source": "call", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "subflows": [
+    {
+      "id": "sub_double",
+      "name": "Double",
+      "inputs": [{ "name": "value", "type": "integer", "required": true }],
+      "outputs": [{ "name": "doubled", "type": "integer" }],
+      "graph": {
+        "nodes": [
+          { "id": "sub_map", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "doubled": { "$expr": ".input.value * 2" } } } }
+        ],
+        "edges": []
+      }
+    }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

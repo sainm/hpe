@@ -1,0 +1,39 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_loop",
+  "name": "Loop",
+  "description": "forEach loop with aggregation",
+  "workflowVersion": "1.0.0",
+  "inputs": [],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "loop",
+      "type": "loop",
+      "typeVersion": "1.0.0",
+      "config": {
+        "mode": "forEach",
+        "items": { "$expr": "[1, 2, 3]" },
+        "itemVariable": "item",
+        "indexVariable": "index",
+        "maxIterations": 10
+      },
+      "body": {
+        "nodes": [
+          { "id": "body_map", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "doubled": { "$expr": ".loop.item * 2" } } } }
+        ],
+        "edges": []
+      },
+      "ui": { "x": 200, "y": 0 }
+    },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 500, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "loop", "targetPort": "in" },
+    { "id": "e2", "source": "loop", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

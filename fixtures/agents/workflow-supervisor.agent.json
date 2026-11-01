@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "hpa.agent/v1",
+  "id": "agent_workflow_supervisor",
+  "name": "Workflow Supervisor",
+  "version": "1.0.0",
+  "description": "Starts a published workflow and waits for its checkpoint or terminal status.",
+  "instructions": "Run the requested workflow version and report the execution status. Workflow approvals stay in the workflow approval center.",
+  "tools": ["workflow.execute", "execution.wait", "execution.get"],
+  "planner": {
+    "kind": "deterministic",
+    "plan": [
+      {
+        "kind": "tool",
+        "tool": "workflow.execute",
+        "arguments": {
+          "workflowId": { "$input": "workflowId" },
+          "version": { "$input": "workflowVersion" },
+          "input": { "$input": "input" }
+        }
+      },
+      {
+        "kind": "tool",
+        "tool": "execution.wait",
+        "arguments": {
+          "executionId": { "$last": "executionId" },
+          "timeoutMs": 15000
+        }
+      },
+      {
+        "kind": "respond",
+        "output": {
+          "agent": "workflow-supervisor",
+          "execution": { "$last": true }
+        }
+      }
+    ]
+  },
+  "limits": {
+    "maxSteps": 8,
+    "maxToolCalls": 4,
+    "timeoutMs": 60000,
+    "maxTokens": 8000,
+    "maxCostUsd": 0.25,
+    "maxHandoffs": 2,
+    "maxDepth": 2
+  },
+  "approval": [],
+  "subAgents": []
+}

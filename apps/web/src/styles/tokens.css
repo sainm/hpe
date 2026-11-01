@@ -1,0 +1,154 @@
+:root,
+html[data-theme="light"] {
+  --hpa-bg: #f1f3f5;
+  --hpa-bg-elevated: #fafbfc;
+  --hpa-panel: #ffffff;
+  --hpa-panel-2: #fafbfc;
+  --hpa-panel-3: #edeff2;
+  --hpa-line: #dce0e5;
+  --hpa-line-strong: #c3c9d1;
+  --hpa-ink: #1b1f24;
+  --hpa-ink-strong: #1b1f24;
+  --hpa-muted: #4c5560;
+  --hpa-faint: #79838f;
+  --hpa-accent: #1557b0;
+  --hpa-accent-strong: #124993;
+  --hpa-accent-ink: #ffffff;
+  --hpa-accent-soft: #e9f0fa;
+  --hpa-accent-border: #c6daf2;
+  --hpa-accent-text: #124993;
+  --hpa-success: #0b6b4f;
+  --hpa-danger: #a81b14;
+  --hpa-warning: #8a5300;
+  --hpa-info: #12499e;
+  --hpa-graph: #5b2b8c;
+  --hpa-focus: #1557b0;
+  --hpa-selection: rgba(21, 87, 176, 0.16);
+  --hpa-canvas-grid: #dce0e5;
+  --hpa-shadow-float: 0 8px 24px -6px rgba(16, 20, 28, 0.2);
+  --hpa-shadow-panel: 0 0 0 rgba(0, 0, 0, 0);
+  --hpa-scrim: rgba(15, 16, 22, 0.32);
+  --hpa-node-bg: #ffffff;
+  --hpa-node-bg-selected: #e9f0fa;
+  color-scheme: light;
+}
+
+html[data-theme="dark"] {
+  --hpa-bg: #15171a;
+  --hpa-bg-elevated: #202429;
+  --hpa-panel: #1b1e22;
+  --hpa-panel-2: #202429;
+  --hpa-panel-3: #262b31;
+  --hpa-line: #2e343b;
+  --hpa-line-strong: #3d444d;
+  --hpa-ink: #e8ebef;
+  --hpa-ink-strong: #f5f7fa;
+  --hpa-muted: #a7b0ba;
+  --hpa-faint: #79838f;
+  --hpa-accent: #6ba5e8;
+  --hpa-accent-strong: #84b6f0;
+  --hpa-accent-ink: #0f1a26;
+  --hpa-accent-soft: #1b2939;
+  --hpa-accent-border: #28405b;
+  --hpa-accent-text: #9cc6f7;
+  --hpa-success: #5cc49a;
+  --hpa-danger: #e38b84;
+  --hpa-warning: #d9a855;
+  --hpa-info: #8fb6f0;
+  --hpa-graph: #b79be0;
+  --hpa-focus: #84b6f0;
+  --hpa-selection: rgba(107, 165, 232, 0.2);
+  --hpa-canvas-grid: #2e343b;
+  --hpa-shadow-float: 0 10px 28px -8px rgba(0, 0, 0, 0.6);
+  --hpa-shadow-panel: 0 0 0 rgba(0, 0, 0, 0);
+  --hpa-scrim: rgba(0, 0, 0, 0.55);
+  --hpa-node-bg: #1b1e22;
+  --hpa-node-bg-selected: #1b2939;
+  color-scheme: dark;
+}
+
+html[data-theme="ocean"] {
+  --hpa-bg: #0e1014;
+  --hpa-bg-elevated: #171a1f;
+  --hpa-panel: #1a1e24;
+  --hpa-panel-2: #20252c;
+  --hpa-panel-3: #272d35;
+  --hpa-line: #333b44;
+  --hpa-line-strong: #46515c;
+  --hpa-ink: #eef2f6;
+  --hpa-ink-strong: #ffffff;
+  --hpa-muted: #adb8c4;
+  --hpa-faint: #7f8b98;
+  --hpa-accent: #8ab4f8;
+  --hpa-accent-strong: #a7c7ff;
+  --hpa-accent-ink: #0c1624;
+  --hpa-accent-soft: #1d2c40;
+  --hpa-accent-border: #2c4260;
+  --hpa-accent-text: #b7d3ff;
+  --hpa-success: #6ed3a7;
+  --hpa-danger: #f09a94;
+  --hpa-warning: #e2b96c;
+  --hpa-info: #9cc0f5;
+  --hpa-graph: #c4a9e8;
+  --hpa-focus: #a7c7ff;
+  --hpa-selection: rgba(138, 180, 248, 0.22);
+  --hpa-canvas-grid: #333b44;
+  --hpa-shadow-float: 0 10px 28px -8px rgba(0, 0, 0, 0.62);
+  --hpa-shadow-panel: 0 0 0 rgba(0, 0, 0, 0);
+  --hpa-scrim: rgba(0, 0, 0, 0.6);
+  --hpa-node-bg: #1a1e24;
+  --hpa-node-bg-selected: #1d2c40;
+  color-scheme: dark;
+}
+
+:root {
+  --hpa-font-sans: "Inter", "Hiragino Sans", "Hiragino Kaku Gothic ProN",
+    "Noto Sans JP", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    "Yu Gothic UI", Meiryo, sans-serif;
+  --hpa-font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo,
+    Consolas, monospace;
+
+  --hpa-text-xs: 0.65625rem;
+  --hpa-text-sm: 0.71875rem;
+  --hpa-text-md: 0.78125rem;
+  --hpa-text-lg: 0.8125rem;
+  --hpa-text-xl: 0.9375rem;
+  --hpa-text-2xl: 1.0625rem;
+  --hpa-text-display: 1.1875rem;
+
+  --hpa-space-1: 0.25rem;
+  --hpa-space-2: 0.5rem;
+  --hpa-space-3: 0.75rem;
+  --hpa-space-4: 1rem;
+  --hpa-space-5: 1.25rem;
+  --hpa-space-6: 1.5rem;
+  --hpa-space-8: 2rem;
+  --hpa-space-10: 2.5rem;
+  --hpa-space-12: 3rem;
+
+  --hpa-radius-xs: 2px;
+  --hpa-radius-sm: 3px;
+  --hpa-radius-md: 4px;
+  --hpa-radius-lg: 6px;
+  --hpa-radius-pill: 20px;
+
+  --hpa-z-base: 0;
+  --hpa-z-canvas-controls: 20;
+  --hpa-z-sticky: 40;
+  --hpa-z-overlay: 60;
+  --hpa-z-toast: 80;
+
+  --hpa-duration-fast: 110ms;
+  --hpa-duration-normal: 170ms;
+  --hpa-duration-slow: 320ms;
+  --hpa-ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --hpa-ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --hpa-sidebar-width: 232px;
+  --hpa-topbar-height: 50px;
+  --hpa-inspector-width: 320px;
+  --hpa-palette-width: 216px;
+  --hpa-code-height: 240px;
+
+  --hpa-breakpoint-narrow: 607px;
+}

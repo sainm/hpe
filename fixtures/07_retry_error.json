@@ -1,0 +1,35 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_retry",
+  "name": "Retry",
+  "description": "retry and fallback branch",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "url", "type": "string", "required": true }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "http",
+      "type": "http.request",
+      "typeVersion": "1.0.0",
+      "config": { "method": "GET", "url": { "$expr": ".input.url" } },
+      "retry": { "maxAttempts": 3, "backoff": { "kind": "exponential", "baseMs": 100, "maxMs": 1000, "jitter": true }, "retryOn": ["HTTP_5XX", "TIMEOUT"] },
+      "timeoutMs": 5000,
+      "errorPolicy": { "mode": "fallback", "fallbackPort": "error" },
+      "ui": { "x": 220, "y": 0 }
+    },
+    { "id": "fallback", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "ok": false } }, "ui": { "x": 480, "y": 100 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 760, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "http", "targetPort": "in" },
+    { "id": "e2", "source": "http", "sourcePort": "out", "target": "end", "targetPort": "in" },
+    { "id": "e3", "source": "http", "sourcePort": "error", "target": "fallback", "targetPort": "in" },
+    { "id": "e4", "source": "fallback", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_layout",
+  "name": "Layout and Unicode",
+  "description": "日本語の名前、レイアウト、メタデータ",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "message", "type": "string", "required": true }
+  ],
+  "outputs": [],
+  "variables": [
+    { "name": "suffix", "type": "string", "initial": "（完了）" }
+  ],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "name": "開始", "config": {}, "ui": { "x": 0, "y": 0, "group": "g1" } },
+    {
+      "id": "greet",
+      "type": "transform",
+      "typeVersion": "1.0.0",
+      "name": "挨拶を作成",
+      "config": { "mapping": { "text": { "$template": "${.input.message}${.vars.suffix}" } } },
+      "ui": { "x": 240, "y": 0, "group": "g1" }
+    },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "name": "終了", "config": {}, "ui": { "x": 520, "y": 0, "group": "g1" } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "greet", "targetPort": "in" },
+    { "id": "e2", "source": "greet", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": {
+    "viewport": { "x": 12, "y": 8, "zoom": 0.9 },
+    "groups": [{ "id": "g1", "label": "挨拶", "color": "blue" }]
+  },
+  "metadata": { "tags": ["fixture", "unicode"], "owner": "hpa" }
+}

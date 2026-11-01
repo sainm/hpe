@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "hpa.agent/v1",
+  "id": "agent_model_invoice",
+  "name": "Model Invoice Agent",
+  "version": "1.0.0",
+  "description": "Uses an optional OpenAI-compatible chat-completions endpoint with the audited invoice skill.",
+  "instructions": "Use the invoice-audit skill for exact totals. Return a short JSON summary.",
+  "tools": ["skill.invoice-audit.audit"],
+  "planner": {
+    "kind": "openAi",
+    "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+    "model": "local-model",
+    "temperature": 0,
+    "inputCostPer1k": 0,
+    "outputCostPer1k": 0,
+    "network": []
+  },
+  "limits": {
+    "maxSteps": 10,
+    "maxToolCalls": 4,
+    "timeoutMs": 60000,
+    "maxTokens": 16000,
+    "maxCostUsd": 0.5,
+    "maxHandoffs": 2,
+    "maxDepth": 2
+  },
+  "approval": [],
+  "subAgents": []
+}

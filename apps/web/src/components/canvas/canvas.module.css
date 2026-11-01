@@ -1,0 +1,255 @@
+.node {
+  --node-tone: var(--hpa-faint);
+  position: relative;
+  width: 200px;
+  padding: 9px 11px 10px;
+  border-radius: var(--hpa-radius-md);
+  border: 1px solid var(--hpa-line);
+  background: var(--hpa-node-bg);
+  box-shadow: 0 1px 2px rgba(16, 20, 28, 0.06);
+  color: var(--hpa-ink);
+  transition: border-color 100ms, box-shadow 100ms, background 100ms;
+}
+
+.node:hover {
+  border-color: var(--hpa-line-strong);
+}
+
+.nodeSelected {
+  border-color: var(--hpa-accent);
+  background: var(--hpa-node-bg-selected);
+  box-shadow: 0 0 0 1px var(--hpa-accent);
+}
+
+.nodeAccent {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: var(--hpa-radius-md) 0 0 var(--hpa-radius-md);
+  background: var(--node-tone);
+  opacity: 0.9;
+}
+
+.nodeHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.nodeIcon {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border-radius: var(--hpa-radius-xs);
+  border: 1px solid color-mix(in srgb, var(--node-tone) 35%, var(--hpa-line));
+  background: color-mix(in srgb, var(--node-tone) 8%, var(--hpa-panel));
+  color: var(--node-tone);
+}
+
+.nodeKind {
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--node-tone);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nodeMeta {
+  margin-left: auto;
+  min-width: 16px;
+  height: 15px;
+  padding: 0 4px;
+  display: grid;
+  place-items: center;
+  border-radius: 2px;
+  border: 1px solid var(--hpa-line);
+  background: var(--hpa-panel-3);
+  font-family: var(--hpa-font-mono);
+  font-size: 9px;
+  color: var(--hpa-faint);
+}
+
+.nodeName {
+  margin-top: 5px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--hpa-ink);
+  overflow-wrap: anywhere;
+}
+
+.nodeId {
+  margin-top: 1px;
+  font-family: var(--hpa-font-mono);
+  font-size: 9.5px;
+  color: var(--hpa-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.nodeDescription {
+  margin-top: 5px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--hpa-faint);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.port {
+  position: absolute;
+  right: -1px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  transform: translateY(-50%);
+}
+
+.portLabel {
+  padding: 0 4px;
+  border-radius: 2px;
+  border: 1px solid var(--hpa-line);
+  background: var(--hpa-panel);
+  color: var(--hpa-faint);
+  font-family: var(--hpa-font-mono);
+  font-size: 8.5px;
+  line-height: 13px;
+  white-space: nowrap;
+}
+
+.handle {
+  width: 7px !important;
+  height: 7px !important;
+  border: 1px solid var(--hpa-panel) !important;
+  background: var(--node-tone) !important;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--node-tone) 45%, transparent);
+}
+
+.port .handle {
+  position: absolute !important;
+  right: -4px !important;
+  top: 50% !important;
+  transform: translateY(-50%) !important;
+}
+
+.node :global(.react-flow__handle-left) {
+  left: -4px;
+}
+
+.toneNeutral {
+  --node-tone: var(--hpa-faint);
+}
+.toneAccent {
+  --node-tone: var(--hpa-accent);
+}
+.toneSuccess {
+  --node-tone: var(--hpa-success);
+}
+.toneDanger {
+  --node-tone: var(--hpa-danger);
+}
+.toneWarning {
+  --node-tone: var(--hpa-warning);
+}
+.toneInfo {
+  --node-tone: var(--hpa-info);
+}
+.toneGraph {
+  --node-tone: var(--hpa-graph);
+}
+
+.canvas {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  background:
+    radial-gradient(circle at 1px 1px, var(--hpa-canvas-grid) 1px, transparent 0) 0 0 / 22px
+      22px,
+    var(--hpa-panel-2);
+}
+
+.canvas :global(.react-flow__edge-path) {
+  stroke: var(--hpa-line-strong);
+  stroke-width: 1.2;
+}
+
+.canvas :global(.react-flow__edge.selected .react-flow__edge-path),
+.canvas :global(.react-flow__edge:hover .react-flow__edge-path) {
+  stroke: var(--hpa-accent);
+  stroke-width: 1.6;
+}
+
+.canvas :global(.react-flow__arrowhead) {
+  fill: var(--hpa-line-strong);
+}
+
+.controls {
+  border: 1px solid var(--hpa-line) !important;
+  border-radius: var(--hpa-radius-sm) !important;
+  overflow: hidden;
+  box-shadow: var(--hpa-shadow-float) !important;
+}
+
+.controls :global(.react-flow__controls-button) {
+  width: 24px !important;
+  height: 24px !important;
+  background: var(--hpa-panel) !important;
+  border-bottom: 1px solid var(--hpa-line) !important;
+  color: var(--hpa-muted) !important;
+}
+
+.controls :global(.react-flow__controls-button:hover) {
+  background: var(--hpa-panel-3) !important;
+  color: var(--hpa-ink) !important;
+}
+
+.controls :global(.react-flow__controls-button svg) {
+  fill: currentColor;
+  max-width: 10px;
+  max-height: 10px;
+}
+
+.canvas :global(.react-flow__attribution) {
+  background: color-mix(in srgb, var(--hpa-panel) 80%, transparent);
+  color: var(--hpa-faint);
+  font-size: 9px;
+  padding: 1px 4px;
+  border-radius: 2px;
+}
+
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  color: var(--hpa-faint);
+  font-size: 11.5px;
+}
+
+@media (max-width: 607px) {
+  .node {
+    width: 182px;
+    padding: 8px 10px;
+  }
+
+  .nodeDescription {
+    display: none;
+  }
+
+  .portLabel {
+    display: none;
+  }
+}

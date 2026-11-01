@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "hpa.agent/v1",
+  "id": "agent_invoice_auditor",
+  "name": "Invoice Auditor",
+  "version": "1.0.0",
+  "description": "Runs the published invoice-audit skill and returns a deterministic audit summary.",
+  "instructions": "Audit the invoice deterministically. Never invent totals.",
+  "tools": ["skill.invoice-audit.audit"],
+  "planner": {
+    "kind": "deterministic",
+    "plan": [
+      {
+        "kind": "tool",
+        "tool": "skill.invoice-audit.audit",
+        "arguments": {
+          "invoiceId": { "$input": "invoiceId" },
+          "items": { "$input": "items" }
+        }
+      },
+      {
+        "kind": "respond",
+        "output": {
+          "agent": "invoice-auditor",
+          "audit": { "$last": true }
+        }
+      }
+    ]
+  },
+  "limits": {
+    "maxSteps": 8,
+    "maxToolCalls": 4,
+    "timeoutMs": 60000,
+    "maxTokens": 8000,
+    "maxCostUsd": 0.25,
+    "maxHandoffs": 2,
+    "maxDepth": 2
+  },
+  "approval": [],
+  "subAgents": []
+}

@@ -1,0 +1,37 @@
+{
+  "internalId": "hpa",
+  "productName": "Auralis",
+  "shortName": "Auralis",
+  "historicalAliases": ["Hisha"],
+  "tagline": "Build Once. Execute Anywhere. Publish Everywhere.",
+  "defaultLocale": "ja",
+  "locales": ["ja", "en", "zh"],
+  "identifiers": {
+    "npmScope": "@hpa",
+    "cratePrefix": "hpa-",
+    "pythonPackagePrefix": "hpa-",
+    "envPrefix": "HPA_",
+    "dataDir": ".hpa",
+    "keychainService": "hpa",
+    "otelNamespace": "hpa",
+    "mcpProviderId": "hpa-local",
+    "mcpResourceScheme": "hpa",
+    "vscodePublisher": "hpa",
+    "vscodeExtensionName": "workbench",
+    "vscodeExtensionId": "hpa.workbench",
+    "cliBinary": "hpa",
+    "skillManifest": "hpa.skill.json",
+    "pluginManifest": "hpa.plugin.json",
+    "pluginExtension": ".hplugin",
+    "schemaAuthority": "https://hpa.dev"
+  },
+  "assets": {
+    "logo": "",
+    "icon": ""
+  },
+  "urls": {
+    "website": "",
+    "docs": "",
+    "support": ""
+  }
+}

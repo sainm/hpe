@@ -1,0 +1,46 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_approval",
+  "name": "Approval",
+  "description": "human approval pause and resume",
+  "workflowVersion": "1.0.0",
+  "inputs": [],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 0, "y": 0 } },
+    {
+      "id": "approve",
+      "type": "human.approval",
+      "typeVersion": "1.0.0",
+      "config": {
+        "title": "Approve order",
+        "formSchema": {
+          "type": "object",
+          "properties": {
+            "decision": { "type": "string", "enum": ["approve", "reject"] },
+            "comment": { "type": "string" }
+          },
+          "required": ["decision"]
+        },
+        "assignees": [{ "kind": "role", "value": "approver" }],
+        "slaMs": 86400000,
+        "onTimeout": "reject"
+      },
+      "ui": { "x": 220, "y": 0 }
+    },
+    { "id": "approved", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "decision": "approved" } }, "ui": { "x": 480, "y": -80 } },
+    { "id": "rejected", "type": "transform", "typeVersion": "1.0.0", "config": { "mapping": { "decision": "rejected" } }, "ui": { "x": 480, "y": 80 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "config": {}, "ui": { "x": 760, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "approve", "targetPort": "in" },
+    { "id": "e2", "source": "approve", "sourcePort": "approved", "target": "approved", "targetPort": "in" },
+    { "id": "e3", "source": "approve", "sourcePort": "rejected", "target": "rejected", "targetPort": "in" },
+    { "id": "e4", "source": "approve", "sourcePort": "timeout", "target": "rejected", "targetPort": "in" },
+    { "id": "e5", "source": "approved", "sourcePort": "out", "target": "end", "targetPort": "in" },
+    { "id": "e6", "source": "rejected", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

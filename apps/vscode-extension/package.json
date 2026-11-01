@@ -1,0 +1,364 @@
+{
+  "name": "workbench",
+  "displayName": "Auralis",
+  "description": "Auralis automation runtime integration for VS Code and GitHub Copilot",
+  "version": "0.1.0",
+  "publisher": "hpa",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.143.0",
+    "node": ">=22.14.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "automation",
+    "workflow",
+    "mcp",
+    "agent",
+    "hpa"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "restrictedConfigurations": [
+        "hpa.local.endpoint",
+        "hpa.mcp.endpoint",
+        "hpa.remote.endpoint",
+        "hpa.remote.mcpEndpoint",
+        "hpa.skills.installTarget",
+        "hpa.skills.personalPath",
+        "hpa.runtime.binary"
+      ]
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "hpa",
+          "title": "%container.title%",
+          "icon": "media/hpa.svg"
+        }
+      ]
+    },
+    "views": {
+      "hpa": [
+        {
+          "id": "hpa.overview",
+          "name": "%view.overview%"
+        },
+        {
+          "id": "hpa.workflows",
+          "name": "%view.workflows%"
+        },
+        {
+          "id": "hpa.agents",
+          "name": "%view.agents%"
+        },
+        {
+          "id": "hpa.skills",
+          "name": "%view.skills%"
+        },
+        {
+          "id": "hpa.mcp",
+          "name": "%view.mcp%"
+        },
+        {
+          "id": "hpa.plugins",
+          "name": "%view.plugins%"
+        },
+        {
+          "id": "hpa.runtime",
+          "name": "%view.runtime%"
+        },
+        {
+          "id": "hpa.executions",
+          "name": "%view.executions%"
+        },
+        {
+          "id": "hpa.artifacts",
+          "name": "%view.artifacts%"
+        },
+        {
+          "id": "hpa.settings",
+          "name": "%view.settings%"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "hpa.runtime.connect",
+        "title": "%command.runtime.connect%",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "hpa.runtime.refresh",
+        "title": "%command.runtime.refresh%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hpa.runtime.status",
+        "title": "%command.runtime.status%"
+      },
+      {
+        "command": "hpa.runtime.start",
+        "title": "%command.runtime.start%",
+        "icon": "$(play)"
+      },
+      {
+        "command": "hpa.workflow.run",
+        "title": "%command.workflow.run%",
+        "icon": "$(run)"
+      },
+      {
+        "command": "hpa.execution.open",
+        "title": "%command.execution.open%"
+      },
+      {
+        "command": "hpa.execution.cancel",
+        "title": "%command.execution.cancel%",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "hpa.execution.approve",
+        "title": "%command.execution.approve%",
+        "icon": "$(check)"
+      },
+      {
+        "command": "hpa.artifact.preview",
+        "title": "%command.artifact.preview%",
+        "icon": "$(preview)"
+      },
+      {
+        "command": "hpa.skill.install",
+        "title": "%command.skill.install%",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "hpa.skill.update",
+        "title": "%command.skill.update%"
+      },
+      {
+        "command": "hpa.skill.remove",
+        "title": "%command.skill.remove%"
+      },
+      {
+        "command": "hpa.mcp.refresh",
+        "title": "%command.mcp.refresh%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hpa.mcp.register",
+        "title": "%command.mcp.register%"
+      },
+      {
+        "command": "hpa.web.open",
+        "title": "%command.web.open%",
+        "icon": "$(link-external)"
+      },
+      {
+        "command": "hpa.auth.setToken",
+        "title": "%command.auth.setToken%"
+      },
+      {
+        "command": "hpa.auth.clearToken",
+        "title": "%command.auth.clearToken%"
+      },
+      {
+        "command": "hpa.settings.open",
+        "title": "%command.settings.open%",
+        "icon": "$(gear)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "hpa.runtime.refresh",
+          "when": "view == hpa.workflows || view == hpa.agents || view == hpa.skills || view == hpa.plugins || view == hpa.executions || view == hpa.artifacts",
+          "group": "navigation@1"
+        },
+        {
+          "command": "hpa.mcp.refresh",
+          "when": "view == hpa.mcp",
+          "group": "navigation@1"
+        },
+        {
+          "command": "hpa.runtime.connect",
+          "when": "view == hpa.runtime || view == hpa.overview",
+          "group": "navigation@1"
+        },
+        {
+          "command": "hpa.skill.install",
+          "when": "view == hpa.skills",
+          "group": "navigation@2"
+        },
+        {
+          "command": "hpa.settings.open",
+          "when": "view == hpa.settings",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "hpa.workflow.run",
+          "when": "view == hpa.workflows && viewItem == hpa.workflow",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.workflow.run",
+          "when": "view == hpa.workflows && viewItem == hpa.workflow"
+        },
+        {
+          "command": "hpa.execution.open",
+          "when": "view == hpa.executions && viewItem == hpa.execution"
+        },
+        {
+          "command": "hpa.execution.cancel",
+          "when": "view == hpa.executions && viewItem == hpa.execution.running",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.execution.approve",
+          "when": "view == hpa.executions && viewItem == hpa.execution.waiting",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.artifact.preview",
+          "when": "view == hpa.artifacts && viewItem == hpa.artifact",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.skill.update",
+          "when": "view == hpa.skills && viewItem == hpa.skill.installed",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.skill.remove",
+          "when": "view == hpa.skills && viewItem == hpa.skill.installed",
+          "group": "inline@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "%config.title%",
+      "properties": {
+        "hpa.mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "local",
+            "remote"
+          ],
+          "default": "auto",
+          "scope": "window",
+          "description": "%config.mode%"
+        },
+        "hpa.local.endpoint": {
+          "type": "string",
+          "default": "http://127.0.0.1:8787",
+          "scope": "window",
+          "description": "%config.localEndpoint%"
+        },
+        "hpa.mcp.endpoint": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "%config.mcpEndpoint%"
+        },
+        "hpa.remote.endpoint": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "%config.remoteEndpoint%"
+        },
+        "hpa.remote.mcpEndpoint": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "%config.remoteMcpEndpoint%"
+        },
+        "hpa.locale": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "ja",
+            "en",
+            "zh"
+          ],
+          "default": "auto",
+          "scope": "window",
+          "description": "%config.locale%"
+        },
+        "hpa.skills.installTarget": {
+          "type": "string",
+          "enum": [
+            "project",
+            "personal"
+          ],
+          "default": "project",
+          "scope": "window",
+          "description": "%config.skillTarget%"
+        },
+        "hpa.skills.personalPath": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "%config.personalSkills%"
+        },
+        "hpa.runtime.binary": {
+          "type": "string",
+          "default": "",
+          "scope": "machine",
+          "description": "%config.binary%"
+        },
+        "hpa.runtime.startArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "serve"
+          ],
+          "scope": "machine",
+          "description": "%config.startArgs%"
+        }
+      }
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "hpa-local",
+        "label": "%mcp.provider.name%"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:host": "node test/host/run.mjs",
+    "package": "vsce package --no-dependencies --allow-missing-repository --out hpa-workbench.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/vscode": "1.140.0",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.1.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  }
+}

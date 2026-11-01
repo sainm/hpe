@@ -1,0 +1,376 @@
+.designer {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - var(--hpa-topbar-height));
+  min-height: 600px;
+  background: var(--hpa-bg);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 42px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--hpa-line);
+  background: var(--hpa-panel);
+}
+
+.toolbarLeft {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.name {
+  min-width: 120px;
+  max-width: 340px;
+  width: 100%;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: var(--hpa-radius-sm);
+  background: transparent;
+  color: var(--hpa-ink);
+  font-size: 13px;
+  font-weight: 600;
+  outline: none;
+  transition: background 100ms, border-color 100ms;
+}
+
+.name:hover {
+  background: var(--hpa-panel-3);
+}
+
+.name:focus {
+  border-color: var(--hpa-accent);
+  background: var(--hpa-panel);
+  box-shadow: 0 0 0 2px var(--hpa-accent-soft);
+}
+
+.workflowMeta {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  font-family: var(--hpa-font-mono);
+  font-size: 10px;
+  color: var(--hpa-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toolbarActions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.workspace {
+  display: grid;
+  grid-template-columns: var(--hpa-palette-width) minmax(0, 1fr) var(--hpa-inspector-width);
+  flex: 1;
+  min-height: 0;
+}
+
+.palette {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--hpa-line);
+  background: var(--hpa-panel);
+}
+
+.sideHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 31px;
+  padding: 0 11px;
+  border-bottom: 1px solid var(--hpa-line);
+  background: var(--hpa-panel-2);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hpa-faint);
+}
+
+.paletteScroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.paletteGroup {
+  margin-bottom: 9px;
+}
+
+.paletteGroupLabel {
+  padding: 5px 6px;
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hpa-faint);
+}
+
+.paletteGrid {
+  display: grid;
+  gap: 1px;
+}
+
+.paletteItem {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 27px;
+  padding: 3px 6px;
+  border: 1px solid transparent;
+  border-radius: var(--hpa-radius-sm);
+  background: transparent;
+  color: var(--hpa-muted);
+  text-align: left;
+  transition: background 100ms, color 100ms;
+}
+
+.paletteItem:hover {
+  background: var(--hpa-panel-3);
+  color: var(--hpa-ink);
+}
+
+.paletteIcon {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border-radius: var(--hpa-radius-xs);
+  border: 1px solid var(--hpa-line);
+  background: var(--hpa-panel);
+  color: var(--hpa-accent);
+}
+
+.paletteText {
+  min-width: 0;
+}
+
+.paletteLabel {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.25;
+}
+
+.paletteDesc {
+  display: block;
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--hpa-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.canvasPane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.canvasHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 31px;
+  padding: 0 11px;
+  border-bottom: 1px solid var(--hpa-line);
+  background: var(--hpa-panel-2);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--hpa-faint);
+}
+
+.canvasHeaderHint {
+  margin-left: auto;
+  font-family: var(--hpa-font-sans);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--hpa-faint);
+}
+
+.canvasBody {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+.inspector {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--hpa-line);
+  background: var(--hpa-panel);
+}
+
+.inspectorBody {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.codePane {
+  flex: 0 0 calc(var(--hpa-code-height) + 31px);
+  height: calc(var(--hpa-code-height) + 31px);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.emptyWrap {
+  display: grid;
+  place-items: center;
+  min-height: 60vh;
+  padding: 24px;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--hpa-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 1180px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) 310px;
+  }
+
+  .palette {
+    grid-column: 1 / -1;
+    border-right: 0;
+    border-bottom: 1px solid var(--hpa-line);
+  }
+
+  .paletteScroll {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 5px 8px;
+  }
+
+  .paletteGroup {
+    margin: 0;
+    flex: 0 0 auto;
+  }
+
+  .paletteGroupLabel {
+    display: none;
+  }
+
+  .paletteGrid {
+    grid-auto-flow: column;
+    grid-auto-columns: max-content;
+  }
+
+  .paletteItem {
+    min-width: 128px;
+  }
+
+  .designer {
+    height: auto;
+    min-height: calc(100vh - var(--hpa-topbar-height));
+  }
+
+  .canvasPane {
+    min-height: 500px;
+  }
+}
+
+@media (max-width: 900px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .inspector {
+    border-left: 0;
+    border-top: 1px solid var(--hpa-line);
+  }
+
+  .inspectorBody {
+    max-height: 440px;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+    padding: 7px 10px;
+  }
+
+  .toolbarLeft {
+    width: 100%;
+  }
+
+  .toolbarActions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 607px) {
+  .designer {
+    min-height: 0;
+  }
+
+  .toolbar {
+    position: sticky;
+    top: 0;
+    z-index: var(--hpa-z-sticky);
+  }
+
+  .name {
+    max-width: none;
+  }
+
+  .workflowMeta {
+    display: none;
+  }
+
+  .canvasPane {
+    min-height: 360px;
+  }
+
+  .canvasHeaderHint {
+    display: none;
+  }
+
+  .inspectorEmpty {
+    display: none;
+  }
+
+  .paletteScroll {
+    padding: 5px 6px;
+  }
+
+  .paletteItem {
+    min-width: 108px;
+    padding: 3px 6px;
+  }
+
+  .paletteDesc {
+    display: none;
+  }
+}

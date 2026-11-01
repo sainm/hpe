@@ -1,0 +1,39 @@
+[package]
+name = "hpa-local"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "hpa"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+hpa-core = { path = "../hpa-core" }
+hpa-skill.workspace = true
+jsonschema.workspace = true
+reqwest.workspace = true
+ring = "0.17.14"
+rust-embed.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tar.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

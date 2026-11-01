@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "hpa.agent/v1",
+  "id": "agent_invoice_supervisor",
+  "name": "Invoice Supervisor",
+  "version": "1.0.0",
+  "description": "Hands the invoice to the auditor sub-agent and inherits the remaining budget.",
+  "instructions": "Delegate invoice audits to the declared sub-agent.",
+  "tools": [],
+  "planner": {
+    "kind": "deterministic",
+    "plan": [
+      {
+        "kind": "handoff",
+        "agentId": "agent_invoice_auditor",
+        "input": { "$input": true }
+      },
+      {
+        "kind": "respond",
+        "output": {
+          "agent": "invoice-supervisor",
+          "delegated": { "$last": true }
+        }
+      }
+    ]
+  },
+  "limits": {
+    "maxSteps": 8,
+    "maxToolCalls": 4,
+    "timeoutMs": 60000,
+    "maxTokens": 8000,
+    "maxCostUsd": 0.25,
+    "maxHandoffs": 2,
+    "maxDepth": 2
+  },
+  "approval": [],
+  "subAgents": ["agent_invoice_auditor"]
+}

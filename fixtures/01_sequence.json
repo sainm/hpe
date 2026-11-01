@@ -1,0 +1,23 @@
+{
+  "$schema": "https://hpa.dev/schema/ir/v0.1/workflow.schema.json",
+  "schemaVersion": "hpa.dev/v1",
+  "id": "wf_fixture_sequence",
+  "name": "Sequence",
+  "description": "start to transform to end",
+  "workflowVersion": "1.0.0",
+  "inputs": [
+    { "name": "value", "type": "integer", "required": true }
+  ],
+  "outputs": [],
+  "variables": [],
+  "nodes": [
+    { "id": "start", "type": "start", "typeVersion": "1.0.0", "name": "Start", "config": {}, "ui": { "x": 0, "y": 0 } },
+    { "id": "map", "type": "transform", "typeVersion": "1.0.0", "name": "Add one", "config": { "mapping": { "value": { "$expr": ".input.value + 1" } } }, "ui": { "x": 240, "y": 0 } },
+    { "id": "end", "type": "end", "typeVersion": "1.0.0", "name": "End", "config": {}, "ui": { "x": 480, "y": 0 } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "start", "sourcePort": "out", "target": "map", "targetPort": "in" },
+    { "id": "e2", "source": "map", "sourcePort": "out", "target": "end", "targetPort": "in" }
+  ],
+  "layout": { "viewport": { "x": 0, "y": 0, "zoom": 1 } }
+}

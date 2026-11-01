@@ -1,0 +1,190 @@
+@import "./tokens.css";
+@import "tailwindcss";
+
+@theme {
+  --color-bg: var(--hpa-bg);
+  --color-bg-elevated: var(--hpa-bg-elevated);
+  --color-panel: var(--hpa-panel);
+  --color-panel-2: var(--hpa-panel-2);
+  --color-panel-3: var(--hpa-panel-3);
+  --color-line: var(--hpa-line);
+  --color-line-strong: var(--hpa-line-strong);
+  --color-ink: var(--hpa-ink);
+  --color-ink-strong: var(--hpa-ink-strong);
+  --color-muted: var(--hpa-muted);
+  --color-faint: var(--hpa-faint);
+  --color-accent: var(--hpa-accent);
+  --color-accent-strong: var(--hpa-accent-strong);
+  --color-accent-ink: var(--hpa-accent-ink);
+  --color-success: var(--hpa-success);
+  --color-danger: var(--hpa-danger);
+  --color-warning: var(--hpa-warning);
+  --color-info: var(--hpa-info);
+  --color-graph: var(--hpa-graph);
+  --color-focus: var(--hpa-focus);
+
+  --font-sans: var(--hpa-font-sans);
+  --font-mono: var(--hpa-font-mono);
+
+  --text-xs: 10.5px;
+  --text-sm: 11.5px;
+  --text-base: 12.5px;
+  --text-lg: 13px;
+  --text-xl: 15px;
+  --text-2xl: 17px;
+
+  --radius-xs: var(--hpa-radius-xs);
+  --radius-sm: var(--hpa-radius-sm);
+  --radius-md: var(--hpa-radius-md);
+  --radius-lg: var(--hpa-radius-lg);
+
+  --shadow-float: var(--hpa-shadow-float);
+  --shadow-panel: var(--hpa-shadow-panel);
+
+  --breakpoint-narrow: 38rem;
+}
+
+@layer base {
+  *,
+  *::before,
+  *::after {
+    border-color: var(--hpa-line);
+  }
+
+  html {
+    height: 100%;
+    background: var(--hpa-bg);
+    color-scheme: light;
+  }
+
+  html[data-theme="dark"],
+  html[data-theme="ocean"] {
+    color-scheme: dark;
+  }
+
+  body {
+    min-height: 100%;
+    margin: 0;
+    background: var(--hpa-bg);
+    color: var(--hpa-ink);
+    font-family: var(--hpa-font-sans);
+    font-size: 13px;
+    line-height: 1.55;
+    letter-spacing: 0;
+    font-feature-settings: "cv11", "ss01";
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  p,
+  figure {
+    margin: 0;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: var(--hpa-selection);
+    color: var(--hpa-accent);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--hpa-focus);
+    outline-offset: 1px;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--hpa-faint);
+  }
+
+  ::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--hpa-line-strong);
+    border: 2px solid var(--hpa-panel);
+    border-radius: 20px;
+    background-clip: padding-box;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--hpa-faint);
+    border: 2px solid var(--hpa-panel);
+    background-clip: padding-box;
+  }
+
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+}
+
+@layer utilities {
+  .hpa-hairline {
+    background: var(--hpa-line);
+    height: 1px;
+  }
+
+  .hpa-scroll {
+    scrollbar-gutter: stable;
+    overflow: auto;
+  }
+
+  .hpa-tnum {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes hpa-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes hpa-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
