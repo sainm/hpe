@@ -48,6 +48,7 @@ import type {
   OauthClient,
   OauthConsentRequest,
   OauthTokenSummary,
+  ReadyReport,
   MarketDetail,
   MarketSummary,
   NodeCatalog,
@@ -778,6 +779,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ decision, remember }),
     }),
+  ready: () => request<ReadyReport>("/ready"),
   triggers: (workflowId?: string) =>
     request<{ tenantId: string; triggers: TriggerSummary[] }>(
       `/triggers${workflowId ? `?workflowId=${encodeURIComponent(workflowId)}` : ""}`,

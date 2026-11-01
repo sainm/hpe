@@ -6,6 +6,7 @@ import {
   BadgeCheck,
   Clock3,
   RefreshCw,
+  Timer,
   XCircle,
 } from "lucide-react";
 import { useState } from "react";
@@ -24,7 +25,7 @@ import {
 } from "../components/ui";
 import { api } from "../lib/api";
 import { formatDate } from "../lib/i18n";
-import type { JsonValue } from "../lib/types";
+import type { ExecutionEvent, JsonValue } from "../lib/types";
 import { useUiStore } from "../stores/ui";
 
 export function ExecutionDetailPage() {
@@ -187,6 +188,8 @@ export function ExecutionDetailPage() {
         ) : null}
       </Panel>
 
+      <StepTimeline events={events.data ?? []} />
+
       {waiting ? (
         <Panel className="border-warning/40 bg-warning/5 p-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -318,5 +321,151 @@ export function ExecutionDetailPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+interface StepSpan {
+  key: string;
+  nodeId: string;
+  graphId?: string | null;
+  attempt?: number | null;
+  startedAt: number;
+  endedAt: number;
+  status: "succeeded" | "failed" | "waiting" | "skipped" | "running";
+}
+
+function buildSpans(events: ExecutionEvent[]): StepSpan[] {
+  const open = new Map<string, { startedAt: number; attempt?: number | null; graphId?: string | null }>();
+  const spans: StepSpan[] = [];
+  const ordered = [...events].sort((left, right) => left.sequence - right.sequence);
+  for (const event of ordered) {
+    const nodeId = event.nodeId;
+    if (!nodeId) continue;
+    const at = Date.parse(event.at);
+    if (Number.isNaN(at)) continue;
+    if (event.kind === "node.started") {
+      open.set(nodeId, { startedAt: at, attempt: event.attempt, graphId: event.graphId });
+      continue;
+    }
+    const status =
+      event.kind === "node.succeeded"
+        ? "succeeded"
+        : event.kind === "node.failed"
+          ? "failed"
+          : event.kind === "node.waiting"
+            ? "waiting"
+            : event.kind === "node.skipped"
+              ? "skipped"
+              : null;
+    if (!status) continue;
+    const started = open.get(nodeId);
+    open.delete(nodeId);
+    spans.push({
+      key: `${nodeId}-${event.sequence}`,
+      nodeId,
+      graphId: event.graphId ?? started?.graphId ?? null,
+      attempt: event.attempt ?? started?.attempt ?? null,
+      startedAt: started?.startedAt ?? at,
+      endedAt: at,
+      status,
+    });
+  }
+  for (const [nodeId, started] of open) {
+    spans.push({
+      key: `${nodeId}-open`,
+      nodeId,
+      graphId: started.graphId ?? null,
+      attempt: started.attempt ?? null,
+      startedAt: started.startedAt,
+      endedAt: Date.now(),
+      status: "running",
+    });
+  }
+  return spans.sort((left, right) => left.startedAt - right.startedAt);
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1) return "<1ms";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 2 : 1)}s`;
+  const minutes = Math.floor(ms / 60_000);
+  return `${minutes}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+const spanTone: Record<StepSpan["status"], string> = {
+  succeeded: "bg-accent",
+  failed: "bg-danger",
+  waiting: "bg-warning",
+  skipped: "bg-line-strong",
+  running: "bg-accent/60",
+};
+
+function StepTimeline({ events }: { events: ExecutionEvent[] }) {
+  const { t } = useTranslation();
+  const spans = buildSpans(events);
+  if (spans.length === 0) {
+    return null;
+  }
+  const start = Math.min(...spans.map((span) => span.startedAt));
+  const end = Math.max(...spans.map((span) => span.endedAt));
+  const total = Math.max(end - start, 1);
+  const slowest = spans.reduce((worst, span) =>
+    span.endedAt - span.startedAt > worst.endedAt - worst.startedAt ? span : worst,
+  );
+
+  return (
+    <Panel className="p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Timer className="h-4 w-4 text-accent" />
+        <h2 className="text-sm font-semibold text-ink">{t("executions.timeline.title")}</h2>
+        <Badge tone="neutral">{t("executions.timeline.spans", { total: spans.length })}</Badge>
+        <Badge tone="neutral">
+          {t("executions.timeline.total")}: {formatDuration(total)}
+        </Badge>
+        <Badge tone="warning">
+          {t("executions.timeline.slowest")}: {slowest.nodeId} ·{" "}
+          {formatDuration(slowest.endedAt - slowest.startedAt)}
+        </Badge>
+      </div>
+      <p className="mt-1 text-[10.5px] text-faint">{t("executions.timeline.hint")}</p>
+      <ol className="mt-2 grid gap-1">
+        {spans.map((span) => {
+          const offset = ((span.startedAt - start) / total) * 100;
+          const width = Math.max(((span.endedAt - span.startedAt) / total) * 100, 0.8);
+          const isSlowest = span.key === slowest.key;
+          return (
+            <li
+              key={span.key}
+              className="grid min-w-0 grid-cols-[minmax(0,148px)_minmax(0,1fr)_58px] items-center gap-2"
+            >
+              <div className="min-w-0">
+                <p
+                  className={cn(
+                    "truncate font-mono text-[11px]",
+                    isSlowest ? "text-warning" : "text-ink",
+                  )}
+                  title={span.graphId ? `${span.nodeId} (${span.graphId})` : span.nodeId}
+                >
+                  {span.nodeId}
+                </p>
+                {span.attempt && span.attempt > 1 ? (
+                  <p className="text-[9.5px] text-faint">#{span.attempt}</p>
+                ) : null}
+              </div>
+              <div className="relative h-2.5 min-w-0 rounded-sm bg-panel-3">
+                <div
+                  className={cn("absolute inset-y-0 rounded-sm", spanTone[span.status])}
+                  style={{ left: `${offset}%`, width: `${width}%` }}
+                  title={`${span.status} · ${formatDuration(span.endedAt - span.startedAt)}`}
+                />
+              </div>
+              <span className="text-right font-mono text-[10px] tabular-nums text-faint">
+                {formatDuration(span.endedAt - span.startedAt)}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </Panel>
   );
 }

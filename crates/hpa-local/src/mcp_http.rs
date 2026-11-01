@@ -114,6 +114,7 @@ pub fn router(state: McpGatewayState) -> Router {
             "/mcp/.well-known/oauth-protected-resource",
             get(protected_resource_metadata),
         )
+        .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .with_state(state)
 }
 

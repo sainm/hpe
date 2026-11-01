@@ -153,6 +153,27 @@ impl EnterpriseState {
         .map_err(internal)
     }
 
+    pub(crate) fn auth_required(&self) -> bool {
+        self.require_auth
+    }
+
+    pub(crate) async fn control_ping(&self) -> Result<(), ApiError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.control)
+            .await
+            .map(|_| ())
+            .map_err(internal)
+    }
+
+    pub(crate) async fn tenant_ping(&self, tenant_id: &str) -> Result<(), ApiError> {
+        let state = self.tenant_entry(tenant_id).await?;
+        sqlx::query("SELECT 1")
+            .execute(&state.state.db.pool)
+            .await
+            .map(|_| ())
+            .map_err(internal)
+    }
+
     pub(crate) async fn tenant_active(&self, tenant_id: &str) -> Result<bool, ApiError> {
         let found: Option<String> = sqlx::query_scalar(
             "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
@@ -821,7 +842,9 @@ pub fn router(state: EnterpriseState) -> Router {
         .route("/api/auth/logout", post(auth_logout))
         .merge(crate::oauth_http::router())
         .merge(crate::hooks::router())
+        .merge(crate::observe::router())
         .route("/api/{*rest}", any(tenant_gate))
+        .route_layer(middleware::from_fn(crate::metrics::track_http))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .with_state(state)
 }
@@ -2876,6 +2899,14 @@ async fn tenant_gate(
     if path == "/health" {
         let brand: Value = serde_json::from_str(include_str!("../../../branding/brand.json"))
             .unwrap_or(Value::Null);
+        crate::metrics::metrics().inc(
+            "hpa_http_requests_total",
+            &[
+                ("route", "/api/health"),
+                ("method", "GET"),
+                ("status", "200"),
+            ],
+        );
         return Json(json!({
             "status": "ok",
             "internalId": "hpa",
@@ -2955,6 +2986,9 @@ async fn tenant_gate(
     };
     *request.uri_mut() = uri;
     request.extensions_mut().clear();
+    request
+        .extensions_mut()
+        .insert(crate::metrics::TenantApiSurface);
     match entry.router.oneshot(request).await {
         Ok(response) => response,
         Err(error) => ApiError::internal(error.to_string()).into_response(),

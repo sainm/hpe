@@ -217,6 +217,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/mcp/servers/{id}/call", post(mcp_server_call))
         .fallback(api_not_found)
         .with_state(state)
+        .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }

@@ -1247,3 +1247,10 @@ export interface TriggerFireResult {
   triggerId: string;
   kind: string;
 }
+
+export interface ReadyReport {
+  ready: boolean;
+  checks: Record<string, string>;
+  schedulerTickAgeMs: number | null;
+  uptimeSeconds: number;
+}

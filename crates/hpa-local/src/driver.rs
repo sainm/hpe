@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 use crate::db::{Db, parse_state, status_text};
+use crate::metrics::{metrics, now_ms};
 
 #[derive(Clone)]
 pub struct RuntimeManager {
@@ -166,11 +167,20 @@ impl RuntimeManager {
             );
         }
 
+        let node_types: HashMap<&str, &str> = workflow
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.node_type.as_str()))
+            .collect();
+
         loop {
             if state.status.is_terminal() || state.status == ExecutionStatus::WaitingApproval {
                 break;
             }
+            let started = Instant::now();
             let result = step(&workflow, &compilation.plan, &mut state).await;
+            let elapsed = started.elapsed().as_secs_f64();
+            record_node_metrics(&result.events, &node_types, elapsed);
             if let Err(error) = self.db.save_execution(&state, &result.events).await {
                 return Err(format!("cannot persist execution state: {error}"));
             }
@@ -181,6 +191,21 @@ impl RuntimeManager {
                 }
                 StepStatus::WaitingApproval | StepStatus::Succeeded | StepStatus::Failed => break,
             }
+        }
+
+        if state.status.is_terminal() {
+            let status = status_text(state.status);
+            metrics().inc(
+                "hpa_workflow_executions_total",
+                &[("tenant", state.tenant_id.as_str()), ("status", status)],
+            );
+            let duration = ((now_ms() - state.started_ms as i64).max(0) as f64) / 1000.0;
+            metrics().observe("hpa_workflow_execution_seconds", &[], duration);
+            metrics().observe(
+                "hpa_workflow_execution_seconds",
+                &[("status", status)],
+                duration,
+            );
         }
 
         if state.status.is_terminal()
@@ -195,6 +220,34 @@ impl RuntimeManager {
             "execution finished"
         );
         Ok(())
+    }
+}
+
+fn record_node_metrics(
+    events: &[hpa_core::runtime::ExecutionEvent],
+    node_types: &HashMap<&str, &str>,
+    elapsed: f64,
+) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for event in events {
+        let Some(node_id) = event.node_id.as_deref() else {
+            continue;
+        };
+        let status = match event.kind.as_str() {
+            "node.succeeded" => "succeeded",
+            "node.failed" => "failed",
+            "node.skipped" => "skipped",
+            _ => continue,
+        };
+        if !seen.insert(node_id) {
+            continue;
+        }
+        let node_type = node_types.get(node_id).copied().unwrap_or("unknown");
+        metrics().inc(
+            "hpa_node_executions_total",
+            &[("type", node_type), ("status", status)],
+        );
+        metrics().observe("hpa_node_seconds", &[("type", node_type)], elapsed);
     }
 }
 

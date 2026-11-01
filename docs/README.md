@@ -117,6 +117,7 @@
 - [Hybrid Worker 私有部署](08-platform/hybrid-worker-deployment.md)
 - [Phase 9 Browser SSO](08-platform/browser-sso.md)
 - [Phase 10 OAuth 2.1 授权服务器](08-platform/oauth-authorization-server.md)
+- [Phase 12 可观测性](08-platform/observability.md)
 
 ### 09 UI
 

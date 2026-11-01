@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::db::{Db, DbError, ExecutionRow, TriggerFireRow, TriggerSeed, TriggerStateRow};
 use crate::driver::RuntimeManager;
+use crate::metrics::metrics;
 
 /// A tick that runs more than this late treats the slot as missed for `skip`.
 const GRACE_MS: i64 = 60_000;
@@ -324,10 +325,18 @@ async fn fire_row(
     };
     let recorded = host.db.record_trigger_fire(&fire).await?;
     if !recorded {
+        metrics().inc(
+            "hpa_trigger_fires_total",
+            &[("kind", row.kind.as_str()), ("result", "duplicate")],
+        );
         return Err(TriggerError::Duplicate {
             event_id: request.event_id.clone().unwrap_or_default(),
         });
     }
+    metrics().inc(
+        "hpa_trigger_fires_total",
+        &[("kind", row.kind.as_str()), ("result", "started")],
+    );
     let _ = host
         .db
         .note_trigger_execution(
@@ -503,8 +512,18 @@ pub fn spawn(enterprise: crate::enterprise::EnterpriseState) -> tokio::task::Joi
                     }
                 };
                 let host = state.trigger_host();
-                match tick(&host, now).await {
+                let started = std::time::Instant::now();
+                let outcome = tick(&host, now).await;
+                metrics().observe(
+                    "hpa_scheduler_tick_seconds",
+                    &[],
+                    started.elapsed().as_secs_f64(),
+                );
+                metrics().inc("hpa_scheduler_ticks_total", &[]);
+                metrics().mark_scheduler_tick(now);
+                match outcome {
                     Ok(fired) if !fired.is_empty() => {
+                        metrics().inc_by("hpa_scheduler_fires_total", &[], fired.len() as f64);
                         tracing::info!(tenant = %tenant, count = fired.len(), "scheduler fired triggers");
                     }
                     Ok(_) => {}

@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Boxes, Check, Globe2, Moon, Server, Sun, Waves } from "lucide-react";
+import { Activity, Boxes, Check, Globe2, Moon, Server, Sun, Waves } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Badge, PageHeader, Panel, cn } from "../components/ui";
 import { api } from "../lib/api";
@@ -23,6 +23,12 @@ export function SettingsPage() {
   const theme = useUiStore((state) => state.theme);
   const setTheme = useUiStore((state) => state.setTheme);
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, retry: 1 });
+  const readiness = useQuery({
+    queryKey: ["ready"],
+    queryFn: api.ready,
+    retry: 1,
+    refetchInterval: 15_000,
+  });
   const nodes = useQuery({ queryKey: ["nodes"], queryFn: api.nodes, retry: 1 });
   const activeLocale = currentLocale();
 
@@ -70,6 +76,68 @@ export function SettingsPage() {
             );
           })}
         </div>
+      </Panel>
+
+      <Panel className="p-4">
+        <div className="flex flex-wrap items-center gap-2">
+          <Activity className="h-4 w-4 text-accent" />
+          <h2 className="text-sm font-semibold text-ink">{t("settings.observability.title")}</h2>
+          <Badge
+            tone={readiness.data?.ready ? "success" : readiness.isError ? "danger" : "neutral"}
+            dot
+            className="ml-auto"
+          >
+            {readiness.data?.ready
+              ? t("settings.observability.ready")
+              : readiness.isError
+                ? t("settings.observability.unreachable")
+                : t("settings.observability.checking")}
+          </Badge>
+        </div>
+        <p className="mt-1 text-xs text-muted">{t("settings.observability.subtitle")}</p>
+        {readiness.data ? (
+          <>
+            <div className="mt-3 grid gap-1.5 sm:grid-cols-2 lg:grid-cols-4">
+              {(["controlDb", "tenantDb", "signingKey", "scheduler"] as const).map((key) => {
+                const state = readiness.data?.checks?.[key] ?? "unknown";
+                const ok = state === "ok";
+                return (
+                  <div
+                    key={key}
+                    className={cn(
+                      "rounded-sm border px-2.5 py-2",
+                      ok ? "border-line bg-panel-2" : "border-danger/30 bg-danger/5",
+                    )}
+                  >
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">
+                      {t(`settings.observability.checks.${key}`)}
+                    </p>
+                    <p className={cn("mt-0.5 text-[11.5px]", ok ? "text-ink" : "text-danger")}>
+                      {state}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-faint">
+              <span>
+                {t("settings.observability.uptime")}:{" "}
+                {formatUptime(readiness.data.uptimeSeconds)}
+              </span>
+              {readiness.data.schedulerTickAgeMs !== null ? (
+                <span>
+                  {t("settings.observability.tickAge")}: {readiness.data.schedulerTickAgeMs}ms
+                </span>
+              ) : null}
+              <a href="/metrics" target="_blank" rel="noreferrer" className="text-accent hover:underline">
+                /metrics
+              </a>
+              <span>{t("settings.observability.metricsHint")}</span>
+            </div>
+          </>
+        ) : (
+          <p className="mt-2 text-xs text-muted">{t("common.loading")}</p>
+        )}
       </Panel>
 
       <Panel className="p-4">
@@ -174,4 +242,13 @@ function Info({ label, value, mono }: { label: string; value: string; mono?: boo
       <dd className={cn("mt-1 text-xs text-ink", mono && "font-mono")}>{value}</dd>
     </div>
   );
+}
+
+function formatUptime(seconds: number): string {
+  const total = Math.max(Math.round(seconds), 0);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${total % 60}s`;
+  return `${total}s`;
 }

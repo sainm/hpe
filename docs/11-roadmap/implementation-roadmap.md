@@ -215,6 +215,19 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 已实现 `crates/hpa-core/src/trigger.rs`（cron 与契约）、`crates/hpa-local/src/scheduler.rs`（调度与发火）、`hooks.rs`（入站）、`db.rs` 的 `trigger_state`/`trigger_fires`，以及 `/triggers` 页面。10 个 cron/契约单元测试、5 个调度单元测试、2 个 HTTP 集成测试通过；Playwright 覆盖建流程→发布→Webhook→手动触发→启停→界面触发，1440/607 无横向溢出。不做事件总线、分布式调度、DST 时区、mTLS/IP 白名单与远程 Worker 派发。详见 [`docs/03-workflow/triggers.md`](../03-workflow/triggers.md)。
 
+## 8f. Phase 12：可观测性与执行洞察
+
+### 范围
+
+- 进程内指标注册表 + Prometheus 文本暴露：HTTP 路由/方法/状态/延迟、执行与节点直方图、调度器 tick 与心跳、触发器发火、租户状态 gauge。
+- `route` 标签使用路由模板而非真实路径；租户网关兜底路由不重复计数。
+- `/api/ready` 真依赖探针（控制库、租户库、签名密钥、调度器心跳），企业模式下指标需要管理员令牌。
+- 执行详情步骤时间线（事件配对、最慢高亮、重试与未闭合 span）；设置页运行时状态卡片。
+
+### 本地实现状态（2026-11-01）
+
+已实现 `crates/hpa-local/src/metrics.rs` 与 `observe.rs`、driver/scheduler 埋点、`ExecutionDetail` 时间线与设置页状态卡片。2 个指标渲染单元测试、2 个 HTTP 集成测试通过；Playwright 覆盖时间线与设置页，1440/607 无横向溢出。不做 OTLP 导出、跨进程追踪、持久化指标与可配置桶。详见 [`docs/08-platform/observability.md`](../08-platform/observability.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid
