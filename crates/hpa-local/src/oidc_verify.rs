@@ -211,7 +211,7 @@ pub(crate) fn verify_jwt(
     validate_claims(&claims, issuer, audience, expected_nonce)
 }
 
-fn verify_signature(
+pub(crate) fn verify_signature(
     key: &JwkKey,
     algorithm: &str,
     message: &[u8],

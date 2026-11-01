@@ -9,6 +9,8 @@ mod enterprise_ops;
 mod mcp;
 mod mcp_client;
 mod mcp_http;
+mod oauth;
+mod oauth_http;
 mod plugin;
 mod skills;
 mod worker;
@@ -1249,6 +1251,7 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
         .unwrap_or(false);
     let enterprise =
         enterprise::EnterpriseState::new(data_dir.clone(), base_url.clone(), require_auth).await?;
+    let oauth = enterprise.oauth_service();
     let local_state = enterprise
         .local_state()
         .await
@@ -1257,12 +1260,14 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
         local_state.agents.skills.clone(),
         local_state.runtime.clone(),
     );
-    let gateway = McpGatewayState::new(mcp_service, base_url).with_rate_limit(
-        std::env::var("HPA_MCP_RATE_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(120),
-    );
+    let gateway = McpGatewayState::new(mcp_service, base_url)
+        .with_oauth(oauth)
+        .with_rate_limit(
+            std::env::var("HPA_MCP_RATE_LIMIT")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(120),
+        );
     let app = Router::new()
         .merge(enterprise::router(enterprise))
         .merge(mcp_http::router(gateway))

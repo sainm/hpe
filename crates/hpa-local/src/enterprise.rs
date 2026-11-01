@@ -33,6 +33,7 @@ use crate::db::{Db, ExecutionRow, parse_state, status_text};
 use crate::driver::RuntimeManager;
 use crate::enterprise_ops::browser_auth::{self, BrowserAuth};
 use crate::enterprise_ops::{OpsError, OpsService};
+use crate::oauth::{OauthOwner, OauthService};
 use crate::plugin::PluginService;
 use crate::skills::SkillService;
 use crate::worker::{WorkerAuth, WorkerError, WorkerErrorKind, WorkerJob};
@@ -48,6 +49,7 @@ pub struct EnterpriseState {
     require_auth: bool,
     ops: OpsService,
     browser_auth: BrowserAuth,
+    oauth: OauthService,
     workers: crate::worker::WorkerService,
     cache: Arc<tokio::sync::Mutex<HashMap<String, TenantEntry>>>,
 }
@@ -98,6 +100,9 @@ impl EnterpriseState {
         ops.ensure_schema().await?;
         let browser_auth = BrowserAuth::new(pool.clone(), ops.clone());
         browser_auth.ensure_schema().await?;
+        let oauth = OauthService::new(pool.clone(), mcp_base_url.clone());
+        oauth.ensure_schema().await?;
+        let _ = oauth.purge_expired().await;
         let workers = crate::worker::WorkerService::new(pool.clone());
         workers.ensure_schema().await?;
         let now = now_rfc3339();
@@ -128,6 +133,7 @@ impl EnterpriseState {
             require_auth,
             ops,
             browser_auth,
+            oauth,
             workers,
             cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
@@ -135,6 +141,78 @@ impl EnterpriseState {
 
     pub async fn local_state(&self) -> Result<ApiState, ApiError> {
         Ok(self.tenant_entry(LOCAL_TENANT).await?.state)
+    }
+
+    pub(crate) fn oauth(&self) -> &OauthService {
+        &self.oauth
+    }
+
+    pub(crate) fn oauth_service(&self) -> OauthService {
+        self.oauth.clone()
+    }
+
+    /// Resolves the resource owner for an authorization request.
+    ///
+    /// A browser session always wins. Without a session the local anonymous
+    /// owner is used only when the runtime runs in local mode.
+    pub(crate) async fn oauth_owner(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<OauthOwner>, ApiError> {
+        if let Some(cookie) = headers
+            .get(header::COOKIE)
+            .and_then(|value| value.to_str().ok())
+        {
+            match self.browser_auth.session(Some(cookie)).await {
+                Ok(Some(session)) => {
+                    return Ok(Some(OauthOwner {
+                        tenant_id: session.tenant_id,
+                        subject: session.subject,
+                        role: session.role,
+                        platform_admin: session.platform_admin,
+                        authenticated: true,
+                    }));
+                }
+                Ok(None) => {}
+                Err(browser_auth::BrowserAuthError::Forbidden(message))
+                | Err(browser_auth::BrowserAuthError::Invalid(message)) => {
+                    return Err(unauthorized(&message));
+                }
+                Err(error) => return Err(internal(error)),
+            }
+        }
+        if self.require_auth {
+            return Ok(None);
+        }
+        Ok(Some(OauthOwner {
+            tenant_id: LOCAL_TENANT.to_string(),
+            subject: "local-owner".to_string(),
+            role: DEFAULT_ROLE.to_string(),
+            platform_admin: true,
+            authenticated: false,
+        }))
+    }
+
+    pub(crate) async fn oauth_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        self.require_admin(headers).await.map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_audit(
+        &self,
+        tenant_id: Option<&str>,
+        actor_id: Option<&str>,
+        actor_type: &str,
+        action: &str,
+        resource: &str,
+        decision: &str,
+        reason: Option<&str>,
+        detail: Value,
+    ) {
+        self.audit(
+            tenant_id, actor_id, actor_type, action, resource, decision, reason, detail,
+        )
+        .await;
     }
 
     pub async fn create_bootstrap_token(&self, name: &str) -> Result<Value, ApiError> {
@@ -248,6 +326,11 @@ impl EnterpriseState {
         }
         if !token.starts_with("hpa_ent_") {
             if token.matches('.').count() == 2 {
+                if self.oauth.is_own_access_token(token) {
+                    return Err(unauthorized(
+                        "OAuth access tokens are scoped to the MCP resource; use a platform token or session",
+                    ));
+                }
                 let principal = self
                     .ops
                     .verify_oidc_token(token)
@@ -710,6 +793,7 @@ pub fn router(state: EnterpriseState) -> Router {
         .route("/auth/logout", post(auth_logout))
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/logout", post(auth_logout))
+        .merge(crate::oauth_http::router())
         .route("/api/{*rest}", any(tenant_gate))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .with_state(state)

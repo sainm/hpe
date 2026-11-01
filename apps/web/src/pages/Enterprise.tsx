@@ -23,6 +23,7 @@ import {
   ShieldCheck,
   Trash2,
   Users,
+  Webhook,
 } from "lucide-react";
 import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
@@ -60,6 +61,7 @@ import type {
   JsonValue,
 } from "../lib/types";
 import { useUiStore } from "../stores/ui";
+import { OAuthSection } from "./EnterpriseOAuth";
 
 type EnterpriseTab =
   | "overview"
@@ -71,7 +73,8 @@ type EnterpriseTab =
   | "workers"
   | "backups"
   | "audit"
-  | "oidc";
+  | "oidc"
+  | "oauth";
 
 const roles: EnterpriseRole[] = [
   "owner",
@@ -288,6 +291,7 @@ export function EnterprisePage() {
     ["backups", t("enterprise.tabs.backups"), <DatabaseBackup key="b" className="h-3 w-3" />],
     ["audit", t("enterprise.tabs.audit"), <ScrollText key="u" className="h-3 w-3" />],
     ["oidc", t("enterprise.tabs.oidc"), <LockKeyhole key="i" className="h-3 w-3" />],
+    ["oauth", t("enterprise.tabs.oauth"), <Webhook key="x" className="h-3 w-3" />],
   ];
 
   function refresh() {
@@ -523,6 +527,7 @@ export function EnterprisePage() {
           ) : null}
           {tab === "audit" ? <AuditSection enabled={controlAllowed} tenants={tenants} /> : null}
           {tab === "oidc" ? <OidcSection enabled={controlAllowed} /> : null}
+          {tab === "oauth" ? <OAuthSection enabled={controlAllowed} /> : null}
         </>
       )}
     </div>

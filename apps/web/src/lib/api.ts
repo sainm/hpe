@@ -19,6 +19,7 @@ import type {
   EnterpriseAuditEntry,
   EnterpriseBackup,
   EnterpriseMember,
+  EnterpriseOauthOverview,
   EnterpriseOidc,
   EnterpriseQuota,
   EnterpriseRestoreResult,
@@ -44,6 +45,9 @@ import type {
   McpServer,
   McpToken,
   McpToolResult,
+  OauthClient,
+  OauthConsentRequest,
+  OauthTokenSummary,
   MarketDetail,
   MarketSummary,
   NodeCatalog,
@@ -734,6 +738,43 @@ export const api = {
     requestBlob(
       `/enterprise/audit/export?format=${format}${tenantId ? `&tenantId=${encodeURIComponent(tenantId)}` : ""}`,
     ),
+  enterpriseOauth: () => request<EnterpriseOauthOverview>("/enterprise/oauth/overview"),
+  enterpriseOauthClients: () => request<{ clients: OauthClient[] }>("/enterprise/oauth/clients"),
+  enterpriseOauthCreateClient: (body: {
+    name: string;
+    redirect_uris: string[];
+    token_endpoint_auth_method: string;
+    scope: string;
+  }) =>
+    request<OauthClient>("/enterprise/oauth/clients", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  enterpriseOauthDisableClient: (id: string) =>
+    request<{ disabled: string }>(`/enterprise/oauth/clients/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  enterpriseOauthRotateSecret: (id: string) =>
+    request<{ clientId: string; clientSecret: string }>(
+      `/enterprise/oauth/clients/${encodeURIComponent(id)}/secret`,
+      { method: "POST" },
+    ),
+  enterpriseOauthTokens: () => request<{ tokens: OauthTokenSummary[] }>("/enterprise/oauth/tokens"),
+  enterpriseOauthRevokeToken: (id: string) =>
+    request<{ revoked: string }>(`/enterprise/oauth/tokens/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  enterpriseOauthRotateKey: () =>
+    request<{ kid: string; alg: string; rotatedAt: number }>("/enterprise/oauth/keys/rotate", {
+      method: "POST",
+    }),
+  oauthConsentRequest: (id: string) =>
+    request<OauthConsentRequest>(`/oauth/requests/${encodeURIComponent(id)}`),
+  oauthConsentDecision: (id: string, decision: "allow" | "deny", remember: boolean) =>
+    request<{ redirect: string }>(`/oauth/requests/${encodeURIComponent(id)}/decision`, {
+      method: "POST",
+      body: JSON.stringify({ decision, remember }),
+    }),
   enterpriseOidc: () => request<EnterpriseOidc>("/enterprise/oidc"),
   enterpriseSaveOidc: (body: EnterpriseOidc) =>
     request<EnterpriseOidc>("/enterprise/oidc", {

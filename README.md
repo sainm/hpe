@@ -27,7 +27,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 
 ## 当前状态
 
-**Phase 1 至 Phase 9 已收口并通过本地验收。** 产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
+**Phase 1 至 Phase 10 已收口并通过本地验收。** 产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
 
 - Rust Core：Canonical Workflow IR、JSON Schema 校验、Saphyr YAML 解析/输出、jaq 表达式、编译器与执行计划；Schema/静态/表达式/依赖/权限与执行策略五类校验；Node Registry（13 类节点、`typeVersion` 解析、旧版 `http.request@0.9.0` 迁移）。
 - Runtime：顺序/条件/多路分支/循环/并行节点、重试/退避、节点超时、错误回退、人工审批暂停与恢复、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。
@@ -51,6 +51,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 - VS Code & Copilot 集成：`apps/vscode-extension`（`hpa.workbench`）薄客户端，10 个 Tree View、状态栏、Runtime 发现/重连、Workflow 运行与执行 Webview、事件/审批/取消、产物预览；Skill 安装/更新/移除到 `.github/skills` 或个人目录，备份回滚与本地修改检测；官方 `mcpServerDefinitionProviders` 注册本地 MCP Server，PAT 仅存 SecretStorage；`X-HPA-Tool-Name-Style: slug` 适配 VS Code 工具名限制。扩展不执行工作区脚本，未信任工作区只读。
 - Hybrid Worker：`hpa worker` 出站轮询控制面，同一 Rust Runtime 执行 Workflow 快照；一次性 `hpa_wrk_` token（租户绑定、SHA-256）、能力/并发、30s 租约、心跳续租、租约过期重排、旧 lease 409、协作取消；首次 start 写回租户 execution/events/artifacts，`remote_executions` 阻止本地 Runtime 接管；审批后 Job 重排恢复；Enterprise Worker Center 注册/派发/队列/取消。
 - Browser SSO：OIDC Authorization Code + PKCE（S256，public client）、state/nonce/redirect 校验、EdDSA/RS256/ES256 ID Token、JWKS/OKP/RSA/P-256；服务端 session 只存 token 哈希，`hpa_session` HttpOnly/SameSite=Lax Cookie、CSRF header、登录/会话/登出与失效；成员目录 disabled 拒绝、active 角色覆盖、租户 active 校验、平台管理员 `adminSubjects` allowlist；`/login` 与 Enterprise Center 浏览器登录、ja/en/zh；本地匿名模式与 `hpa_ent_`/OIDC Bearer/Worker/VS Code 认证不回归。
+- OAuth 2.1 授权服务器：内置 AS，Authorization Code + PKCE(S256)、动态客户端注册（RFC 7591）、刷新令牌轮换与复用检测、吊销（RFC 7009）与内省（RFC 7662）、ES256/EdDSA 签发与 24h 轮换重叠的 JWKS；同意页与 Enterprise Center 的 OAuth 控制台；MCP Gateway 除 PAT 外接受 AS 签发的访问令牌。
 - 品牌门禁：`scripts/check-brand.mjs` 保证技术标识不混入显示名。
 
 已执行的验收：
@@ -94,6 +95,10 @@ Phase 8 验收：真实 `hpa worker` daemon 完成远程 Workflow `succeeded`、
 Phase 9 验收：浏览器完成 `/login` → mock IdP 授权码 → `/auth/oidc/callback` → 平台管理员 session → `/enterprise` → 退出全流程，`EdDSA`、`RS256`、`ES256` 三种签名各跑一轮且零错误；Rust HTTP 集成测试覆盖 Cookie 属性、`/api/auth/session`、Cookie 认证写操作缺 `X-HPA-CSRF` 403、state 重放、redirect 逃逸、disabled 成员、nonce 失配与登出后 401。全量 Rust 142 passed / 1 ignored；新增 SSO 单元/集成测试 15 个；Web 10 Vitest、扩展 60 Vitest + 7 host checks 与 build 通过。登录页、已登录 Enterprise、回调错误与 OIDC 配置在 1440/607 无页面横向溢出，截图见 `docs/assets/phase9/`。
 
 实现与边界详见 [`docs/08-platform/browser-sso.md`](docs/08-platform/browser-sso.md)。
+
+Phase 10 验收：`/oauth/register` 注册公共客户端 → `/oauth/authorize` 302 到 `/consent` → 同意 → 回调收码 → `/oauth/token` 换取访问/刷新令牌 → 用访问令牌调用 `/mcp` `server/discover` 成功 → 内省 active → 刷新令牌轮换 → 吊销后 `/mcp` 401。负向覆盖未注册 `redirect_uri`（400 且不重定向）、缺少 PKCE、`plain` 方法、未注册 scope（带 `state` 回到客户端）、错误 `code_verifier`、授权码重放、刷新令牌复用触发整链吊销、拒绝授权 `access_denied`、错误客户端密钥 401、停用客户端后密钥轮换 409。Playwright 真实浏览器完成同一流程并在 1440/607 截图，两页均无横向溢出；控制台列出客户端与已签发令牌。Rust 新增 4 个单元测试与 4 个 HTTP 集成测试，`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all --check`、品牌门禁与 IR 门禁通过；Web typecheck、10 Vitest（新增 Consent / EnterpriseOAuth 文案门禁）与 build 通过。
+
+实现与边界详见 [`docs/08-platform/oauth-authorization-server.md`](docs/08-platform/oauth-authorization-server.md)。
 
 ## 运行
 
@@ -201,6 +206,20 @@ claude mcp add hpa http://127.0.0.1:8787/mcp --transport http --scope user --hea
 codex mcp add hpa --url http://127.0.0.1:8787/mcp --bearer-token-env-var HPA_MCP_TOKEN
 ```
 
+OAuth 2.1 授权（不需要预先创建 PAT）：客户端先用 `GET /.well-known/oauth-authorization-server` 发现端点，再用 `POST /oauth/register` 注册，浏览器打开 `/oauth/authorize` 完成同意后即可调用 `/mcp`。支持 OAuth 的 MCP 客户端直接指向 `http://127.0.0.1:8787/mcp` 即可自动走这条流程：
+
+```bash
+# 查看 AS 元数据与签名公钥
+curl -s http://127.0.0.1:8787/.well-known/oauth-authorization-server
+curl -s http://127.0.0.1:8787/oauth/jwks
+```
+
+浏览器流程的自动化验收（Playwright，真实点击同意页）：
+
+```bash
+HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase10-oauth-e2e.mjs
+```
+
 开发模式：
 
 ```bash
@@ -287,6 +306,18 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npm run dev
 - 不调用 UserInfo，只验证 ID Token；不支持第三方 Cookie、SameSite=None、IdP 侧登出或 IdP 会话管理。mock IdP 只用于本地验收。
 - 单节点 SQLite：flow/session 表不跨节点共享；登录失败只返回稳定错误码，不向浏览器区分用户不存在与角色无效。
 
+## Phase 10 行为边界
+
+- 只做授权服务器（AS），不做身份提供方：不签发 ID Token、没有 `/userinfo`、不支持 `openid` scope 或用户注册；登录仍由 Phase 9 的 OIDC SSO 或本地匿名模式提供。
+- 签名默认 ES256；`HPA_OAUTH_SIGNING_ALG=EdDSA` 可切换为 Ed25519。不提供 RS256（ring 不能生成 RSA 私钥），需要 RS256 的客户端只能使用 PAT。
+- 不支持 CIMD、PAR、JARM、DPoP、mTLS 令牌绑定、token exchange；`response_type` 仅 `code`，`code_challenge_method` 仅 `S256`。
+- 访问令牌 1 小时、刷新令牌 30 天且每次使用轮换；刷新令牌复用会吊销整条 family，但没有 refresh token family 的跨节点同步。
+- 校验同时验签与查库，吊销立即生效；代价是每个 MCP 请求多一次 SQLite 查询，且多实例部署时吊销状态不共享。
+- 授权端点要求浏览器身份：有会话用会话主体，企业模式无会话跳 `/login`，本地模式使用匿名 `local-owner`。本地端口暴露给他人等同于交出授权能力。
+- MCP Gateway 仍只服务 `local` 租户：其他租户授权的令牌会被 403 拒绝，与 PAT 的单租户边界一致。
+- 同意记录按 client/tenant/subject 覆盖 scope；没有按资源粒度、时间窗或单次授权的细粒度控制，`prompt=none` 不支持。
+- 客户端与令牌管理接口属平台管理员操作；本地模式等价 owner，无额外登录。
+
 ## Phase 8 行为边界
 
 - Worker 与控制面均为单节点 SQLite；没有 Redis/Postgres 队列、HA、自动扩缩容或跨机控制库共享。Worker 必须能通过 loopback HTTP 或 HTTPS 访问控制面。
@@ -329,6 +360,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npm run dev
 | 企业部署与运维 | [`docs/08-platform/enterprise-operations.md`](docs/08-platform/enterprise-operations.md) |
 | Hybrid Worker 协议 | [`docs/08-platform/hybrid-workers.md`](docs/08-platform/hybrid-workers.md) |
 | Hybrid Worker 私有部署 | [`docs/08-platform/hybrid-worker-deployment.md`](docs/08-platform/hybrid-worker-deployment.md) |
+| OAuth 2.1 授权服务器 | [`docs/08-platform/oauth-authorization-server.md`](docs/08-platform/oauth-authorization-server.md) |
 | VS Code / Copilot 集成 | [`docs/14-vscode-copilot/README.md`](docs/14-vscode-copilot/README.md) |
 | VS Code Phase 7 本地实现 | [`docs/14-vscode-copilot/local-implementation.md`](docs/14-vscode-copilot/local-implementation.md) |
 | 研究证据与许可证 | [`docs/01-research/README.md`](docs/01-research/README.md) |

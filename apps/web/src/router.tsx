@@ -15,6 +15,7 @@ import { ExecutionsPage } from "./pages/Executions";
 import { LoginPage } from "./pages/Login";
 import { McpCenterPage } from "./pages/McpCenter";
 import { ConnectorsPage } from "./pages/Connectors";
+import { ConsentPage } from "./pages/Consent";
 import { PluginsPage } from "./pages/Plugins";
 import { SettingsPage } from "./pages/Settings";
 import { SkillsPage } from "./pages/Skills";
@@ -112,6 +113,12 @@ const loginRoute = createRoute({
   component: LoginPage,
 });
 
+const consentRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/consent",
+  component: ConsentPage,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   workflowsRoute,
@@ -128,6 +135,7 @@ const routeTree = rootRoute.addChildren([
   settingsRoute,
   enterpriseRoute,
   loginRoute,
+  consentRoute,
 ]);
 
 export const router = createRouter({

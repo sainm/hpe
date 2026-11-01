@@ -1137,3 +1137,62 @@ export interface EnterpriseRestoreResult {
   requiresRestart: boolean;
   message: string;
 }
+
+export interface OauthClient {
+  id: string;
+  name: string;
+  redirectUris: string[];
+  grantTypes: string[];
+  scopes: string[];
+  tokenEndpointAuthMethod: string;
+  hasSecret: boolean;
+  origin: string;
+  createdAt: number;
+  updatedAt: number;
+  disabledAt: number | null;
+  lastUsedAt: number | null;
+  clientSecret?: string;
+}
+
+export interface OauthTokenSummary {
+  id: string;
+  kind: "access" | "refresh" | string;
+  clientId: string;
+  tenantId: string;
+  subject: string;
+  scope: string;
+  createdAt: number;
+  expiresAt: number;
+  revokedAt: number | null;
+  familyId: string;
+}
+
+export interface EnterpriseOauthOverview {
+  issuer: string;
+  resource: string;
+  jwksUri: string;
+  authorizationEndpoint: string;
+  tokenEndpoint: string;
+  registrationEndpoint: string;
+  scopes: string[];
+  clients: OauthClient[];
+  clientCount: number;
+  tokenCount: number;
+  activeTokenCount: number;
+  signingAlg: string;
+}
+
+export interface OauthConsentRequest {
+  id: string;
+  clientId: string;
+  clientName: string;
+  redirectUri: string;
+  redirectHost: string;
+  scope: string;
+  scopes: string[];
+  resource: string | null;
+  tenantId: string;
+  subject: string;
+  expiresAt: number;
+  authenticated: boolean;
+}

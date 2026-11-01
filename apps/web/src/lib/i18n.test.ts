@@ -55,10 +55,18 @@ describe("i18n resources", () => {
   });
 
   it("ships every static key used by the ecosystem pages", () => {
-    for (const page of ["Plugins", "Connectors", "Enterprise", "Login"]) {
+    const minimums: Record<string, number> = {
+      Plugins: 30,
+      Connectors: 30,
+      Enterprise: 30,
+      Login: 15,
+      Consent: 15,
+      EnterpriseOAuth: 20,
+    };
+    for (const [page, minimum] of Object.entries(minimums)) {
       const source = readFileSync(new URL(`../pages/${page}.tsx`, import.meta.url), "utf8");
       const keys = [...source.matchAll(/\bt\("([^"]+)"/g)].map((match) => match[1]!);
-      expect(keys.length).toBeGreaterThan(page === "Login" ? 15 : 30);
+      expect(keys.length).toBeGreaterThan(minimum);
       for (const key of keys) {
         expect(en).toContain(key);
         expect(zh).toContain(key);

@@ -17,6 +17,7 @@ use crate::mcp::{
     MODERN_VERSION, McpService, SCOPE_EXECUTE, SCOPE_READ, SUPPORTED_VERSIONS, ToolNameStyle,
     authenticate_token, detect_era, handle_request_styled, now_rfc3339,
 };
+use crate::oauth::OauthService;
 
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 const DEFAULT_LIMIT_PER_MINUTE: usize = 120;
@@ -30,6 +31,7 @@ struct RateWindow {
 pub struct McpGatewayState {
     pub service: McpService,
     pub base_url: String,
+    oauth: Option<OauthService>,
     sessions: Arc<Mutex<HashMap<String, Instant>>>,
     rate: Arc<Mutex<HashMap<String, RateWindow>>>,
     limit_per_minute: usize,
@@ -40,10 +42,16 @@ impl McpGatewayState {
         Self {
             service,
             base_url,
+            oauth: None,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             rate: Arc::new(Mutex::new(HashMap::new())),
             limit_per_minute: DEFAULT_LIMIT_PER_MINUTE,
         }
+    }
+
+    pub fn with_oauth(mut self, oauth: OauthService) -> Self {
+        self.oauth = Some(oauth);
+        self
     }
 
     pub fn with_rate_limit(mut self, limit_per_minute: usize) -> Self {
@@ -129,9 +137,38 @@ async fn protected_resource_metadata(State(state): State<McpGatewayState>) -> Js
     Json(json!({
         "resource": format!("{}/mcp", state.base_url),
         "resource_name": "hpa local MCP",
+        "authorization_servers": [state.base_url],
         "bearer_methods_supported": ["header"],
         "scopes_supported": [SCOPE_READ, SCOPE_EXECUTE],
         "resource_documentation": format!("{}/settings", state.base_url),
+    }))
+}
+
+async fn oauth_auth(
+    state: &McpGatewayState,
+    token: &str,
+) -> Result<Option<crate::mcp::AuthContext>, String> {
+    let Some(oauth) = state.oauth.as_ref() else {
+        return Ok(None);
+    };
+    if token.split('.').count() != 3 {
+        return Ok(None);
+    }
+    if oauth.audience() != format!("{}/mcp", state.base_url) {
+        return Ok(None);
+    }
+    let access = oauth
+        .verify_access_token(token)
+        .await
+        .map_err(|error| error.description())?;
+    if access.tenant_id != "local" {
+        return Err("token was issued for another tenant".to_string());
+    }
+    Ok(Some(crate::mcp::AuthContext {
+        token_id: format!("oauth:{}:{}", access.client_id, access.jti),
+        tenant_id: access.tenant_id,
+        scopes: access.scopes,
+        label: format!("oauth:{}", access.client_id),
     }))
 }
 
@@ -271,17 +308,31 @@ async fn handle_mcp(
     };
     let auth = match authenticate_token(&state.service.skills.db, token, &now_rfc3339()).await {
         Ok(Some(auth)) => auth,
-        Ok(None) => {
-            audit(
-                &state.service.skills.db,
-                None,
-                &rpc_method,
-                "unauthorized",
-                json!({"reason": "invalid token"}),
-            )
-            .await;
-            return unauthorized(&state, "invalid token", true);
-        }
+        Ok(None) => match oauth_auth(&state, token).await {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                audit(
+                    &state.service.skills.db,
+                    None,
+                    &rpc_method,
+                    "unauthorized",
+                    json!({"reason": "invalid token"}),
+                )
+                .await;
+                return unauthorized(&state, "invalid token", true);
+            }
+            Err(error) => {
+                audit(
+                    &state.service.skills.db,
+                    None,
+                    &rpc_method,
+                    "unauthorized",
+                    json!({"reason": "invalid oauth token", "detail": error}),
+                )
+                .await;
+                return unauthorized(&state, "invalid token", true);
+            }
+        },
         Err(error) => {
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,

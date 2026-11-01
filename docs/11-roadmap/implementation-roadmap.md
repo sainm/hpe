@@ -185,6 +185,22 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 已实现 `browser_auth`、`oidc_verify` 与控制面路由/CSRF 接线；`/login` 与 Enterprise Center 可在浏览器完成 SSO 登录/退出并显示角色与管理员状态。EdDSA/RS256/ES256 三种算法均通过 Playwright 流程；Rust HTTP 测试覆盖 Cookie 属性、CSRF 403、state 重放、redirect 逃逸、disabled 成员、nonce 失配与登出后 401。全量 Rust 142 passed / 1 ignored；Web 10 Vitest。仍不做授权服务器、refresh token、silent renew、RP-initiated logout、SCIM/组、第三方 Cookie 或多 IdP。详见 [`docs/08-platform/browser-sso.md`](../08-platform/browser-sso.md)。
 
+## 8d. Phase 10：内置 OAuth 2.1 授权服务器
+
+### 范围
+
+- Authorization Code + PKCE（S256，强制）、`state` 往返、授权码一次性与 120s TTL。
+- 动态客户端注册（RFC 7591）与手工注册；公共/机密客户端、密钥哈希、启停与轮换。
+- 刷新令牌轮换与复用检测（family 级吊销）、吊销（RFC 7009）、内省（RFC 7662）。
+- ES256（默认）/EdDSA 签发，JWKS 与密钥轮换 24h 重叠窗口。
+- 同意页与 `oauth_consents`；本地模式匿名 owner、企业模式跳 `/login`。
+- MCP Gateway 接受 AS 访问令牌（`aud` 绑定、单租户约束）；`authorization_servers` 元数据。
+- Enterprise Center → OAuth 2.1：端点、客户端、令牌与密钥轮换控制台；ja/en/zh。
+
+### 本地实现状态（2026-11-01）
+
+已实现 `crates/hpa-local/src/oauth.rs` + `oauth_http.rs`、`/consent` 页面与 Enterprise Center OAuth 标签页。4 个单元测试与 4 个 HTTP 集成测试通过；Playwright 走通「注册 → 授权 → 同意 → 换令牌 → 调用 MCP → 吊销」并覆盖 1440/607 截图；MCP PAT 与 stdio 令牌路径不回归。不做 ID Token、CIMD、PAR、JARM、DPoP、token exchange、RS256 与跨节点吊销同步。详见 [`docs/08-platform/oauth-authorization-server.md`](../08-platform/oauth-authorization-server.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid
