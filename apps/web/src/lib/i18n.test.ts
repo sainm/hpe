@@ -54,6 +54,27 @@ describe("i18n resources", () => {
     }
   });
 
+
+  it("uses i18next double-brace interpolation everywhere", () => {
+    const singleBrace = /(?<!\{)\{[a-zA-Z][a-zA-Z0-9_]*\}(?!\})/;
+    const offenders: string[] = [];
+    const walk = (value: unknown, path: string) => {
+      if (typeof value === "string") {
+        const match = value.match(singleBrace);
+        if (match) offenders.push(`${path}: ${match[0]}`);
+        return;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) return;
+      for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+        walk(child, path ? `${path}.${key}` : key);
+      }
+    };
+    for (const locale of ["ja", "en", "zh"] as const) {
+      walk(i18n.getResourceBundle(locale, "translation"), locale);
+    }
+    expect(offenders).toEqual([]);
+  });
+
   it("ships every static key used by the ecosystem pages", () => {
     const minimums: Record<string, number> = {
       Plugins: 30,
@@ -62,6 +83,7 @@ describe("i18n resources", () => {
       Login: 15,
       Consent: 15,
       EnterpriseOAuth: 20,
+      Triggers: 20,
     };
     for (const [page, minimum] of Object.entries(minimums)) {
       const source = readFileSync(new URL(`../pages/${page}.tsx`, import.meta.url), "utf8");

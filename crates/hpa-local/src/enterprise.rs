@@ -143,6 +143,31 @@ impl EnterpriseState {
         Ok(self.tenant_entry(LOCAL_TENANT).await?.state)
     }
 
+    /// Tenant ids that the scheduler and hooks may serve.
+    pub(crate) async fn active_tenants(&self) -> Result<Vec<String>, ApiError> {
+        sqlx::query_scalar(
+            "SELECT id FROM enterprise_tenants WHERE status = 'active' ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.control)
+        .await
+        .map_err(internal)
+    }
+
+    pub(crate) async fn tenant_active(&self, tenant_id: &str) -> Result<bool, ApiError> {
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.control)
+        .await
+        .map_err(internal)?;
+        Ok(found.is_some())
+    }
+
+    pub(crate) async fn tenant_api_state(&self, tenant_id: &str) -> Result<ApiState, ApiError> {
+        Ok(self.tenant_entry(tenant_id).await?.state)
+    }
+
     pub(crate) fn oauth(&self) -> &OauthService {
         &self.oauth
     }
@@ -535,6 +560,7 @@ impl EnterpriseState {
             .map_err(|error| ApiError::internal(error.to_string()))?;
         agents.start_approval_monitor();
         let state = ApiState {
+            tenant_id: tenant_id.to_string(),
             db,
             runtime,
             agents,
@@ -794,6 +820,7 @@ pub fn router(state: EnterpriseState) -> Router {
         .route("/api/auth/session", get(auth_session))
         .route("/api/auth/logout", post(auth_logout))
         .merge(crate::oauth_http::router())
+        .merge(crate::hooks::router())
         .route("/api/{*rest}", any(tenant_gate))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .with_state(state)

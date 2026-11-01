@@ -15,6 +15,7 @@ import {
   Plug,
   Puzzle,
   Settings,
+  Timer,
   SquarePen,
   Sun,
   Waves,
@@ -131,6 +132,11 @@ export function AppShell() {
     {
       labelKey: "nav.groupOperations",
       items: [
+        {
+          path: "/triggers",
+          labelKey: "nav.triggers",
+          icon: <Timer className={styles.navIcon} />,
+        },
         {
           path: "/executions",
           labelKey: "nav.executions",

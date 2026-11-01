@@ -72,6 +72,7 @@
 - [执行引擎](03-workflow/execution-engine.md)
 - [表达式与数据映射](03-workflow/expression-and-mapping.md)
 - [AI Workflow 生成](03-workflow/ai-workflow-generation.md)
+- [触发器与调度（Phase 11）](03-workflow/triggers.md)
 
 ### 04 Agent
 

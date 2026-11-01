@@ -287,6 +287,46 @@ pub struct Stats {
     pub failed: i64,
 }
 
+#[derive(Debug, Clone, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerStateRow {
+    pub workflow_id: String,
+    pub trigger_id: String,
+    pub kind: String,
+    pub config_json: String,
+    pub workflow_version: Option<String>,
+    pub enabled: i64,
+    pub next_fire_at: Option<i64>,
+    pub last_fire_at: Option<i64>,
+    pub last_execution_id: Option<String>,
+    pub last_status: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerFireRow {
+    pub id: String,
+    pub workflow_id: String,
+    pub trigger_id: String,
+    pub kind: String,
+    pub fired_at: String,
+    pub scheduled_at: Option<String>,
+    pub execution_id: Option<String>,
+    pub status: String,
+    pub event_id: Option<String>,
+    pub detail_json: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TriggerSeed {
+    pub trigger_id: String,
+    pub kind: String,
+    pub config_json: String,
+    pub enabled: bool,
+    pub next_fire_at: Option<i64>,
+}
+
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS workflows (
         id TEXT PRIMARY KEY,
@@ -624,6 +664,35 @@ const SCHEMA: &[&str] = &[
         detail_json TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_connector_audit_at ON connector_audit(at DESC)",
+    "CREATE TABLE IF NOT EXISTS trigger_state (
+        workflow_id TEXT NOT NULL,
+        trigger_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        config_json TEXT NOT NULL,
+        workflow_version TEXT,
+        enabled INTEGER NOT NULL,
+        next_fire_at INTEGER,
+        last_fire_at INTEGER,
+        last_execution_id TEXT,
+        last_status TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (workflow_id, trigger_id)
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_trigger_state_due ON trigger_state(enabled, next_fire_at)",
+    "CREATE TABLE IF NOT EXISTS trigger_fires (
+        id TEXT PRIMARY KEY,
+        workflow_id TEXT NOT NULL,
+        trigger_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        fired_at TEXT NOT NULL,
+        scheduled_at TEXT,
+        execution_id TEXT,
+        status TEXT NOT NULL,
+        event_id TEXT,
+        detail_json TEXT
+    )",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_fires_event ON trigger_fires(trigger_id, event_id) WHERE event_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_trigger_fires_at ON trigger_fires(fired_at DESC)",
 ];
 
 impl Db {
@@ -2072,6 +2141,207 @@ async fn ensure_plugin_columns(pool: &SqlitePool) -> DbResult<()> {
             .await?;
     }
     Ok(())
+}
+
+impl Db {
+    /// Replaces the trigger rows of a workflow with the published snapshot.
+    /// `last_fire_at` and the last execution reference survive republication.
+    pub async fn sync_triggers(
+        &self,
+        workflow_id: &str,
+        version: Option<&str>,
+        seeds: &[TriggerSeed],
+        now: &str,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let existing: Vec<String> =
+            sqlx::query_scalar("SELECT trigger_id FROM trigger_state WHERE workflow_id = ?")
+                .bind(workflow_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        for trigger_id in existing {
+            if seeds.iter().any(|seed| seed.trigger_id == trigger_id) {
+                continue;
+            }
+            sqlx::query("DELETE FROM trigger_state WHERE workflow_id = ? AND trigger_id = ?")
+                .bind(workflow_id)
+                .bind(&trigger_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for seed in seeds {
+            sqlx::query(
+                "INSERT INTO trigger_state
+                 (workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
+                  next_fire_at, last_fire_at, last_execution_id, last_status, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?)
+                 ON CONFLICT(workflow_id, trigger_id) DO UPDATE SET
+                   kind = excluded.kind,
+                   config_json = excluded.config_json,
+                   workflow_version = excluded.workflow_version,
+                   enabled = excluded.enabled,
+                   next_fire_at = excluded.next_fire_at,
+                   updated_at = excluded.updated_at",
+            )
+            .bind(workflow_id)
+            .bind(&seed.trigger_id)
+            .bind(&seed.kind)
+            .bind(&seed.config_json)
+            .bind(version)
+            .bind(seed.enabled as i64)
+            .bind(seed.next_fire_at)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_triggers(&self) -> DbResult<Vec<TriggerStateRow>> {
+        Ok(sqlx::query_as::<_, TriggerStateRow>(
+            "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
+                    next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
+             FROM trigger_state ORDER BY workflow_id, trigger_id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_trigger(
+        &self,
+        workflow_id: &str,
+        trigger_id: &str,
+    ) -> DbResult<Option<TriggerStateRow>> {
+        Ok(sqlx::query_as::<_, TriggerStateRow>(
+            "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
+                    next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
+             FROM trigger_state WHERE workflow_id = ? AND trigger_id = ?",
+        )
+        .bind(workflow_id)
+        .bind(trigger_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn due_triggers(&self, now_ms: i64, limit: i64) -> DbResult<Vec<TriggerStateRow>> {
+        Ok(sqlx::query_as::<_, TriggerStateRow>(
+            "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
+                    next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
+             FROM trigger_state
+             WHERE enabled = 1 AND kind = 'schedule' AND next_fire_at IS NOT NULL
+               AND next_fire_at <= ?
+             ORDER BY next_fire_at ASC LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Optimistically advances a schedule slot. Returns false when another tick
+    /// already claimed it.
+    pub async fn claim_schedule_slot(
+        &self,
+        workflow_id: &str,
+        trigger_id: &str,
+        expected_next: i64,
+        now_ms: i64,
+        next_fire_at: Option<i64>,
+        updated_at: &str,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE trigger_state
+             SET next_fire_at = ?, last_fire_at = ?, updated_at = ?
+             WHERE workflow_id = ? AND trigger_id = ? AND enabled = 1 AND next_fire_at = ?",
+        )
+        .bind(next_fire_at)
+        .bind(now_ms)
+        .bind(updated_at)
+        .bind(workflow_id)
+        .bind(trigger_id)
+        .bind(expected_next)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn set_trigger_enabled(
+        &self,
+        workflow_id: &str,
+        trigger_id: &str,
+        enabled: bool,
+        next_fire_at: Option<i64>,
+        updated_at: &str,
+    ) -> DbResult<bool> {
+        let updated = sqlx::query(
+            "UPDATE trigger_state SET enabled = ?, next_fire_at = ?, updated_at = ?
+             WHERE workflow_id = ? AND trigger_id = ?",
+        )
+        .bind(enabled as i64)
+        .bind(next_fire_at)
+        .bind(updated_at)
+        .bind(workflow_id)
+        .bind(trigger_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn note_trigger_execution(
+        &self,
+        workflow_id: &str,
+        trigger_id: &str,
+        execution_id: &str,
+        status: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE trigger_state SET last_execution_id = ?, last_status = ?
+             WHERE workflow_id = ? AND trigger_id = ?",
+        )
+        .bind(execution_id)
+        .bind(status)
+        .bind(workflow_id)
+        .bind(trigger_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Returns false when the `event_id` was already recorded for this trigger.
+    pub async fn record_trigger_fire(&self, row: &TriggerFireRow) -> DbResult<bool> {
+        let inserted = sqlx::query(
+            "INSERT INTO trigger_fires
+             (id, workflow_id, trigger_id, kind, fired_at, scheduled_at, execution_id, status,
+              event_id, detail_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(trigger_id, event_id) WHERE event_id IS NOT NULL DO NOTHING",
+        )
+        .bind(&row.id)
+        .bind(&row.workflow_id)
+        .bind(&row.trigger_id)
+        .bind(&row.kind)
+        .bind(&row.fired_at)
+        .bind(&row.scheduled_at)
+        .bind(&row.execution_id)
+        .bind(&row.status)
+        .bind(&row.event_id)
+        .bind(&row.detail_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(inserted.rows_affected() > 0)
+    }
+
+    pub async fn list_trigger_fires(&self, limit: i64) -> DbResult<Vec<TriggerFireRow>> {
+        Ok(sqlx::query_as::<_, TriggerFireRow>(
+            "SELECT id, workflow_id, trigger_id, kind, fired_at, scheduled_at, execution_id,
+                    status, event_id, detail_json
+             FROM trigger_fires ORDER BY fired_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?)
+    }
 }
 
 #[cfg(test)]

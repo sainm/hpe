@@ -19,6 +19,7 @@ import { ConsentPage } from "./pages/Consent";
 import { PluginsPage } from "./pages/Plugins";
 import { SettingsPage } from "./pages/Settings";
 import { SkillsPage } from "./pages/Skills";
+import { TriggersPage } from "./pages/Triggers";
 import { WorkflowsPage } from "./pages/Workflows";
 
 const rootRoute = createRootRoute({ component: AppShell });
@@ -51,6 +52,12 @@ const skillsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/skills",
   component: SkillsPage,
+});
+
+const triggersRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/triggers",
+  component: TriggersPage,
 });
 
 const pluginsRoute = createRoute({
@@ -125,6 +132,7 @@ const routeTree = rootRoute.addChildren([
   designerRoute,
   agentsRoute,
   skillsRoute,
+  triggersRoute,
   pluginsRoute,
   connectorsRoute,
   mcpRoute,

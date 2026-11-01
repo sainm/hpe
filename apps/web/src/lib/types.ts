@@ -1196,3 +1196,54 @@ export interface OauthConsentRequest {
   expiresAt: number;
   authenticated: boolean;
 }
+
+export interface TriggerSchedule {
+  cron: string;
+  timezone: string;
+  misfire: "skip" | "run_once" | "catch_up" | string;
+  maxCatchUp: number;
+  input?: JsonValue;
+}
+
+export interface TriggerWebhook {
+  url: string;
+  hasSecret: boolean;
+  slug?: string | null;
+  signatureHeader: string;
+}
+
+export interface TriggerSummary {
+  workflowId: string;
+  triggerId: string;
+  kind: "schedule" | "webhook" | "event" | "mcp" | string;
+  enabled: boolean;
+  workflowVersion: string | null;
+  schedule: TriggerSchedule | null;
+  webhook: TriggerWebhook | null;
+  nextFireAt: number | null;
+  lastFireAt: number | null;
+  lastExecutionId: string | null;
+  lastStatus: string | null;
+  updatedAt: string;
+}
+
+export interface TriggerFire {
+  id: string;
+  workflowId: string;
+  triggerId: string;
+  kind: string;
+  firedAt: string;
+  scheduledAt: string | null;
+  executionId: string | null;
+  status: string;
+  eventId: string | null;
+  detailJson: string | null;
+}
+
+export interface TriggerFireResult {
+  executionId: string;
+  workflowId: string;
+  workflowVersion: string;
+  triggerId: string;
+  kind: string;
+}

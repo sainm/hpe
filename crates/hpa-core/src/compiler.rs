@@ -167,6 +167,7 @@ impl<'a> Builder<'a> {
     }
 
     fn run(mut self) -> Result<Compilation, Vec<Issue>> {
+        self.check_triggers();
         self.check_subflow_ids();
         let root_graph = self.workflow.root_graph();
         self.collect_graph_ids(&root_graph, "$");
@@ -1592,6 +1593,34 @@ impl<'a> Builder<'a> {
                     self.edge_ids.len()
                 ),
             );
+        }
+    }
+
+    fn check_triggers(&mut self) {
+        let triggers = self.workflow.triggers.clone();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for (index, trigger) in triggers.iter().enumerate() {
+            let path = format!("$.triggers[{index}]");
+            if !seen.insert(trigger.id.clone()) {
+                self.error(
+                    "TRIGGER_ID_DUPLICATE",
+                    format!("{path}.id"),
+                    format!("trigger id `{}` is used more than once", trigger.id),
+                );
+            }
+            match crate::trigger::parse_trigger(trigger) {
+                Ok(crate::trigger::TriggerSpec::Event) => {
+                    self.warning(
+                        "TRIGGER_EVENT_NOT_WIRED",
+                        path,
+                        "event triggers are accepted but no event bus is implemented yet; use schedule or webhook",
+                    );
+                }
+                Ok(_) => {}
+                Err(message) => {
+                    self.error("TRIGGER_INVALID", path, message);
+                }
+            }
         }
     }
 

@@ -6,12 +6,14 @@ mod db;
 mod driver;
 mod enterprise;
 mod enterprise_ops;
+mod hooks;
 mod mcp;
 mod mcp_client;
 mod mcp_http;
 mod oauth;
 mod oauth_http;
 mod plugin;
+mod scheduler;
 mod skills;
 mod worker;
 mod worker_daemon;
@@ -1268,6 +1270,7 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(120),
         );
+    let scheduler = scheduler::spawn(enterprise.clone());
     let app = Router::new()
         .merge(enterprise::router(enterprise))
         .merge(mcp_http::router(gateway))
@@ -1289,6 +1292,7 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    scheduler.abort();
     Ok(())
 }
 

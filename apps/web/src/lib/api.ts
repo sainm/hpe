@@ -65,6 +65,9 @@ import type {
   SkillShow,
   SkillTestResult,
   Stats,
+  TriggerFire,
+  TriggerFireResult,
+  TriggerSummary,
   ValidationResult,
   VersionSummary,
   WorkflowDetail,
@@ -775,6 +778,26 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ decision, remember }),
     }),
+  triggers: (workflowId?: string) =>
+    request<{ tenantId: string; triggers: TriggerSummary[] }>(
+      `/triggers${workflowId ? `?workflowId=${encodeURIComponent(workflowId)}` : ""}`,
+    ),
+  triggerFires: (limit = 50) => request<{ fires: TriggerFire[] }>(`/trigger-fires?limit=${limit}`),
+  enableTrigger: (workflowId: string, triggerId: string) =>
+    request<{ workflowId: string; triggerId: string; enabled: boolean; nextFireAt: number | null }>(
+      `/triggers/${encodeURIComponent(workflowId)}/${encodeURIComponent(triggerId)}/enable`,
+      { method: "POST" },
+    ),
+  disableTrigger: (workflowId: string, triggerId: string) =>
+    request<{ workflowId: string; triggerId: string; enabled: boolean }>(
+      `/triggers/${encodeURIComponent(workflowId)}/${encodeURIComponent(triggerId)}/disable`,
+      { method: "POST" },
+    ),
+  fireTrigger: (workflowId: string, triggerId: string, input?: JsonValue) =>
+    request<TriggerFireResult>(
+      `/triggers/${encodeURIComponent(workflowId)}/${encodeURIComponent(triggerId)}/fire`,
+      { method: "POST", body: JSON.stringify({ input: input ?? {} }) },
+    ),
   enterpriseOidc: () => request<EnterpriseOidc>("/enterprise/oidc"),
   enterpriseSaveOidc: (body: EnterpriseOidc) =>
     request<EnterpriseOidc>("/enterprise/oidc", {

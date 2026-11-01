@@ -3,7 +3,18 @@ import path from "node:path";
 
 const root = process.cwd();
 const forbidden = /\b(hisha|auralis)\b/i;
-const skipDirs = new Set([".git", "node_modules", "target", "dist", "build", ".next", "coverage", ".qoder", ".hpa"]);
+const skipDirs = new Set([
+  ".git",
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  ".next",
+  "coverage",
+  ".qoder",
+  ".hpa",
+  ".workbuddy",
+]);
 const binaryExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".zip", ".gz", ".vsix"]);
 const allowedFiles = new Set([
   "README.md",

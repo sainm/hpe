@@ -35,8 +35,8 @@ use crate::agent::{self, AgentError, AgentLimits, AgentRuntime, AgentStart};
 use crate::connector::{self, ConnectionInput, ConnectorError, ConnectorRuntime};
 use crate::db::{
     AgentApprovalRow, AgentEventRow, AgentSessionRow, AgentVersionRow, ArtifactRow, Db, DbError,
-    ExecutionRow, McpServerRow, SkillRunRow, SkillSummaryRow, SkillVersionRow, WorkflowRow,
-    WorkflowVersionRow, parse_state,
+    ExecutionRow, McpServerRow, SkillRunRow, SkillSummaryRow, SkillVersionRow, TriggerStateRow,
+    WorkflowRow, WorkflowVersionRow, parse_state,
 };
 use crate::driver::RuntimeManager;
 use crate::mcp::{self, McpService};
@@ -48,6 +48,7 @@ const BRAND_JSON: &str = include_str!("../../../branding/brand.json");
 
 #[derive(Clone)]
 pub struct ApiState {
+    pub tenant_id: String,
     pub db: Db,
     pub runtime: RuntimeManager,
     pub agents: AgentRuntime,
@@ -56,6 +57,16 @@ pub struct ApiState {
     pub data_dir: PathBuf,
     pub mcp_base_url: String,
     pub worker_queue: Option<crate::worker::WorkerService>,
+}
+
+impl ApiState {
+    pub(crate) fn trigger_host(&self) -> crate::scheduler::TriggerHost {
+        crate::scheduler::TriggerHost::new(
+            self.db.clone(),
+            self.runtime.clone(),
+            self.tenant_id.clone(),
+        )
+    }
 }
 
 fn worker_api_error(error: crate::worker::WorkerError) -> ApiError {
@@ -176,6 +187,20 @@ pub fn router(state: ApiState) -> Router {
             "/skill-runs/{id}/artifacts/{artifact_id}",
             get(get_skill_artifact),
         )
+        .route("/triggers", get(list_triggers_api))
+        .route(
+            "/triggers/{workflow_id}/{trigger_id}/enable",
+            post(enable_trigger_api),
+        )
+        .route(
+            "/triggers/{workflow_id}/{trigger_id}/disable",
+            post(disable_trigger_api),
+        )
+        .route(
+            "/triggers/{workflow_id}/{trigger_id}/fire",
+            post(fire_trigger_api),
+        )
+        .route("/trigger-fires", get(list_trigger_fires_api))
         .route("/mcp/overview", get(mcp_overview))
         .route("/mcp/catalog", get(mcp_catalog))
         .route("/mcp/call", post(mcp_call))
@@ -599,7 +624,7 @@ async fn publish_workflow(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("workflow `{id}` not found")))?;
     let ir: Value = serde_json::from_str(&row.ir_json)?;
-    let (_workflow, _canonical, yaml) = validate_ir(&ir)?;
+    let (workflow, _canonical, yaml) = validate_ir(&ir)?;
     row.yaml = yaml;
     row.published = 1;
     row.updated_at = now_rfc3339();
@@ -619,6 +644,9 @@ async fn publish_workflow(
             ),
             other => ApiError::internal(other.to_string()),
         })?;
+    crate::scheduler::sync_published(&state.trigger_host(), &workflow, &row.version)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(WorkflowSummary::from(&row)))
 }
 
@@ -2630,4 +2658,201 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+// ---- triggers ----------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+struct TriggerListQuery {
+    #[serde(default, rename = "workflowId")]
+    workflow_id: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+fn trigger_error(error: crate::scheduler::TriggerError) -> ApiError {
+    use crate::scheduler::TriggerError;
+    match error {
+        TriggerError::NotFound {
+            workflow_id,
+            trigger_id,
+        } => ApiError::not_found(format!(
+            "trigger `{trigger_id}` of workflow `{workflow_id}` was not found"
+        )),
+        TriggerError::Disabled { trigger_id } => ApiError::conflict(
+            "TRIGGER_DISABLED",
+            format!("trigger `{trigger_id}` is disabled"),
+        ),
+        TriggerError::Unsupported { trigger_id, kind } => ApiError::bad_request(
+            "TRIGGER_UNSUPPORTED",
+            format!("trigger `{trigger_id}` of kind `{kind}` cannot be fired"),
+        ),
+        TriggerError::Duplicate { event_id } => ApiError::conflict(
+            "TRIGGER_DUPLICATE",
+            format!("event `{event_id}` was already delivered"),
+        ),
+        TriggerError::VersionMissing {
+            workflow_id,
+            version,
+        } => ApiError::conflict(
+            "TRIGGER_VERSION_MISSING",
+            format!("workflow `{workflow_id}` has no published version `{version}`"),
+        ),
+        TriggerError::Invalid(message) => ApiError::bad_request("TRIGGER_INVALID", message),
+        TriggerError::Runtime(message) => ApiError::internal(message),
+        TriggerError::Db(error) => ApiError::internal(error.to_string()),
+    }
+}
+
+fn trigger_value(row: &TriggerStateRow, state: &ApiState) -> Value {
+    let trigger = hpa_core::ir::Trigger {
+        id: row.trigger_id.clone(),
+        trigger_type: match row.kind.as_str() {
+            "webhook" => hpa_core::ir::TriggerType::Webhook,
+            "event" => hpa_core::ir::TriggerType::Event,
+            "mcp" => hpa_core::ir::TriggerType::Mcp,
+            _ => hpa_core::ir::TriggerType::Schedule,
+        },
+        config: serde_json::from_str(&row.config_json).unwrap_or_else(|_| json!({})),
+    };
+    let mut schedule = Value::Null;
+    let mut webhook = Value::Null;
+    match hpa_core::trigger::parse_trigger(&trigger) {
+        Ok(hpa_core::trigger::TriggerSpec::Schedule(spec)) => {
+            schedule = json!({
+                "cron": spec.cron_raw,
+                "timezone": spec.offset_text,
+                "misfire": match spec.misfire {
+                    hpa_core::trigger::MisfirePolicy::Skip => "skip",
+                    hpa_core::trigger::MisfirePolicy::RunOnce => "run_once",
+                    hpa_core::trigger::MisfirePolicy::CatchUp => "catch_up",
+                },
+                "maxCatchUp": spec.max_catch_up,
+                "input": spec.input,
+            });
+        }
+        Ok(hpa_core::trigger::TriggerSpec::Webhook(spec)) => {
+            webhook = json!({
+                "url": format!(
+                    "{}/hooks/{}/{}/{}",
+                    state.mcp_base_url, state.tenant_id, row.workflow_id, row.trigger_id
+                ),
+                "hasSecret": spec.secret.is_some(),
+                "slug": spec.slug,
+                "signatureHeader": "X-HPA-Signature",
+            });
+        }
+        _ => {}
+    }
+    json!({
+        "workflowId": row.workflow_id,
+        "triggerId": row.trigger_id,
+        "kind": row.kind,
+        "enabled": row.enabled != 0,
+        "workflowVersion": row.workflow_version,
+        "schedule": schedule,
+        "webhook": webhook,
+        "nextFireAt": row.next_fire_at,
+        "lastFireAt": row.last_fire_at,
+        "lastExecutionId": row.last_execution_id,
+        "lastStatus": row.last_status,
+        "updatedAt": row.updated_at,
+    })
+}
+
+async fn list_triggers_api(
+    State(state): State<ApiState>,
+    Query(query): Query<TriggerListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let rows = state.db.list_triggers().await?;
+    let values = rows
+        .iter()
+        .filter(|row| {
+            query
+                .workflow_id
+                .as_deref()
+                .is_none_or(|workflow_id| row.workflow_id == workflow_id)
+        })
+        .map(|row| trigger_value(row, &state))
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "tenantId": state.tenant_id,
+        "triggers": values,
+    })))
+}
+
+async fn enable_trigger_api(
+    State(state): State<ApiState>,
+    Path((workflow_id, trigger_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let next =
+        crate::scheduler::set_enabled(&state.trigger_host(), &workflow_id, &trigger_id, true)
+            .await
+            .map_err(trigger_error)?;
+    Ok(Json(json!({
+        "workflowId": workflow_id,
+        "triggerId": trigger_id,
+        "enabled": true,
+        "nextFireAt": next,
+    })))
+}
+
+async fn disable_trigger_api(
+    State(state): State<ApiState>,
+    Path((workflow_id, trigger_id)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    crate::scheduler::set_enabled(&state.trigger_host(), &workflow_id, &trigger_id, false)
+        .await
+        .map_err(trigger_error)?;
+    Ok(Json(json!({
+        "workflowId": workflow_id,
+        "triggerId": trigger_id,
+        "enabled": false,
+        "nextFireAt": Value::Null,
+    })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct FireTriggerRequest {
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+async fn fire_trigger_api(
+    State(state): State<ApiState>,
+    Path((workflow_id, trigger_id)): Path<(String, String)>,
+    body: Option<Json<FireTriggerRequest>>,
+) -> Result<Json<Value>, ApiError> {
+    let input = body
+        .and_then(|Json(request)| request.input)
+        .unwrap_or_else(|| json!({}));
+    let outcome = crate::scheduler::fire_now(
+        &state.trigger_host(),
+        crate::scheduler::FireRequest {
+            workflow_id,
+            trigger_id,
+            input,
+            event_id: None,
+            scheduled_at: None,
+            origin: "manual".to_string(),
+        },
+    )
+    .await
+    .map_err(trigger_error)?;
+    Ok(Json(json!({
+        "executionId": outcome.execution_id,
+        "workflowId": outcome.workflow_id,
+        "workflowVersion": outcome.workflow_version,
+        "triggerId": outcome.trigger_id,
+        "kind": outcome.kind,
+    })))
+}
+
+async fn list_trigger_fires_api(
+    State(state): State<ApiState>,
+    Query(query): Query<TriggerListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let fires = state.db.list_trigger_fires(limit).await?;
+    Ok(Json(json!({ "fires": fires })))
 }

@@ -27,7 +27,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 
 ## 当前状态
 
-**Phase 1 至 Phase 10 已收口并通过本地验收。** 产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
+**Phase 1 至 Phase 11 已收口并通过本地验收。** 产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
 
 - Rust Core：Canonical Workflow IR、JSON Schema 校验、Saphyr YAML 解析/输出、jaq 表达式、编译器与执行计划；Schema/静态/表达式/依赖/权限与执行策略五类校验；Node Registry（13 类节点、`typeVersion` 解析、旧版 `http.request@0.9.0` 迁移）。
 - Runtime：顺序/条件/多路分支/循环/并行节点、重试/退避、节点超时、错误回退、人工审批暂停与恢复、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。
@@ -51,6 +51,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 - VS Code & Copilot 集成：`apps/vscode-extension`（`hpa.workbench`）薄客户端，10 个 Tree View、状态栏、Runtime 发现/重连、Workflow 运行与执行 Webview、事件/审批/取消、产物预览；Skill 安装/更新/移除到 `.github/skills` 或个人目录，备份回滚与本地修改检测；官方 `mcpServerDefinitionProviders` 注册本地 MCP Server，PAT 仅存 SecretStorage；`X-HPA-Tool-Name-Style: slug` 适配 VS Code 工具名限制。扩展不执行工作区脚本，未信任工作区只读。
 - Hybrid Worker：`hpa worker` 出站轮询控制面，同一 Rust Runtime 执行 Workflow 快照；一次性 `hpa_wrk_` token（租户绑定、SHA-256）、能力/并发、30s 租约、心跳续租、租约过期重排、旧 lease 409、协作取消；首次 start 写回租户 execution/events/artifacts，`remote_executions` 阻止本地 Runtime 接管；审批后 Job 重排恢复；Enterprise Worker Center 注册/派发/队列/取消。
 - Browser SSO：OIDC Authorization Code + PKCE（S256，public client）、state/nonce/redirect 校验、EdDSA/RS256/ES256 ID Token、JWKS/OKP/RSA/P-256；服务端 session 只存 token 哈希，`hpa_session` HttpOnly/SameSite=Lax Cookie、CSRF header、登录/会话/登出与失效；成员目录 disabled 拒绝、active 角色覆盖、租户 active 校验、平台管理员 `adminSubjects` allowlist；`/login` 与 Enterprise Center 浏览器登录、ja/en/zh；本地匿名模式与 `hpa_ent_`/OIDC Bearer/Worker/VS Code 认证不回归。
+- 触发器与调度：`schedule`（自研 5 字段 cron、固定偏移时区、skip/run_once/catch_up 漏跑策略、乐观锁单飞）与 `webhook`（HMAC-SHA256 签名、±300s 重放窗口、`X-HPA-Event-Id` 幂等、进程内限流）真正驱动已发布版本；`trigger_state`/`trigger_fires` 持久化，重启不丢计划；Triggers 控制台展示下次触发、最近触发与启停。
 - OAuth 2.1 授权服务器：内置 AS，Authorization Code + PKCE(S256)、动态客户端注册（RFC 7591）、刷新令牌轮换与复用检测、吊销（RFC 7009）与内省（RFC 7662）、ES256/EdDSA 签发与 24h 轮换重叠的 JWKS；同意页与 Enterprise Center 的 OAuth 控制台；MCP Gateway 除 PAT 外接受 AS 签发的访问令牌。
 - 品牌门禁：`scripts/check-brand.mjs` 保证技术标识不混入显示名。
 
@@ -99,6 +100,10 @@ Phase 9 验收：浏览器完成 `/login` → mock IdP 授权码 → `/auth/oidc
 Phase 10 验收：`/oauth/register` 注册公共客户端 → `/oauth/authorize` 302 到 `/consent` → 同意 → 回调收码 → `/oauth/token` 换取访问/刷新令牌 → 用访问令牌调用 `/mcp` `server/discover` 成功 → 内省 active → 刷新令牌轮换 → 吊销后 `/mcp` 401。负向覆盖未注册 `redirect_uri`（400 且不重定向）、缺少 PKCE、`plain` 方法、未注册 scope（带 `state` 回到客户端）、错误 `code_verifier`、授权码重放、刷新令牌复用触发整链吊销、拒绝授权 `access_denied`、错误客户端密钥 401、停用客户端后密钥轮换 409。Playwright 真实浏览器完成同一流程并在 1440/607 截图，两页均无横向溢出；控制台列出客户端与已签发令牌。Rust 新增 4 个单元测试与 4 个 HTTP 集成测试，`cargo clippy --workspace --all-targets -- -D warnings`、`cargo fmt --all --check`、品牌门禁与 IR 门禁通过；Web typecheck、10 Vitest（新增 Consent / EnterpriseOAuth 文案门禁）与 build 通过。
 
 实现与边界详见 [`docs/08-platform/oauth-authorization-server.md`](docs/08-platform/oauth-authorization-server.md)。
+
+Phase 11 验收：发布带 `schedule` + `webhook` + `event` 三个触发器的工作流后，`GET /api/triggers` 返回 3 行（`event` 为禁用占位），`next_fire_at` 落在 `09:00 +08:00` 的整分边界；带 `sha256=` 签名的投递返回 202 并生成执行，重复 `X-HPA-Event-Id` 返回 409，错误签名/过期时间戳/缺签名返回 401，未知触发器 404，停用后 409；手动触发与 `/api/trigger-fires` 正常。调度语义用注入时钟测试：到期触发一次并推进、同一时刻重复 tick 不重复、`skip` 丢弃迟到 10 分钟的 slot、`catch_up` 按上限补齐并跳过剩余。Playwright 完成「建工作流→发布→Webhook 投递→手动触发→停用/启用→界面触发」并在 1440/607 截图，无横向溢出。新增 cron/契约单元测试 10 个、调度单元测试 5 个、触发器 HTTP 集成测试 2 个；Web 11 Vitest（新增插值门禁，禁止单花括号占位符）与 build 通过。
+
+实现与边界详见 [`docs/03-workflow/triggers.md`](docs/03-workflow/triggers.md)。
 
 ## 运行
 
@@ -220,6 +225,19 @@ curl -s http://127.0.0.1:8787/oauth/jwks
 HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase10-oauth-e2e.mjs
 ```
 
+触发器：在 Workflow IR 里加 `triggers`，发布后到 `/triggers` 查看下次触发时间；Webhook 用 HMAC 签名投递：
+
+```bash
+TS=$(date +%s)
+BODY='{"action":"published"}'
+SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -r | cut -d' ' -f1)
+curl -sS -X POST http://127.0.0.1:8787/hooks/<workflowId>/<triggerId> \
+  -H "content-type: application/json" -H "x-hpa-timestamp: $TS" \
+  -H "x-hpa-signature: sha256=$SIG" -d "$BODY"
+
+HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase11-triggers-e2e.mjs
+```
+
 开发模式：
 
 ```bash
@@ -306,6 +324,18 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npm run dev
 - 不调用 UserInfo，只验证 ID Token；不支持第三方 Cookie、SameSite=None、IdP 侧登出或 IdP 会话管理。mock IdP 只用于本地验收。
 - 单节点 SQLite：flow/session 表不跨节点共享；登录失败只返回稳定错误码，不向浏览器区分用户不存在与角色无效。
 
+## Phase 11 行为边界
+
+- 只有 `schedule` 与 `webhook` 会真正执行；`event` 通过校验但明确不接线（控制台显示“未接线”），`mcp` 走 `workflow.execute` 工具。
+- 触发器只运行**已发布版本**；改草稿不影响正在跑的调度，重新发布会重算 `next_fire_at` 并保留历史。
+- cron 是自研 5 字段实现，不支持秒级、`@daily` 别名、`L`/`W`/`#` 扩展；日与周同时受限按并集处理。
+- 时区只接受 `UTC` 与固定偏移（`+08:00`），没有 IANA 时区库，因此不处理夏令时。
+- `skip` 的迟到阈值固定 60 秒；没有抖动、退避、并发上限或每触发器配额。
+- Webhook 只支持 HMAC-SHA256 + 时间戳窗口 + 可选事件 ID 去重；不支持 mTLS、IP 白名单、请求体 schema 校验或同步返回执行结果。
+- 签名密钥以明文存在租户库的 `config_json` 里（与 Workflow 快照同库），轮换需要改 IR 并重新发布。
+- 调度器每节点各自 tick，靠 `next_fire_at` 乐观锁避免重复触发；没有 leader 选举、分布式队列或跨节点时钟对齐。
+- 调度只在本机启动执行，不派发到 Hybrid Worker；远程派发仍走显式 Worker Job 流程。
+
 ## Phase 10 行为边界
 
 - 只做授权服务器（AS），不做身份提供方：不签发 ID Token、没有 `/userinfo`、不支持 `openid` scope 或用户注册；登录仍由 Phase 9 的 OIDC SSO 或本地匿名模式提供。
@@ -361,6 +391,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npm run dev
 | Hybrid Worker 协议 | [`docs/08-platform/hybrid-workers.md`](docs/08-platform/hybrid-workers.md) |
 | Hybrid Worker 私有部署 | [`docs/08-platform/hybrid-worker-deployment.md`](docs/08-platform/hybrid-worker-deployment.md) |
 | OAuth 2.1 授权服务器 | [`docs/08-platform/oauth-authorization-server.md`](docs/08-platform/oauth-authorization-server.md) |
+| 触发器与调度 | [`docs/03-workflow/triggers.md`](docs/03-workflow/triggers.md) |
 | VS Code / Copilot 集成 | [`docs/14-vscode-copilot/README.md`](docs/14-vscode-copilot/README.md) |
 | VS Code Phase 7 本地实现 | [`docs/14-vscode-copilot/local-implementation.md`](docs/14-vscode-copilot/local-implementation.md) |
 | 研究证据与许可证 | [`docs/01-research/README.md`](docs/01-research/README.md) |

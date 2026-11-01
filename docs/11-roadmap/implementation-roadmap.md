@@ -201,6 +201,20 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 已实现 `crates/hpa-local/src/oauth.rs` + `oauth_http.rs`、`/consent` 页面与 Enterprise Center OAuth 标签页。4 个单元测试与 4 个 HTTP 集成测试通过；Playwright 走通「注册 → 授权 → 同意 → 换令牌 → 调用 MCP → 吊销」并覆盖 1440/607 截图；MCP PAT 与 stdio 令牌路径不回归。不做 ID Token、CIMD、PAR、JARM、DPoP、token exchange、RS256 与跨节点吊销同步。详见 [`docs/08-platform/oauth-authorization-server.md`](../08-platform/oauth-authorization-server.md)。
 
+## 8e. Phase 11：触发器与调度
+
+### 范围
+
+- `trigger.config` 强类型化：schedule（cron/时区/misfire/maxCatchUp/input）与 webhook（secret/enabled），未知字段拒绝。
+- 自研 5 字段 cron（`*`/列表/区间/步长/月周缩写，日周并集语义）与固定偏移时区；无新依赖。
+- 调度器：`trigger_state` 持久化 `next_fire_at`，每秒 tick，乐观锁单飞，skip/run_once/catch_up 三种漏跑策略。
+- Webhook 入站：HMAC-SHA256 + `±300s` 重放窗口 + `X-HPA-Event-Id` 幂等 + 1 MiB 体积上限 + 进程内限流。
+- 发布即同步触发器快照；`/api/triggers` 启停/手动触发/触发历史；`/triggers` 控制台（ja/en/zh）。
+
+### 本地实现状态（2026-11-01）
+
+已实现 `crates/hpa-core/src/trigger.rs`（cron 与契约）、`crates/hpa-local/src/scheduler.rs`（调度与发火）、`hooks.rs`（入站）、`db.rs` 的 `trigger_state`/`trigger_fires`，以及 `/triggers` 页面。10 个 cron/契约单元测试、5 个调度单元测试、2 个 HTTP 集成测试通过；Playwright 覆盖建流程→发布→Webhook→手动触发→启停→界面触发，1440/607 无横向溢出。不做事件总线、分布式调度、DST 时区、mTLS/IP 白名单与远程 Worker 派发。详见 [`docs/03-workflow/triggers.md`](../03-workflow/triggers.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid

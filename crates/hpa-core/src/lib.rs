@@ -5,5 +5,6 @@ pub mod ir;
 pub mod registry;
 pub mod runtime;
 pub mod schema;
+pub mod trigger;
 pub mod validator;
 pub mod yaml;
