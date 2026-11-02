@@ -40,6 +40,7 @@ HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db cargo test -p hpa-local --t
 
 # 端到端
 node scripts/run-local-e2e.mjs
+HPA_POSTGRES_URL=postgresql://user@host:5432/empty_db node scripts/multi-node-e2e.mjs
 ```
 
 说明：

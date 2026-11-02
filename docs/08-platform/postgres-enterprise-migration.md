@@ -83,6 +83,19 @@
 
 `postgres_session_store` 证明：节点 A 创建的会话，节点 B（空 data dir）用同一 Cookie 通过认证并拿到 `platformAdmin`；节点 B 登出后该行在 PostgreSQL 标记 `revoked_at`，两节点都拒绝；任一节点的 SQLite `enterprise_sessions` 保持 0 行。
 
+## 4.1 双节点验收
+
+`node scripts/multi-node-e2e.mjs`（需要指向空库的 `HPA_POSTGRES_URL`）会启动两个共享同一 PostgreSQL 的控制面节点，逐项断言：
+
+| 断言 | 说明 |
+| --- | --- |
+| `shared-admin-token` | `enterprise init` 写入的令牌在两个节点都可用 |
+| `shared-quota` | 节点 A 设置配额，节点 B 读到同一值 |
+| `execution-visible-on-b` | 节点 A 发起的工作流在节点 B 查询为 `succeeded` |
+| `worker-executes-across-nodes` | Worker 注册在 A，daemon 连 B 领取并完成 |
+| `shared-revocation` | A 吊销令牌后 B 立即 401 |
+| `late-node-joins` | 后启动的第三个节点直接可用 |
+
 ## 5. 验证
 
 ```bash
