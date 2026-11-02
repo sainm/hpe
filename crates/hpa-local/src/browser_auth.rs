@@ -14,6 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::enterprise_ops::{OidcPrincipal, OpsError, OpsService};
+use hpa_local::postgres_control::{PostgresControlStore, SessionRecord};
 
 const SESSION_COOKIE: &str = "hpa_session";
 const FLOW_TTL_MS: i64 = 600_000;
@@ -31,6 +32,7 @@ const SECRET_ENVELOPE_VERSION: &str = "v1";
 pub struct BrowserAuth {
     control: SqlitePool,
     ops: OpsService,
+    postgres: Option<PostgresControlStore>,
 }
 
 #[allow(dead_code)]
@@ -256,7 +258,19 @@ struct StoredSession {
 
 impl BrowserAuth {
     pub fn new(control: SqlitePool, ops: OpsService) -> Self {
-        Self { control, ops }
+        Self {
+            control,
+            ops,
+            postgres: None,
+        }
+    }
+
+    /// Sessions move to PostgreSQL when the control plane runs on it, so a
+    /// cookie issued by one node is accepted by every other node.
+    #[allow(dead_code)]
+    pub fn with_postgres(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.postgres = Some(PostgresControlStore::new(pool));
+        self
     }
 
     pub async fn ensure_schema(&self) -> Result<(), BrowserAuthError> {
@@ -538,11 +552,15 @@ impl BrowserAuth {
             Some(member) => member.role,
             None => stored.role.clone(),
         };
-        let _ = sqlx::query("UPDATE enterprise_sessions SET last_seen_at = ? WHERE id = ?")
-            .bind(now)
-            .bind(&stored.id)
-            .execute(&self.control)
-            .await;
+        if let Some(postgres) = self.postgres.as_ref() {
+            let _ = postgres.touch_session(&stored.id, now).await;
+        } else {
+            let _ = sqlx::query("UPDATE enterprise_sessions SET last_seen_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(&stored.id)
+                .execute(&self.control)
+                .await;
+        }
         Ok(Some(principal_from_stored(stored, role)))
     }
 
@@ -727,30 +745,49 @@ impl BrowserAuth {
             }
             None => stored.id_token_ciphertext.clone(),
         };
-        let updated = sqlx::query(
-            "UPDATE enterprise_sessions
-             SET token_hash = ?, refresh_token_ciphertext = ?,
-                 refresh_token_version = refresh_token_version + 1,
-                 refresh_token_expires_at = ?, id_token_ciphertext = ?,
-                 access_token_expires_at = ?, expires_at = ?,
-                 last_refresh_at = ?, last_seen_at = ?
-             WHERE id = ? AND token_hash = ? AND refresh_token_version = ?
-               AND revoked_at IS NULL",
-        )
-        .bind(&new_token_hash)
-        .bind(&refresh_ciphertext)
-        .bind(refresh_expires_at)
-        .bind(&id_token_ciphertext)
-        .bind(grant.access_token_expires_at)
-        .bind(session_expires_at)
-        .bind(refreshed_at)
-        .bind(refreshed_at)
-        .bind(&stored.id)
-        .bind(&token_hash)
-        .bind(stored.refresh_token_version)
-        .execute(&self.control)
-        .await?;
-        if updated.rows_affected() != 1 {
+        let rotated = if let Some(postgres) = self.postgres.as_ref() {
+            postgres
+                .rotate_session_tokens(
+                    &stored.id,
+                    &token_hash,
+                    i32::try_from(stored.refresh_token_version).unwrap_or_default(),
+                    &new_token_hash,
+                    Some(refresh_ciphertext.as_str()),
+                    refresh_expires_at,
+                    id_token_ciphertext.as_deref(),
+                    Some(grant.access_token_expires_at),
+                    session_expires_at,
+                    refreshed_at,
+                )
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?
+        } else {
+            let updated = sqlx::query(
+                "UPDATE enterprise_sessions
+                 SET token_hash = ?, refresh_token_ciphertext = ?,
+                     refresh_token_version = refresh_token_version + 1,
+                     refresh_token_expires_at = ?, id_token_ciphertext = ?,
+                     access_token_expires_at = ?, expires_at = ?,
+                     last_refresh_at = ?, last_seen_at = ?
+                 WHERE id = ? AND token_hash = ? AND refresh_token_version = ?
+                   AND revoked_at IS NULL",
+            )
+            .bind(&new_token_hash)
+            .bind(&refresh_ciphertext)
+            .bind(refresh_expires_at)
+            .bind(&id_token_ciphertext)
+            .bind(grant.access_token_expires_at)
+            .bind(session_expires_at)
+            .bind(refreshed_at)
+            .bind(refreshed_at)
+            .bind(&stored.id)
+            .bind(&token_hash)
+            .bind(stored.refresh_token_version)
+            .execute(&self.control)
+            .await?;
+            updated.rows_affected() == 1
+        };
+        if !rotated {
             self.revoke_session_id(&stored.id).await?;
             return Err(BrowserAuthError::Forbidden(
                 "session_refresh_replay".to_string(),
@@ -803,14 +840,23 @@ impl BrowserAuth {
                         .ok()
                 })
             });
-        let revoked = sqlx::query(
-            "UPDATE enterprise_sessions SET revoked_at = ?
-             WHERE token_hash = ? AND revoked_at IS NULL",
-        )
-        .bind(now_ms())
-        .bind(&token_hash)
-        .execute(&self.control)
-        .await?;
+        let revoked = if let Some(postgres) = self.postgres.as_ref() {
+            postgres
+                .revoke_session_by_hash(&token_hash, now_ms())
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?
+        } else {
+            sqlx::query(
+                "UPDATE enterprise_sessions SET revoked_at = ?
+                 WHERE token_hash = ? AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(&token_hash)
+            .execute(&self.control)
+            .await?
+            .rows_affected()
+                > 0
+        };
         let logout_url = match (
             stored.as_ref(),
             id_token,
@@ -824,7 +870,7 @@ impl BrowserAuth {
             _ => None,
         };
         Ok(LogoutResult {
-            revoked: revoked.rows_affected() > 0,
+            revoked,
             cookie: clear_cookie,
             logout_url,
         })
@@ -885,6 +931,12 @@ impl BrowserAuth {
     }
 
     pub async fn revoke_tenant_sessions(&self, tenant_id: &str) -> Result<usize, BrowserAuthError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .revoke_tenant_sessions(tenant_id, now_ms())
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()));
+        }
         let revoked = sqlx::query(
             "UPDATE enterprise_sessions SET revoked_at = ?
              WHERE tenant_id = ? AND revoked_at IS NULL",
@@ -911,6 +963,14 @@ impl BrowserAuth {
         &self,
         token_hash: &str,
     ) -> Result<Option<StoredSession>, BrowserAuthError> {
+        if let Some(postgres) = self.postgres.as_ref()
+            && let Some(record) = postgres
+                .session_by_hash(token_hash)
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?
+        {
+            return Ok(Some(stored_from_record(record)));
+        }
         Ok(sqlx::query_as(
             "SELECT id, csrf_token, tenant_id, subject, email, display_name, role,
                     platform_admin, expires_at, revoked_at,
@@ -926,6 +986,13 @@ impl BrowserAuth {
 
     #[allow(dead_code)]
     async fn revoke_session_id(&self, session_id: &str) -> Result<(), BrowserAuthError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            postgres
+                .revoke_session_by_id(session_id, now_ms())
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+            return Ok(());
+        }
         sqlx::query(
             "UPDATE enterprise_sessions SET revoked_at = ?
              WHERE id = ? AND revoked_at IS NULL",
@@ -1181,6 +1248,40 @@ impl BrowserAuth {
             .as_deref()
             .map(|token| self.encrypt_secret(token, &format!("id-token:{id}")))
             .transpose()?;
+        if let Some(postgres) = self.postgres.as_ref() {
+            postgres
+                .create_session(&SessionRecord {
+                    id: id.clone(),
+                    token_hash: token_hash.clone(),
+                    csrf_token: csrf_token.clone(),
+                    tenant_id: tenant_id.to_string(),
+                    subject: subject.to_string(),
+                    email: email.map(str::to_string),
+                    display_name: display_name.map(str::to_string),
+                    role: role.to_string(),
+                    platform_admin,
+                    created_at: now,
+                    expires_at,
+                    revoked_at: None,
+                    last_seen_at: Some(now),
+                    refresh_token_ciphertext: refresh_token_ciphertext.clone(),
+                    refresh_token_version: i32::try_from(refresh_token_version).unwrap_or_default(),
+                    refresh_token_expires_at: grant.refresh_token_expires_at,
+                    id_token_ciphertext: id_token_ciphertext.clone(),
+                    access_token_expires_at: Some(grant.access_token_expires_at),
+                    last_refresh_at: None,
+                })
+                .await
+                .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+            return Ok(CreatedSession {
+                id,
+                token,
+                csrf_token,
+                expires_at,
+                access_token_expires_at: Some(grant.access_token_expires_at),
+                refresh_available: refresh_token_ciphertext.is_some(),
+            });
+        }
         sqlx::query(
             "INSERT INTO enterprise_sessions
              (id, token_hash, csrf_token, tenant_id, subject, email, display_name, role,
@@ -1315,6 +1416,26 @@ fn optional_nonempty_string(
         Some(_) => Err(BrowserAuthError::Upstream(format!(
             "token response {field} is invalid"
         ))),
+    }
+}
+
+fn stored_from_record(record: SessionRecord) -> StoredSession {
+    StoredSession {
+        id: record.id,
+        csrf_token: record.csrf_token,
+        tenant_id: record.tenant_id,
+        subject: record.subject,
+        email: record.email,
+        display_name: record.display_name,
+        role: record.role,
+        platform_admin: i64::from(record.platform_admin),
+        expires_at: record.expires_at,
+        revoked_at: record.revoked_at,
+        refresh_token_ciphertext: record.refresh_token_ciphertext,
+        refresh_token_version: i64::from(record.refresh_token_version),
+        refresh_token_expires_at: record.refresh_token_expires_at,
+        id_token_ciphertext: record.id_token_ciphertext,
+        access_token_expires_at: record.access_token_expires_at,
     }
 }
 

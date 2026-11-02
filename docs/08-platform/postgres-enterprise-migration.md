@@ -26,7 +26,8 @@
 | 配额 | **权威** | 镜像 + **读取** | 读路径已在 PG 模式下走 PostgreSQL |
 | 成员 | **权威** | 镜像（写穿） | 创建/更新/删除同步到 PG |
 | SCIM Group / 映射 | **权威** | 未镜像 | 依赖成员表，翻转时一起处理 |
-| 浏览器会话 / OAuth AS 状态 | **权威** | 未镜像 | 含加密 token 字段，需单独迁移 |
+| 浏览器会话 | 不写 | **权威** | 读/写/轮换/登出/按租户吊销全部走 PostgreSQL |
+| OAuth AS 状态（clients/codes/tokens） | **权威** | 未迁移 | 含签名密钥与授权码，需单独迁移 |
 
 ## 3. 镜像实现
 
@@ -64,8 +65,23 @@
 1. ~~**租户读取切 PG**~~（已完成）：`ensure_tenant` / `active_tenants` 的存在性与状态判断改读 `hpa_control.tenants`；写入仍走 SQLite + 镜像。
 2. **配额权威翻转**：删除回退路径，`PUT /quotas` 先写 PG，镜像反向写 SQLite 或直接停写。
 3. **成员与 SCIM**：`scim.rs` 的 12 处成员查询、Group 映射、`browser_auth::find_member` 一起切；SCIM E2E 必须在 PG 模式下重跑（`pnpm test:scim-e2e`）。
-4. **会话与 OAuth AS 状态**：`hpa_control.sessions` / `oauth_*` 已建表，需要把加密 token 字段、refresh 轮换与 CSRF 校验一并迁移；验收标准是“节点 A 登录、节点 B 直接用同一 Cookie 通过”。
+4. ~~**浏览器会话**~~（已完成）：`hpa_control.sessions` 承接读取、创建、`last_seen` 触碰、refresh 轮换（保留 token_hash + version 双重围栏）、登出、按 id/租户吊销；SQLite 只在 PG 无该行时作为升级窗口回退。**OAuth AS 状态**（`oauth_clients/codes/tokens/consents/signing_keys`）仍未迁移，那是第 4 步剩下的部分。
 5. **停止双写**：删除 SQLite 控制面写入与 `sync_postgres_control`，`enterprise_*` 表只作为历史备份保留。
+
+### 3.4 会话（已完成）
+
+`BrowserAuth` 在 PG 模式下把会话读写全部指向 `hpa_control.sessions`：
+
+| 操作 | PG 行为 |
+| --- | --- |
+| 登录写入 | `create_session` |
+| 每次请求 | 按 token_hash 查询 + `last_seen_at` 触碰 |
+| 静默续期 | `rotate_session_tokens`：`WHERE token_hash = ? AND refresh_token_version = ?` 保留原围栏，命中 0 行即视为重放并吊销 |
+| 登出 | `revoke_session_by_hash` |
+| 刷新令牌过期/重放 | `revoke_session_by_id` |
+| 租户暂停 | `revoke_tenant_sessions` |
+
+`postgres_session_store` 证明：节点 A 创建的会话，节点 B（空 data dir）用同一 Cookie 通过认证并拿到 `platformAdmin`；节点 B 登出后该行在 PostgreSQL 标记 `revoked_at`，两节点都拒绝；任一节点的 SQLite `enterprise_sessions` 保持 0 行。
 
 ## 5. 验证
 

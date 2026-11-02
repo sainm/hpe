@@ -151,6 +151,7 @@ impl EnterpriseState {
 
     pub fn with_postgres_execution(mut self, pool: sqlx::postgres::PgPool) -> Self {
         self.workers = self.workers.clone().with_postgres(pool.clone());
+        self.browser_auth = self.browser_auth.clone().with_postgres(pool.clone());
         self.postgres_execution = Some(pool);
         self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         self

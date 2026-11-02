@@ -91,6 +91,29 @@ pub struct MemberRecord {
     pub updated_at: OffsetDateTime,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub id: String,
+    pub token_hash: String,
+    pub csrf_token: String,
+    pub tenant_id: String,
+    pub subject: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    pub role: String,
+    pub platform_admin: bool,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub revoked_at: Option<i64>,
+    pub last_seen_at: Option<i64>,
+    pub refresh_token_ciphertext: Option<String>,
+    pub refresh_token_version: i32,
+    pub refresh_token_expires_at: Option<i64>,
+    pub id_token_ciphertext: Option<String>,
+    pub access_token_expires_at: Option<i64>,
+    pub last_refresh_at: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct PostgresControlStore {
     pool: PgPool,
@@ -216,6 +239,205 @@ impl PostgresControlStore {
         .await?;
         transaction.commit().await?;
         Ok(updated.rows_affected() > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_session(&self, session: &SessionRecord) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.sessions
+             (id, token_hash, csrf_token, tenant_id, subject, email, display_name, role,
+              platform_admin, created_at, expires_at, revoked_at, last_seen_at,
+              refresh_token_ciphertext, refresh_token_version, refresh_token_expires_at,
+              id_token_ciphertext, access_token_expires_at, last_refresh_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                     $15, $16, $17, $18, $19)",
+        )
+        .bind(&session.id)
+        .bind(&session.token_hash)
+        .bind(&session.csrf_token)
+        .bind(&session.tenant_id)
+        .bind(&session.subject)
+        .bind(session.email.as_deref())
+        .bind(session.display_name.as_deref())
+        .bind(&session.role)
+        .bind(session.platform_admin)
+        .bind(session.created_at)
+        .bind(session.expires_at)
+        .bind(session.revoked_at)
+        .bind(session.last_seen_at)
+        .bind(session.refresh_token_ciphertext.as_deref())
+        .bind(session.refresh_token_version)
+        .bind(session.refresh_token_expires_at)
+        .bind(session.id_token_ciphertext.as_deref())
+        .bind(session.access_token_expires_at)
+        .bind(session.last_refresh_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn session_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<SessionRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query("SELECT * FROM hpa_control.sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        match row {
+            Some(row) => Ok(Some(SessionRecord {
+                id: row.try_get("id")?,
+                token_hash: row.try_get("token_hash")?,
+                csrf_token: row.try_get("csrf_token")?,
+                tenant_id: row.try_get("tenant_id")?,
+                subject: row.try_get("subject")?,
+                email: row.try_get("email")?,
+                display_name: row.try_get("display_name")?,
+                role: row.try_get("role")?,
+                platform_admin: row.try_get("platform_admin")?,
+                created_at: row.try_get("created_at")?,
+                expires_at: row.try_get("expires_at")?,
+                revoked_at: row.try_get("revoked_at")?,
+                last_seen_at: row.try_get("last_seen_at")?,
+                refresh_token_ciphertext: row.try_get("refresh_token_ciphertext")?,
+                refresh_token_version: row.try_get("refresh_token_version")?,
+                refresh_token_expires_at: row.try_get("refresh_token_expires_at")?,
+                id_token_ciphertext: row.try_get("id_token_ciphertext")?,
+                access_token_expires_at: row.try_get("access_token_expires_at")?,
+                last_refresh_at: row.try_get("last_refresh_at")?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn touch_session(&self, session_id: &str, at: i64) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query("UPDATE hpa_control.sessions SET last_seen_at = $2 WHERE id = $1")
+            .bind(session_id)
+            .bind(at)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn revoke_session_by_hash(
+        &self,
+        token_hash: &str,
+        at: i64,
+    ) -> Result<bool, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let revoked = sqlx::query(
+            "UPDATE hpa_control.sessions SET revoked_at = $2
+             WHERE token_hash = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(revoked.rows_affected() > 0)
+    }
+
+    pub async fn revoke_session_by_id(
+        &self,
+        session_id: &str,
+        at: i64,
+    ) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "UPDATE hpa_control.sessions SET revoked_at = $2
+             WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .bind(at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn revoke_tenant_sessions(
+        &self,
+        tenant_id: &str,
+        at: i64,
+    ) -> Result<usize, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let revoked = sqlx::query(
+            "UPDATE hpa_control.sessions SET revoked_at = $2
+             WHERE tenant_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .bind(at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(revoked.rows_affected() as usize)
+    }
+
+    /// Mirrors the SQLite refresh rotation, including its fencing conditions.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn rotate_session_tokens(
+        &self,
+        session_id: &str,
+        expected_hash: &str,
+        expected_version: i32,
+        new_hash: &str,
+        refresh_token_ciphertext: Option<&str>,
+        refresh_token_expires_at: Option<i64>,
+        id_token_ciphertext: Option<&str>,
+        access_token_expires_at: Option<i64>,
+        expires_at: i64,
+        refreshed_at: i64,
+    ) -> Result<bool, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let updated = sqlx::query(
+            "UPDATE hpa_control.sessions
+             SET token_hash = $3, refresh_token_ciphertext = $4,
+                 refresh_token_version = refresh_token_version + 1,
+                 refresh_token_expires_at = $5, id_token_ciphertext = $6,
+                 access_token_expires_at = $7, expires_at = $8,
+                 last_refresh_at = $9, last_seen_at = $9
+             WHERE id = $1 AND token_hash = $2 AND refresh_token_version = $10
+               AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .bind(expected_hash)
+        .bind(new_hash)
+        .bind(refresh_token_ciphertext)
+        .bind(refresh_token_expires_at)
+        .bind(id_token_ciphertext)
+        .bind(access_token_expires_at)
+        .bind(expires_at)
+        .bind(refreshed_at)
+        .bind(expected_version)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    pub async fn session_tokens(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT refresh_token_ciphertext, id_token_ciphertext
+             FROM hpa_control.sessions WHERE id = $1",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        match row {
+            Some(row) => Ok(Some((row.try_get(0)?, row.try_get(1)?))),
+            None => Ok(None),
+        }
     }
 
     pub async fn upsert_tenant(&self, tenant: &TenantRecord) -> Result<(), ControlError> {
