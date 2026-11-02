@@ -29,7 +29,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 
 **Phase 1 至 Phase 12 的本地 MVP 子集已实现并通过当前自动化验收。** 这不等于原路线图的全部企业/云端退出标准；逐项差异见 [实现状态与验收边界](docs/10-quality/implementation-status.md)。产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
 
-**当前目标：Phase 13“生产级补全”（IN_PROGRESS）**，范围与退出标准见 [Phase 13 路线图](docs/11-roadmap/phase-13-production-completion.md)。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、66 张租户表的 FORCE RLS、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease 和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Enterprise/Worker 等其余 API 仍未整体切换，不能视为整阶段完成。
+**当前目标：Phase 13“生产级补全”（IN_PROGRESS）**，范围与退出标准见 [Phase 13 路线图](docs/11-roadmap/phase-13-production-completion.md)。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、66 张租户表的 FORCE RLS、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease 和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Worker 注册/心跳/停用与 Worker Job API 也已切到 PostgreSQL（PostgreSQL 模式下 SQLite 注册表保持 0 行）；Enterprise 租户/令牌/成员/配额/审计与 Agent 仍以 SQLite 为权威，不能视为整阶段完成。
 
 - Rust Core：Canonical Workflow IR、JSON Schema 校验、Saphyr YAML 解析/输出、jaq 表达式、编译器与执行计划；Schema/静态/表达式/依赖/权限与执行策略五类校验；Node Registry（13 类节点、`typeVersion` 解析、旧版 `http.request@0.9.0` 迁移）。
 - Runtime：顺序/条件/多路分支/循环/并行节点、重试/退避、节点超时、错误回退、人工审批暂停与恢复、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。

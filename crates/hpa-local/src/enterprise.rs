@@ -1957,23 +1957,40 @@ async fn register_worker(
         .capabilities
         .unwrap_or_else(|| vec!["workflow".to_string()]);
     let max_concurrency = request.max_concurrency.unwrap_or(1);
-    let worker = state
-        .ops
-        .register_worker_config(
-            &request.tenant_id,
-            &request.name,
-            &request.kind,
-            request.metadata.unwrap_or(Value::Null),
-            capabilities.clone(),
-            max_concurrency,
-        )
-        .await
-        .map_err(ops_error)?;
-    state
-        .workers
-        .sync_worker_value(&worker)
-        .await
-        .map_err(worker_error)?;
+    let metadata = request.metadata.unwrap_or(Value::Null);
+    let worker = if state.workers.has_postgres() {
+        state
+            .workers
+            .register_worker_pg(
+                &request.tenant_id,
+                &request.name,
+                &request.kind,
+                &metadata,
+                &capabilities,
+                max_concurrency,
+            )
+            .await
+            .map_err(worker_error)?
+    } else {
+        let worker = state
+            .ops
+            .register_worker_config(
+                &request.tenant_id,
+                &request.name,
+                &request.kind,
+                metadata,
+                capabilities.clone(),
+                max_concurrency,
+            )
+            .await
+            .map_err(ops_error)?;
+        state
+            .workers
+            .sync_worker_value(&worker)
+            .await
+            .map_err(worker_error)?;
+        normalize_worker(worker)
+    };
     let worker_id = worker
         .get("id")
         .and_then(Value::as_str)
@@ -2014,6 +2031,14 @@ async fn worker_heartbeat(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
+    if state.workers.has_postgres() {
+        let worker = state
+            .workers
+            .heartbeat_worker_pg(&id)
+            .await
+            .map_err(worker_error)?;
+        return Ok(Json(normalize_worker(worker)));
+    }
     let worker = state.ops.heartbeat_worker(&id).await.map_err(ops_error)?;
     state
         .workers
@@ -2029,12 +2054,21 @@ async fn disable_worker(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
-    let worker = state.ops.disable_worker(&id).await.map_err(ops_error)?;
-    state
-        .workers
-        .sync_worker_value(&worker)
-        .await
-        .map_err(worker_error)?;
+    let worker = if state.workers.has_postgres() {
+        state
+            .workers
+            .disable_worker_pg(&id)
+            .await
+            .map_err(worker_error)?
+    } else {
+        let worker = state.ops.disable_worker(&id).await.map_err(ops_error)?;
+        state
+            .workers
+            .sync_worker_value(&worker)
+            .await
+            .map_err(worker_error)?;
+        worker
+    };
     let _ = state.workers.revoke_worker_tokens(&id).await;
     state
         .audit(

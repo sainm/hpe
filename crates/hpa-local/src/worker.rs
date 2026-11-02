@@ -228,6 +228,72 @@ impl WorkerService {
         self.postgres.is_some()
     }
 
+    /// PostgreSQL-authoritative worker registration. Used when the control
+    /// plane runs on PostgreSQL so the SQLite mirror is not written at all.
+    pub async fn register_worker_pg(
+        &self,
+        tenant_id: &str,
+        name: &str,
+        kind: &str,
+        metadata: &Value,
+        capabilities: &[String],
+        max_concurrency: i64,
+    ) -> Result<Value, WorkerError> {
+        let postgres = self
+            .postgres
+            .as_ref()
+            .ok_or_else(|| WorkerError::internal("PostgreSQL worker store is not configured"))?;
+        let capabilities = validate_capabilities(capabilities)?;
+        if !(1..=MAX_CONCURRENCY).contains(&max_concurrency) {
+            return Err(WorkerError::invalid(format!(
+                "max concurrency must be between 1 and {MAX_CONCURRENCY}"
+            )));
+        }
+        let worker_id = format!("wrk_{}", Uuid::now_v7());
+        let now = now_ms();
+        let record = postgres
+            .upsert_worker(
+                tenant_id,
+                &worker_id,
+                name,
+                kind,
+                "active",
+                &capabilities,
+                max_concurrency,
+                None,
+                now,
+                now,
+                metadata,
+            )
+            .await
+            .map_err(Self::map_postgres)?;
+        Ok(worker_record_json(record))
+    }
+
+    pub async fn heartbeat_worker_pg(&self, worker_id: &str) -> Result<Value, WorkerError> {
+        let postgres = self
+            .postgres
+            .as_ref()
+            .ok_or_else(|| WorkerError::internal("PostgreSQL worker store is not configured"))?;
+        let record = postgres
+            .heartbeat_worker(worker_id, now_ms())
+            .await
+            .map_err(Self::map_postgres)?;
+        Ok(worker_record_json(record))
+    }
+
+    pub async fn disable_worker_pg(&self, worker_id: &str) -> Result<Value, WorkerError> {
+        let postgres = self
+            .postgres
+            .as_ref()
+            .ok_or_else(|| WorkerError::internal("PostgreSQL worker store is not configured"))?;
+        let record = postgres
+            .disable_worker(worker_id, now_ms())
+            .await
+            .map_err(Self::map_postgres)?;
+        Ok(worker_record_json(record))
+    }
+
     pub async fn sync_worker_value(&self, worker: &Value) -> Result<(), WorkerError> {
         let Some(postgres) = self.postgres.as_ref() else {
             return Ok(());
@@ -486,42 +552,6 @@ impl WorkerService {
     }
 
     #[allow(dead_code)]
-    pub async fn update_worker_runtime(
-        &self,
-        worker_id: &str,
-        version: &str,
-        capabilities: &[String],
-        max_concurrency: i64,
-    ) -> Result<(), WorkerError> {
-        let capabilities = validate_capabilities(capabilities)?;
-        if !(1..=MAX_CONCURRENCY).contains(&max_concurrency) {
-            return Err(WorkerError::invalid(format!(
-                "max concurrency must be between 1 and {MAX_CONCURRENCY}"
-            )));
-        }
-        let capabilities_json = serde_json::to_string(&capabilities)?;
-        let result = sqlx::query(
-            "UPDATE enterprise_workers
-             SET runtime_version = ?, capabilities_json = ?, max_concurrency = ?,
-                 last_heartbeat_at = ?,
-                 status = CASE WHEN status = 'disabled' THEN 'disabled' ELSE 'active' END
-             WHERE id = ?",
-        )
-        .bind(version)
-        .bind(capabilities_json)
-        .bind(max_concurrency)
-        .bind(now_ms())
-        .bind(worker_id)
-        .execute(&self.control)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(WorkerError::not_found(format!(
-                "worker `{worker_id}` does not exist"
-            )));
-        }
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_job(
         &self,

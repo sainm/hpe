@@ -437,7 +437,7 @@ impl PostgresWorkerStore {
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or_else(|| PostgresWorkerError::WorkerNotFound(auth.worker_id.clone()))?;
-        let max_concurrency: i64 = worker.try_get("max_concurrency")?;
+        let max_concurrency: i64 = i64::from(worker.try_get::<i32, _>("max_concurrency")?);
         let registered_json: Value = worker.try_get("capabilities_json")?;
         let registered_values: Vec<String> =
             serde_json::from_value(registered_json).unwrap_or_default();
@@ -1003,7 +1003,8 @@ fn worker_from_row(row: PgRow) -> Result<WorkerRecord, PostgresWorkerError> {
         kind: row.try_get("kind")?,
         status: row.try_get("status")?,
         capabilities: serde_json::from_value(capabilities).unwrap_or_default(),
-        max_concurrency: row.try_get("max_concurrency")?,
+        // `hpa_control.workers.max_concurrency` is INTEGER (INT4) by schema.
+        max_concurrency: i64::from(row.try_get::<i32, _>("max_concurrency")?),
         runtime_version: row.try_get("runtime_version")?,
         last_heartbeat_at: row.try_get("last_heartbeat_at")?,
         registered_at: row.try_get("registered_at")?,
