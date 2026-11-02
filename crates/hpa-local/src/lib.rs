@@ -1,6 +1,7 @@
 pub mod ai_worker_client;
 pub mod distributed_runtime;
 pub mod persistent_mcp;
+pub mod postgres_control;
 pub mod postgres_execution;
 pub mod postgres_import;
 pub mod postgres_trigger;

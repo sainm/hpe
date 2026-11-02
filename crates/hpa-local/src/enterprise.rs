@@ -37,6 +37,7 @@ use crate::oauth::{OauthOwner, OauthService};
 use crate::plugin::PluginService;
 use crate::skills::SkillService;
 use crate::worker::{WorkerAuth, WorkerError, WorkerErrorKind, WorkerJob};
+use hpa_local::postgres_control::{AuditEntry, PostgresControlStore, TokenRecord};
 
 #[path = "scim.rs"]
 mod scim;
@@ -217,6 +218,14 @@ impl EnterpriseState {
 
     pub(crate) fn auth_required(&self) -> bool {
         self.require_auth
+    }
+
+    /// PostgreSQL control-plane store, present only in `HPA_POSTGRES_RUNTIME=1`.
+    fn control_store(&self) -> Option<PostgresControlStore> {
+        self.postgres_execution
+            .as_ref()
+            .cloned()
+            .map(PostgresControlStore::new)
     }
 
     pub(crate) async fn expire_worker_approvals(&self) -> Result<usize, ApiError> {
@@ -430,6 +439,31 @@ impl EnterpriseState {
         let token = format!("hpa_ent_{}", URL_SAFE_NO_PAD.encode(bytes));
         let hash = hash_token(&token);
         let now = OffsetDateTime::now_utc();
+        if let Some(control) = self.control_store() {
+            self.ensure_postgres_tenant(tenant_id).await?;
+            let expires_at =
+                expires_in_days.map(|days| now + time::Duration::days(days.clamp(1, 3650)));
+            let record = control
+                .create_token(tenant_id, name, &hash, role, platform_admin, expires_at)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            self.audit(
+                Some(tenant_id),
+                Some(&record.id),
+                "token",
+                "token.create",
+                "enterprise_token",
+                "allow",
+                None,
+                json!({"role": role, "platformAdmin": platform_admin}),
+            )
+            .await;
+            let mut value = token_value_from_record(&record);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("token".to_string(), Value::String(token));
+            }
+            return Ok(value);
+        }
         let created_at = now.format(&Rfc3339).unwrap_or_default();
         let expires_at = expires_in_days.map(|days| {
             (now + time::Duration::days(days.clamp(1, 3650)))
@@ -568,6 +602,27 @@ impl EnterpriseState {
             return Err(unauthorized("unsupported bearer token"));
         }
         let hash = hash_token(token);
+        if let Some(control) = self.control_store() {
+            let record = control
+                .find_token_by_hash(&hash)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .ok_or_else(|| unauthorized("token is not recognized"))?;
+            if record.is_revoked() {
+                return Err(unauthorized("token is revoked"));
+            }
+            let now = OffsetDateTime::now_utc();
+            if record.is_expired(now) {
+                return Err(unauthorized("token is expired"));
+            }
+            let _ = control.touch_token(&record.id, now).await;
+            return Ok(Some(Principal {
+                token_id: record.id,
+                tenant_id: record.tenant_id,
+                role: record.role,
+                platform_admin: record.platform_admin,
+            }));
+        }
         let row = sqlx::query(
             "SELECT id, tenant_id, role, platform_admin, expires_at, revoked_at
              FROM enterprise_tokens WHERE token_hash = ?",
@@ -770,6 +825,22 @@ impl EnterpriseState {
         reason: Option<&str>,
         detail: Value,
     ) {
+        if let Some(control) = self.control_store() {
+            let entry = AuditEntry {
+                tenant_id,
+                actor_id,
+                actor_type,
+                action,
+                resource,
+                decision,
+                reason,
+                detail: &detail,
+            };
+            if let Err(error) = control.append_audit(entry).await {
+                tracing::warn!(error = %error, "cannot persist audit event in PostgreSQL");
+            }
+            return;
+        }
         let _ = sqlx::query(
             "INSERT INTO enterprise_audit
              (id, at, tenant_id, actor_id, actor_type, action, resource, decision, reason, detail_json)
@@ -1310,6 +1381,15 @@ async fn list_tokens(
     Query(query): Query<TenantQuery>,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        let records = control
+            .list_tokens(query.tenant_id.as_deref())
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        return Ok(Json(json!({
+            "tokens": records.iter().map(token_value_from_record).collect::<Vec<_>>(),
+        })));
+    }
     let rows = match query.tenant_id.as_deref() {
         Some(tenant_id) => {
             sqlx::query(
@@ -1380,14 +1460,23 @@ async fn revoke_token(
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
     let now = now_rfc3339();
-    let result = sqlx::query(
-        "UPDATE enterprise_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
-    )
-    .bind(&now)
-    .bind(&id)
-    .execute(&state.control)
-    .await
-    .map_err(internal)?;
+    let revoked = if let Some(control) = state.control_store() {
+        control
+            .revoke_token(None, &id, OffsetDateTime::now_utc())
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+    } else {
+        sqlx::query(
+            "UPDATE enterprise_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(&now)
+        .bind(&id)
+        .execute(&state.control)
+        .await
+        .map_err(internal)?
+        .rows_affected()
+            > 0
+    };
     state
         .audit(
             None,
@@ -1400,7 +1489,7 @@ async fn revoke_token(
             json!({"tokenId": id}),
         )
         .await;
-    Ok(Json(json!({"revoked": result.rows_affected() > 0})))
+    Ok(Json(json!({"revoked": revoked})))
 }
 
 async fn list_members(
@@ -3562,6 +3651,29 @@ fn tenant_value(row: &sqlx::sqlite::SqliteRow) -> Value {
         "status": row.get::<String, _>("status"),
         "createdAt": row.get::<String, _>("created_at"),
         "updatedAt": row.get::<String, _>("updated_at"),
+    })
+}
+
+fn token_value_from_record(record: &TokenRecord) -> Value {
+    let format = |value: Option<OffsetDateTime>| {
+        value
+            .and_then(|value| value.format(&Rfc3339).ok())
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    };
+    json!({
+        "id": record.id,
+        "name": record.name,
+        "tenantId": record.tenant_id,
+        "role": record.role,
+        "platformAdmin": record.platform_admin,
+        "createdAt": record
+            .created_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string()),
+        "lastUsedAt": format(record.last_used_at),
+        "expiresAt": format(record.expires_at),
+        "revokedAt": format(record.revoked_at),
     })
 }
 

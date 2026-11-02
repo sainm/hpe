@@ -1474,17 +1474,47 @@ async fn connector_command(
     Ok(())
 }
 
+/// PostgreSQL pool for CLI control-plane commands, when one is configured.
+async fn enterprise_cli_postgres_pool() -> Result<Option<sqlx::postgres::PgPool>, Box<dyn Error>> {
+    let Ok(database_url) =
+        std::env::var("HPA_POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL"))
+    else {
+        return Ok(None);
+    };
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&database_url)
+        .await?;
+    let installed: bool =
+        sqlx::query_scalar("SELECT to_regclass('hpa_control.tokens') IS NOT NULL")
+            .fetch_one(&pool)
+            .await?;
+    if !installed {
+        return Err(CliError(
+            "PostgreSQL control schema is missing; run `hpa db migrate` first".to_string(),
+        )
+        .into());
+    }
+    Ok(Some(pool))
+}
+
 async fn enterprise_command(
     data_dir: PathBuf,
     command: EnterpriseCommand,
 ) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&data_dir)?;
-    let state = crate::enterprise::EnterpriseState::new(
+    let mut state = crate::enterprise::EnterpriseState::new(
         data_dir,
         "http://127.0.0.1:8787".to_string(),
         false,
     )
     .await?;
+    // Bootstrap tokens are written to PostgreSQL when a database is configured,
+    // otherwise `enterprise init` would create a node-local token that the
+    // PostgreSQL-backed control plane cannot authenticate.
+    if let Some(pool) = enterprise_cli_postgres_pool().await? {
+        state = state.with_postgres_execution(pool);
+    }
     match command {
         EnterpriseCommand::Init { name } => {
             let token = state
