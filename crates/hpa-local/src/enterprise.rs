@@ -166,6 +166,17 @@ impl EnterpriseState {
         let Some(pool) = self.postgres_execution.as_ref() else {
             return Ok(());
         };
+        // A node that never saw this tenant must not fail here: if PostgreSQL
+        // already knows it, the mirror has nothing to do.
+        if let Some(control) = self.control_store()
+            && control
+                .tenant(tenant_id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?
+                .is_some()
+        {
+            return Ok(());
+        }
         let row = sqlx::query(
             "SELECT name, status, created_at, updated_at
              FROM enterprise_tenants WHERE id = ?",
@@ -210,6 +221,19 @@ impl EnterpriseState {
 
     /// Tenant ids that the scheduler and hooks may serve.
     pub(crate) async fn active_tenants(&self) -> Result<Vec<String>, ApiError> {
+        if let Some(control) = self.control_store() {
+            let tenants = control
+                .list_tenants()
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            if !tenants.is_empty() {
+                return Ok(tenants
+                    .into_iter()
+                    .filter(|tenant| tenant.status == "active")
+                    .map(|tenant| tenant.id)
+                    .collect());
+            }
+        }
         sqlx::query_scalar(
             "SELECT id FROM enterprise_tenants WHERE status = 'active' ORDER BY created_at ASC",
         )
@@ -294,6 +318,32 @@ impl EnterpriseState {
             .await;
         }
         Ok(expired)
+    }
+
+    /// Resolves tenant state, preferring PostgreSQL in runtime mode and falling
+    /// back to SQLite while the mirror is incomplete.
+    pub(crate) async fn tenant_is_active(&self, tenant_id: &str) -> Result<bool, ApiError> {
+        if let Some(control) = self.control_store()
+            && let Some(record) = control
+                .tenant(tenant_id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?
+        {
+            return Ok(record.status == "active");
+        }
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM enterprise_tenants WHERE id = $1 AND status = 'active'",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.control)
+        .await
+        .map_err(internal)?;
+        if found.is_none() {
+            return Ok(false);
+        }
+        // Self-heal: mirror missing tenants so the next read hits PostgreSQL.
+        let _ = self.ensure_postgres_tenant(tenant_id).await;
+        Ok(true)
     }
 
     /// Mirrors the SQLite control plane (tenants, quotas, members) into
@@ -1370,6 +1420,8 @@ async fn update_tenant_status(
     if request.status == "suspended" {
         let _ = state.browser_auth.revoke_tenant_sessions(&id).await;
     }
+    // Keep the PostgreSQL mirror in step with suspend/resume.
+    let _ = state.ensure_postgres_tenant(&id).await;
     state
         .audit(
             Some(&id),
@@ -3501,13 +3553,7 @@ fn safe_error_code(raw: &str) -> &str {
 
 async fn ensure_tenant(state: &EnterpriseState, tenant_id: &str) -> Result<(), ApiError> {
     validate_tenant_id(tenant_id)?;
-    let found: Option<String> =
-        sqlx::query_scalar("SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'")
-            .bind(tenant_id)
-            .fetch_optional(&state.control)
-            .await
-            .map_err(internal)?;
-    if found.is_none() {
+    if !state.tenant_is_active(tenant_id).await? {
         return Err(ApiError::not_found(format!(
             "tenant `{tenant_id}` not found"
         )));

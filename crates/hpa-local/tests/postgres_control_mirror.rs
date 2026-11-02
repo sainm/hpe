@@ -233,6 +233,45 @@ async fn tenants_quotas_and_members_mirror_into_postgres() {
     assert_eq!(quota["maxWorkflows"], json!(7));
     assert_eq!(quota["maxExecutionsPerDay"], json!(11));
 
+    // Tenant resolution reads PostgreSQL: a node that never saw this tenant can
+    // register a worker for it, while unknown tenants still 404.
+    let cross_node_worker = server_b
+        .client
+        .post(server_b.url("/api/enterprise/workers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "tenantId": tenant_id,
+            "name": "mirror-node-worker",
+            "kind": "runner",
+            "capabilities": ["workflow"],
+            "maxConcurrency": 1,
+        }))
+        .send()
+        .await
+        .expect("register worker on node b");
+    assert_eq!(
+        cross_node_worker.status(),
+        200,
+        "tenant resolved from PostgreSQL on the fresh node"
+    );
+    let unknown = server_b
+        .client
+        .post(server_b.url("/api/enterprise/workers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "tenantId": format!("missing_{}", uuid::Uuid::now_v7().simple()),
+            "name": "ghost",
+            "kind": "runner",
+        }))
+        .send()
+        .await
+        .expect("register worker for unknown tenant");
+    assert_eq!(
+        unknown.status(),
+        404,
+        "unknown tenants must still be rejected"
+    );
+
     let _ = server_b
         .client
         .delete(server_b.url(&format!("/api/enterprise/tenants/{tenant_id}")))

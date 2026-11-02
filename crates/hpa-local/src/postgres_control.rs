@@ -239,6 +239,27 @@ impl PostgresControlStore {
         Ok(())
     }
 
+    pub async fn tenant(&self, tenant_id: &str) -> Result<Option<TenantRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT id, name, status, created_at, updated_at FROM hpa_control.tenants WHERE id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        match row {
+            Some(row) => Ok(Some(TenantRecord {
+                id: row.try_get("id")?,
+                name: row.try_get("name")?,
+                status: row.try_get("status")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            })),
+            None => Ok(None),
+        }
+    }
+
     pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, ControlError> {
         let mut transaction = self.begin_admin().await?;
         let rows = sqlx::query(

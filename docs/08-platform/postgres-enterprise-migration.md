@@ -22,7 +22,7 @@
 | Worker Job / 租约 | 不写 | **权威** | `postgres_worker_daemon` |
 | 平台令牌 | 不写 | **权威** | `postgres_token_store` |
 | 审计 | 不写 | **权威** | 未知租户回退 NULL tenant |
-| 租户 | **权威** | 镜像 | 创建/启动时同步 |
+| 租户 | **权威** | 镜像 + **读取** | 存在性/状态解析已在 PG 模式走 PostgreSQL，未命中回退并自愈 |
 | 配额 | **权威** | 镜像 + **读取** | 读路径已在 PG 模式下走 PostgreSQL |
 | 成员 | **权威** | 镜像（写穿） | 创建/更新/删除同步到 PG |
 | SCIM Group / 映射 | **权威** | 未镜像 | 依赖成员表，翻转时一起处理 |
@@ -48,13 +48,20 @@
 
 ### 3.3 读取切换
 
-`EnterpriseState::quota()` 在 PostgreSQL 模式下先读 `hpa_control.quotas`，命中即返回；未命中（例如旧数据尚未镜像）回退 SQLite。回退路径在权威翻转时必须删除。
+| 读取 | 行为 |
+| --- | --- |
+| `quota()` | PG 模式先读 `hpa_control.quotas`，未命中回退 SQLite |
+| `tenant_is_active()` | PG 模式先读 `hpa_control.tenants`；PG 无行时回退 SQLite 并**自愈**（顺手 `ensure_postgres_tenant`） |
+| `active_tenants()` | PG 有租户行时以 `hpa_control.tenants` 为准，否则回退 SQLite（调度器与 `/metrics` 用） |
+| `ensure_postgres_tenant()` | PG 已有该租户即跳过，避免“没见过的租户”在镜像阶段返回 404 |
+
+回退路径在权威翻转时必须删除。`postgres_control_mirror` 已覆盖跨节点读取：空 data dir 的节点能为它从未见过的租户注册 Worker（租户解析来自 PostgreSQL），未知租户仍 404。
 
 ## 4. 剩余步骤
 
 按依赖顺序，每一步都应独立提交并带 PG 集成测试：
 
-1. **租户读取切 PG**：`ensure_tenant`、`active_tenants`、`tenant_entry` 的存在性检查改读 `hpa_control.tenants`；此时写入仍走 SQLite + 镜像。
+1. ~~**租户读取切 PG**~~（已完成）：`ensure_tenant` / `active_tenants` 的存在性与状态判断改读 `hpa_control.tenants`；写入仍走 SQLite + 镜像。
 2. **配额权威翻转**：删除回退路径，`PUT /quotas` 先写 PG，镜像反向写 SQLite 或直接停写。
 3. **成员与 SCIM**：`scim.rs` 的 12 处成员查询、Group 映射、`browser_auth::find_member` 一起切；SCIM E2E 必须在 PG 模式下重跑（`pnpm test:scim-e2e`）。
 4. **会话与 OAuth AS 状态**：`hpa_control.sessions` / `oauth_*` 已建表，需要把加密 token 字段、refresh 轮换与 CSRF 校验一并迁移；验收标准是“节点 A 登录、节点 B 直接用同一 Cookie 通过”。
