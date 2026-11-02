@@ -24,6 +24,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Release bundles
+/dist-release
+
 # Local runtime data, logs and secrets
 /.hpa
 *.log

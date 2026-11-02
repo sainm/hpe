@@ -143,7 +143,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-08 真实外部客户端与发布验收
 
-> 状态：**BLOCKED_EXTERNAL**。真实 Claude Code/Codex/Copilot 模型会话、双 Worker/双控制面、企业 IdP/CA/Vault/生产 Collector 均未提供凭证或环境。复现 prompt、权限清单、三种部署对照和证据字段见 [外部 AI 客户端发布验收](../10-quality/external-ai-client-acceptance.md)。本地 MCP Client/curl/mock 不计入外部模型 PASS。
+> 状态：**BLOCKED_EXTERNAL**（仅客户端与外部基础设施部分）。发布工程链路已就绪：`scripts/release-pack.mjs` 产出 `bin/`、`web/`、`migrations/postgres/`、`deploy/`、CycloneDX SBOM、`SHA256SUMS` 与带 git sha/工具链的 `manifest.json`；`scripts/release-verify.mjs` 逐文件校验并用临时 data dir 跑 `hpa doctor`。流程、回滚与已知边界见 [发布清单](../10-quality/release-checklist.md)。真实 Claude Code/Codex/Copilot 模型会话、双 Worker/双控制面、企业 IdP/CA/Vault/生产 Collector 仍未提供凭证或环境，复现 prompt 与权限清单见 [外部 AI 客户端发布验收](../10-quality/external-ai-client-acceptance.md)；本地 MCP Client/curl/mock 不计入外部模型 PASS。
 
 交付：
 
@@ -199,6 +199,7 @@ Phase 13 必须保持以下不变量：
 - PostgreSQL ExecutionRuntime：真实 `hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 下完成 workflow snapshot/registry version 物化、execution insert/update、event 追加和 output artifact；PostgreSQL 中可直接核对 execution/events/artifact。强停并重启后 API 仍从 PostgreSQL 读取 execution 与 events。相同 workflow/version 的 IR 内容变化返回 `WorkflowSnapshotConflict`，跨租户查询为 0 行；remote execution marker 同库保存，本地 recovery 不接管远程执行；每日/并发配额也按 PostgreSQL execution 计数。
 - PostgreSQL WorkflowRepository：draft upsert、publish、current/list/version、workflow count 全部 PG；同版本变更失败关闭，新版本可追加，跨租户不可见。`hpa serve` E2E 证明发布版本不在 SQLite，API versions 与 Event Bus consumer 均从 PG 读取。
 - Execution Lease：每 step 前续租，state/events 提交匹配 holder/token/未过期 lease。lease 过期后节点 B 递增 token 接管，节点 A 的 save/release 失败；空 data_dir 节点可从 PG running execution + workflow snapshot 恢复完成并释放 lease。
+- 发布产物：`pnpm release:pack --profile debug --skip-build` 生成 `hpa-0.1.0-<sha>-darwin-arm64.tar.gz`（51 个文件、19 个迁移、12 个前端资源、2 份 CycloneDX SBOM），`pnpm release:verify` 校验压缩包 sha256、逐文件 `SHA256SUMS`，并在临时 data dir 上跑通 `hpa doctor`（status ok）。
 - Hybrid Worker + PostgreSQL 端到端：真实 `hpa worker` daemon 在 `HPA_POSTGRES_RUNTIME=1` 下从 PostgreSQL 领取任务、上报 `start`、执行完成并写回 `hpa_tenant.executions`/`events`，SQLite `enterprise_worker_jobs` 保持 0 行（`postgres_worker_daemon`）。该测试暴露并修复了一个只在 PostgreSQL 出现的缺陷：`remote_executions` 外键要求执行行先存在，而 worker `start` 原先在插入执行行之前就写远端标记，导致守护进程一直 500 重试。
 - PostgreSQL tokens & audit：`HPA_POSTGRES_RUNTIME=1` 时管理员令牌与审计事件均以 PostgreSQL 为权威——`hpa enterprise init` 写入 `hpa_control.tokens`，`/api/enterprise/tokens` 创建/列表/吊销与 Bearer 认证读同一张表，审计写入 `hpa_control.audit`。`postgres_token_store` 删除整个 data_dir 后用空目录重启，同一令牌仍通过认证、吊销在另一节点立即生效、SQLite `enterprise_tokens` 保持 0 行；未知租户的审计行回退为 NULL tenant，避免外键阻塞请求。
 - PostgreSQL 租户供给：`POST /api/enterprise/tenants` 在 PostgreSQL 模式下同步写入 `hpa_control.tenants`，避免新建租户注册 Worker 时触发 `workers_tenant_id_fkey`；`postgres_worker_registry` 每次运行使用独立租户并清理，重复执行结果一致。

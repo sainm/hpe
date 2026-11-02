@@ -145,6 +145,7 @@
 ### 10 质量
 
 - [测试策略](10-quality/test-strategy.md)
+- [发布清单](10-quality/release-checklist.md)
 - [验收标准](10-quality/acceptance-criteria.md)
 - [实现状态与验收边界](10-quality/implementation-status.md)
 - [性能要求](10-quality/performance-requirements.md)
