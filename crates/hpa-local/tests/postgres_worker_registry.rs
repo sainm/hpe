@@ -165,13 +165,51 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
 
     let server = Server::start(&data_dir, &database_url).await;
 
+    // Each run uses its own tenant so leftover queued jobs from other runs can
+    // never satisfy the lease assertion.
+    let tenant_name = format!("wg_{}", uuid::Uuid::now_v7().simple());
+    let tenant_response = server
+        .client
+        .post(server.url("/api/enterprise/tenants"))
+        .bearer_auth(&admin_token)
+        .json(&json!({"name": tenant_name}))
+        .send()
+        .await
+        .expect("create tenant");
+    assert_eq!(
+        tenant_response.status(),
+        200,
+        "tenant creation must succeed"
+    );
+    let tenant: Value = tenant_response.json().await.expect("tenant json");
+    let tenant_id = tenant["id"].as_str().expect("tenant id").to_string();
+
+    let token_response = server
+        .client
+        .post(server.url("/api/enterprise/tokens"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "tenantId": tenant_id,
+            "name": "worker-registry-test",
+            "role": "owner",
+        }))
+        .send()
+        .await
+        .expect("create token");
+    assert_eq!(token_response.status(), 200, "token creation must succeed");
+    let token_body: Value = token_response.json().await.expect("token json");
+    let tenant_token = token_body["token"]
+        .as_str()
+        .expect("tenant token")
+        .to_string();
+
     // Register a worker through the HTTP API.
     let registered = server
         .client
         .post(server.url("/api/enterprise/workers"))
         .bearer_auth(&admin_token)
         .json(&json!({
-            "tenantId": "local",
+            "tenantId": tenant_id,
             "name": "pg-worker",
             "kind": "runner",
             "capabilities": ["workflow"],
@@ -200,9 +238,10 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
         .await
         .expect("connect postgres");
     let in_postgres: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM hpa_control.workers WHERE id = $1 AND tenant_id = 'local'",
+        "SELECT count(*) FROM hpa_control.workers WHERE id = $1 AND tenant_id = $2",
     )
     .bind(&worker_id)
+    .bind(&tenant_id)
     .fetch_one(&pool)
     .await
     .expect("count workers");
@@ -219,7 +258,7 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
     let created = server
         .client
         .post(server.url("/api/workflows"))
-        .bearer_auth(&admin_token)
+        .bearer_auth(&tenant_token)
         .json(&json!({ "ir": workflow_ir() }))
         .send()
         .await
@@ -228,7 +267,7 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
     let published = server
         .client
         .post(server.url("/api/workflows/wf_pg_worker/publish"))
-        .bearer_auth(&admin_token)
+        .bearer_auth(&tenant_token)
         .send()
         .await
         .expect("publish workflow");
@@ -239,7 +278,7 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
         .post(server.url("/api/enterprise/worker-jobs"))
         .bearer_auth(&admin_token)
         .json(&json!({
-            "tenantId": "local",
+            "tenantId": tenant_id,
             "workflowId": "wf_pg_worker",
             "workerId": worker_id,
             "input": {},
@@ -320,6 +359,14 @@ async fn worker_registry_and_jobs_skip_sqlite_when_postgres_is_active() {
         0,
         "disable must not create a SQLite row"
     );
+
+    let _ = server
+        .client
+        .delete(server.url(&format!("/api/enterprise/tenants/{tenant_id}")))
+        .bearer_auth(&admin_token)
+        .json(&json!({"confirm": true}))
+        .send()
+        .await;
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&data_dir);

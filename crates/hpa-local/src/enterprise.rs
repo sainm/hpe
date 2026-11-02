@@ -1073,6 +1073,9 @@ async fn create_tenant(
     tokio::fs::create_dir_all(state.tenant_dir(&id))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    // PostgreSQL-mode control rows are provisioned with the tenant so worker
+    // registration and other FK-bound writes do not fail on a fresh tenant.
+    state.ensure_postgres_tenant(&id).await?;
     state
         .audit(
             Some(&id),
@@ -1959,6 +1962,7 @@ async fn register_worker(
     let max_concurrency = request.max_concurrency.unwrap_or(1);
     let metadata = request.metadata.unwrap_or(Value::Null);
     let worker = if state.workers.has_postgres() {
+        state.ensure_postgres_tenant(&request.tenant_id).await?;
         state
             .workers
             .register_worker_pg(
