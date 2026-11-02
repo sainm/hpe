@@ -127,6 +127,7 @@
 - [SCIM 2.0 Users/Groups 与角色映射](08-platform/scim.md)
 - [Phase 10 OAuth 2.1 授权服务器](08-platform/oauth-authorization-server.md)
 - [Phase 12 可观测性](08-platform/observability.md)
+- [企业控制面 PostgreSQL 迁移](08-platform/postgres-enterprise-migration.md)
 - [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI

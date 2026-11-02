@@ -1635,6 +1635,23 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
             enterprise = enterprise.with_postgres_event_bus(pool.clone());
         }
     }
+    if enterprise.uses_postgres() {
+        // Mirror tenants/quotas/members so PostgreSQL has the control-plane rows
+        // that quota reads, worker registration and audit foreign keys rely on.
+        match enterprise.sync_postgres_control().await {
+            Ok(count) if count > 0 => {
+                println!("postgres control mirror: {count} rows");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return Err(CliError(format!(
+                    "cannot mirror the control plane into PostgreSQL: {}",
+                    error.message
+                ))
+                .into());
+            }
+        }
+    }
     let oauth = enterprise.oauth_service();
     let local_state = enterprise
         .local_state()

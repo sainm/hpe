@@ -37,7 +37,9 @@ use crate::oauth::{OauthOwner, OauthService};
 use crate::plugin::PluginService;
 use crate::skills::SkillService;
 use crate::worker::{WorkerAuth, WorkerError, WorkerErrorKind, WorkerJob};
-use hpa_local::postgres_control::{AuditEntry, PostgresControlStore, TokenRecord};
+use hpa_local::postgres_control::{
+    AuditEntry, MemberRecord, PostgresControlStore, QuotaRecord, TenantRecord, TokenRecord,
+};
 
 #[path = "scim.rs"]
 mod scim;
@@ -220,6 +222,10 @@ impl EnterpriseState {
         self.require_auth
     }
 
+    pub(crate) fn uses_postgres(&self) -> bool {
+        self.postgres_execution.is_some()
+    }
+
     /// PostgreSQL control-plane store, present only in `HPA_POSTGRES_RUNTIME=1`.
     fn control_store(&self) -> Option<PostgresControlStore> {
         self.postgres_execution
@@ -288,6 +294,84 @@ impl EnterpriseState {
             .await;
         }
         Ok(expired)
+    }
+
+    /// Mirrors the SQLite control plane (tenants, quotas, members) into
+    /// PostgreSQL. Idempotent; runs once per start in PostgreSQL mode so that
+    /// quota reads and foreign keys work for tenants created before the switch.
+    pub(crate) async fn sync_postgres_control(&self) -> Result<usize, ApiError> {
+        let Some(control) = self.control_store() else {
+            return Ok(0);
+        };
+        let mut synced = 0usize;
+        let tenants =
+            sqlx::query("SELECT id, name, status, created_at, updated_at FROM enterprise_tenants")
+                .fetch_all(&self.control)
+                .await
+                .map_err(internal)?;
+        for row in &tenants {
+            let tenant = TenantRecord {
+                id: row.get("id"),
+                name: row.get("name"),
+                status: row.get("status"),
+                created_at: parse_rfc3339(row.get::<String, _>("created_at").as_str())?,
+                updated_at: parse_rfc3339(row.get::<String, _>("updated_at").as_str())?,
+            };
+            control
+                .upsert_tenant(&tenant)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            synced += 1;
+        }
+        let quotas = sqlx::query(
+            "SELECT tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
+                    max_plugins, max_connections, max_concurrent_runs FROM enterprise_quotas",
+        )
+        .fetch_all(&self.control)
+        .await
+        .map_err(internal)?;
+        for row in &quotas {
+            let tenant_id: String = row.get("tenant_id");
+            let quota = QuotaRecord {
+                max_workflows: row.get("max_workflows"),
+                max_executions_per_day: row.get("max_executions_per_day"),
+                max_skills: row.get("max_skills"),
+                max_agents: row.get("max_agents"),
+                max_plugins: row.get("max_plugins"),
+                max_connections: row.get("max_connections"),
+                max_concurrent_runs: row.get("max_concurrent_runs"),
+            };
+            control
+                .upsert_quota(&tenant_id, &quota)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        let members = sqlx::query(
+            "SELECT id, tenant_id, subject, display_name, email, role, status,
+                    created_at, updated_at FROM enterprise_members",
+        )
+        .fetch_all(&self.control)
+        .await
+        .map_err(internal)?;
+        for row in &members {
+            let member = MemberRecord {
+                id: row.get("id"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                display_name: row.get("display_name"),
+                email: row.get::<Option<String>, _>("email"),
+                role: row.get("role"),
+                status: row.get("status"),
+                created_at: parse_rfc3339(row.get::<String, _>("created_at").as_str())?,
+                updated_at: parse_rfc3339(row.get::<String, _>("updated_at").as_str())?,
+            };
+            control
+                .upsert_member(&member)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            synced += 1;
+        }
+        Ok(synced)
     }
 
     pub(crate) async fn control_ping(&self) -> Result<(), ApiError> {
@@ -861,6 +945,22 @@ impl EnterpriseState {
     }
 
     async fn quota(&self, tenant_id: &str) -> Result<Quota, ApiError> {
+        if let Some(control) = self.control_store()
+            && let Some(record) = control
+                .quota(tenant_id)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?
+        {
+            return Ok(Quota {
+                max_workflows: record.max_workflows,
+                max_executions_per_day: record.max_executions_per_day,
+                max_skills: record.max_skills,
+                max_agents: record.max_agents,
+                max_plugins: record.max_plugins,
+                max_connections: record.max_connections,
+                max_concurrent_runs: record.max_concurrent_runs,
+            });
+        }
         let row = sqlx::query(
             "SELECT max_workflows, max_executions_per_day, max_skills, max_agents,
                     max_plugins, max_connections, max_concurrent_runs
@@ -1144,9 +1244,24 @@ async fn create_tenant(
     tokio::fs::create_dir_all(state.tenant_dir(&id))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    // PostgreSQL-mode control rows are provisioned with the tenant so worker
-    // registration and other FK-bound writes do not fail on a fresh tenant.
+    // PostgreSQL-mode control rows are provisioned with the tenant (and its
+    // default quota) so worker registration and FK-bound writes do not fail.
     state.ensure_postgres_tenant(&id).await?;
+    if let Some(control) = state.control_store() {
+        let quota = QuotaRecord {
+            max_workflows: 100,
+            max_executions_per_day: 1000,
+            max_skills: 100,
+            max_agents: 100,
+            max_plugins: 50,
+            max_connections: 100,
+            max_concurrent_runs: 8,
+        };
+        control
+            .upsert_quota(&id, &quota)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
     state
         .audit(
             Some(&id),
@@ -1636,6 +1751,7 @@ async fn create_member(
     .fetch_one(&state.control)
     .await
     .map_err(internal)?;
+    mirror_member_row(&state, &row).await;
     Ok(Json(member_value(&row)))
 }
 
@@ -1766,6 +1882,7 @@ async fn update_member(
     .fetch_one(&state.control)
     .await
     .map_err(internal)?;
+    mirror_member_row(&state, &row).await;
     Ok(Json(member_value(&row)))
 }
 
@@ -1784,6 +1901,11 @@ async fn delete_member(
     let Some(tenant_id) = tenant_id else {
         return Err(ApiError::not_found(format!("member `{id}` not found")));
     };
+    if let Some(control) = state.control_store()
+        && let Err(error) = control.delete_member(&id).await
+    {
+        tracing::warn!(error = %error, member = %id, "cannot delete the PostgreSQL member mirror");
+    }
     sqlx::query("DELETE FROM enterprise_members WHERE id = ?")
         .bind(&id)
         .execute(&state.control)
@@ -1879,6 +2001,21 @@ async fn put_quota_handler(
             "QUOTA_INVALID",
             "quota values must be non-negative",
         ));
+    }
+    if let Some(control) = state.control_store() {
+        let quota = QuotaRecord {
+            max_workflows: request.max_workflows,
+            max_executions_per_day: request.max_executions_per_day,
+            max_skills: request.max_skills,
+            max_agents: request.max_agents,
+            max_plugins: request.max_plugins,
+            max_connections: request.max_connections,
+            max_concurrent_runs: request.max_concurrent_runs,
+        };
+        control
+            .upsert_quota(&tenant_id, &quota)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
     }
     let result = sqlx::query(
         "UPDATE enterprise_quotas SET max_workflows = ?, max_executions_per_day = ?,
@@ -3654,6 +3791,44 @@ fn tenant_value(row: &sqlx::sqlite::SqliteRow) -> Value {
         "createdAt": row.get::<String, _>("created_at"),
         "updatedAt": row.get::<String, _>("updated_at"),
     })
+}
+
+/// Mirrors one SQLite member row into PostgreSQL (best effort, logged on error).
+async fn mirror_member_row(state: &EnterpriseState, row: &sqlx::sqlite::SqliteRow) {
+    let Some(control) = state.control_store() else {
+        return;
+    };
+    let created_at = row
+        .try_get::<String, _>("created_at")
+        .ok()
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+    let updated_at = row
+        .try_get::<String, _>("updated_at")
+        .ok()
+        .and_then(|value| OffsetDateTime::parse(&value, &Rfc3339).ok());
+    let (Some(created_at), Some(updated_at)) = (created_at, updated_at) else {
+        tracing::warn!("cannot mirror member: invalid timestamps");
+        return;
+    };
+    let member = MemberRecord {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        subject: row.get("subject"),
+        display_name: row.get("display_name"),
+        email: row.get::<Option<String>, _>("email"),
+        role: row.get("role"),
+        status: row.get("status"),
+        created_at,
+        updated_at,
+    };
+    if let Err(error) = control.upsert_member(&member).await {
+        tracing::warn!(error = %error, member = %member.id, "cannot mirror member into PostgreSQL");
+    }
+}
+
+fn parse_rfc3339(value: &str) -> Result<OffsetDateTime, ApiError> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|error| ApiError::internal(format!("invalid timestamp `{value}`: {error}")))
 }
 
 fn token_value_from_record(record: &TokenRecord) -> Value {

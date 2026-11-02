@@ -58,6 +58,39 @@ pub struct AuditEntry<'a> {
     pub detail: &'a Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct TenantRecord {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaRecord {
+    pub max_workflows: i64,
+    pub max_executions_per_day: i64,
+    pub max_skills: i64,
+    pub max_agents: i64,
+    pub max_plugins: i64,
+    pub max_connections: i64,
+    pub max_concurrent_runs: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberRecord {
+    pub id: String,
+    pub tenant_id: String,
+    pub subject: String,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub role: String,
+    pub status: String,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Clone)]
 pub struct PostgresControlStore {
     pool: PgPool,
@@ -183,6 +216,179 @@ impl PostgresControlStore {
         .await?;
         transaction.commit().await?;
         Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn upsert_tenant(&self, tenant: &TenantRecord) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.tenants (id, name, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 status = EXCLUDED.status,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&tenant.id)
+        .bind(&tenant.name)
+        .bind(&tenant.status)
+        .bind(tenant.created_at)
+        .bind(tenant.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_tenants(&self) -> Result<Vec<TenantRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT id, name, status, created_at, updated_at FROM hpa_control.tenants
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(TenantRecord {
+                    id: row.try_get("id")?,
+                    name: row.try_get("name")?,
+                    status: row.try_get("status")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn upsert_quota(
+        &self,
+        tenant_id: &str,
+        quota: &QuotaRecord,
+    ) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.quotas
+             (tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
+              max_plugins, max_connections, max_concurrent_runs)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (tenant_id) DO UPDATE
+             SET max_workflows = EXCLUDED.max_workflows,
+                 max_executions_per_day = EXCLUDED.max_executions_per_day,
+                 max_skills = EXCLUDED.max_skills,
+                 max_agents = EXCLUDED.max_agents,
+                 max_plugins = EXCLUDED.max_plugins,
+                 max_connections = EXCLUDED.max_connections,
+                 max_concurrent_runs = EXCLUDED.max_concurrent_runs",
+        )
+        .bind(tenant_id)
+        .bind(quota.max_workflows)
+        .bind(quota.max_executions_per_day)
+        .bind(quota.max_skills)
+        .bind(quota.max_agents)
+        .bind(quota.max_plugins)
+        .bind(quota.max_connections)
+        .bind(quota.max_concurrent_runs)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn quota(&self, tenant_id: &str) -> Result<Option<QuotaRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT max_workflows, max_executions_per_day, max_skills, max_agents,
+                    max_plugins, max_connections, max_concurrent_runs
+             FROM hpa_control.quotas WHERE tenant_id = $1",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        match row {
+            Some(row) => Ok(Some(QuotaRecord {
+                max_workflows: row.try_get("max_workflows")?,
+                max_executions_per_day: row.try_get("max_executions_per_day")?,
+                max_skills: row.try_get("max_skills")?,
+                max_agents: row.try_get("max_agents")?,
+                max_plugins: row.try_get("max_plugins")?,
+                max_connections: row.try_get("max_connections")?,
+                max_concurrent_runs: row.try_get("max_concurrent_runs")?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn upsert_member(&self, member: &MemberRecord) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.members
+             (id, tenant_id, subject, display_name, email, role, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (id) DO UPDATE
+             SET subject = EXCLUDED.subject,
+                 display_name = EXCLUDED.display_name,
+                 email = EXCLUDED.email,
+                 role = EXCLUDED.role,
+                 status = EXCLUDED.status,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(&member.id)
+        .bind(&member.tenant_id)
+        .bind(&member.subject)
+        .bind(&member.display_name)
+        .bind(member.email.as_deref())
+        .bind(&member.role)
+        .bind(&member.status)
+        .bind(member.created_at)
+        .bind(member.updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn delete_member(&self, member_id: &str) -> Result<bool, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let deleted = sqlx::query("DELETE FROM hpa_control.members WHERE id = $1")
+            .bind(member_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    pub async fn list_members(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<MemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, subject, display_name, email, role, status, created_at, updated_at
+             FROM hpa_control.members
+             WHERE ($1::text IS NULL OR tenant_id = $1)
+             ORDER BY created_at ASC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(MemberRecord {
+                    id: row.try_get("id")?,
+                    tenant_id: row.try_get("tenant_id")?,
+                    subject: row.try_get("subject")?,
+                    display_name: row.try_get("display_name")?,
+                    email: row.try_get("email")?,
+                    role: row.try_get("role")?,
+                    status: row.try_get("status")?,
+                    created_at: row.try_get("created_at")?,
+                    updated_at: row.try_get("updated_at")?,
+                })
+            })
+            .collect()
     }
 
     /// Audit must never fail the request it describes. If the tenant is not yet
