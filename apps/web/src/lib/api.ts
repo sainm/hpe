@@ -51,6 +51,11 @@ import type {
   ReadyReport,
   MarketDetail,
   MarketSummary,
+  MarketplacePublisher,
+  MarketplaceSource,
+  MarketplaceEvent,
+  RemoteMarketplacePackage,
+  VulnerabilityReport,
   NodeCatalog,
   PluginDetail,
   PluginInspection,
@@ -64,6 +69,7 @@ import type {
   SkillRunResult,
   SkillRunSummary,
   SkillShow,
+  SkillSource,
   SkillTestResult,
   Stats,
   TriggerFire,
@@ -220,8 +226,18 @@ export const api = {
   nodes: () => request<NodeCatalog>("/nodes"),
 
   authSession: () => request<AuthSession>("/auth/session"),
+  authRefresh: () =>
+    request<{
+      authenticated: boolean;
+      refreshed: boolean;
+      expiresAt: number;
+      accessTokenExpiresAt?: number;
+      refreshAvailable: boolean;
+    }>("/auth/refresh", { method: "POST" }),
   authLogout: () =>
-    request<{ loggedOut: boolean }>("/auth/logout", { method: "POST" }),
+    request<{ loggedOut: boolean; logoutUrl?: string | null }>("/auth/logout", {
+      method: "POST",
+    }),
 
   listAgents: () => request<{ agents: AgentSummary[] }>("/agents"),
   createAgent: (config: JsonValue) =>
@@ -329,6 +345,130 @@ export const api = {
 
   listMarketplace: () =>
     request<{ plugins: MarketSummary[] }>("/marketplace"),
+  listRemoteMarketplace: (source?: string) =>
+    request<{ packages: RemoteMarketplacePackage[] }>(
+      `/marketplace/remote${source ? `?source=${encodeURIComponent(source)}` : ""}`,
+    ),
+  getMarketplaceVulnerability: (id: string, version: string) =>
+    request<VulnerabilityReport>(
+      `/marketplace/vulnerabilities/${encodeURIComponent(id)}/${encodeURIComponent(version)}`,
+    ),
+  marketplaceEventCursor: () =>
+    request<{ sequence: number }>("/marketplace/events/latest").then(
+      (value) => value.sequence,
+    ),
+  async streamMarketplaceEvents(
+    since: number | null,
+    onEvent: (event: MarketplaceEvent) => void,
+    signal?: AbortSignal,
+    onReady?: (sequence: number) => void,
+  ): Promise<void> {
+    const headers = new Headers({ accept: "text/event-stream" });
+    if (since !== null) {
+      headers.set("last-event-id", String(Math.max(0, since)));
+    }
+    applyEnterpriseAuth(headers);
+    let response: Response;
+    try {
+      response = await fetch(
+        `${API_BASE}/marketplace/events/stream${
+          since === null ? "" : `?since=${Math.max(0, since)}`
+        }`,
+        { headers, signal },
+      );
+    } catch (error) {
+      throw new ApiError(0, "NETWORK", error instanceof Error ? error.message : String(error));
+    }
+    if (!response.ok) {
+      throw new ApiError(response.status, "MARKETPLACE_STREAM", await response.text());
+    }
+    const readySequence = Number(response.headers.get("x-hpa-event-sequence"));
+    if (Number.isSafeInteger(readySequence) && readySequence >= 0) {
+      onReady?.(readySequence);
+    }
+    if (!response.body) throw new ApiError(0, "NETWORK", "response body is empty");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = frame
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n");
+          if (data) onEvent(JSON.parse(data) as MarketplaceEvent);
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  },
+  listMarketplaceSources: () =>
+    request<{ sources: MarketplaceSource[] }>("/marketplace/sources"),
+  addMarketplaceSource: (body: {
+    id: string;
+    label: string;
+    indexUri: string;
+    keyId: string;
+    publicKey: string;
+    keyLabel: string;
+  }) =>
+    request<{ sourceId: string; keyId: string }>("/marketplace/sources", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  rotateMarketplaceSourceKey: (
+    id: string,
+    body: { keyId: string; publicKey: string; label: string },
+  ) =>
+    request<{ sourceId: string; keyId: string; rotatedAt: string }>(
+      `/marketplace/sources/${encodeURIComponent(id)}/rotate-key`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  refreshMarketplaceSource: (id: string) =>
+    request<JsonValue>(`/marketplace/sources/${encodeURIComponent(id)}/refresh`, {
+      method: "POST",
+    }),
+  installRemoteMarketplacePackage: (source: string, id: string, version: string) =>
+    request<PluginDetail>(
+      `/marketplace/remote/${encodeURIComponent(source)}/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/install`,
+      { method: "POST" },
+    ),
+  listMarketplacePublishers: () =>
+    request<{ publishers: MarketplacePublisher[] }>("/marketplace/publishers"),
+  addMarketplacePublisher: (body: { id: string; name: string }) =>
+    request<{ publisherId: string; name: string; status: string }>(
+      "/marketplace/publishers",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  addMarketplacePublisherKey: (
+    id: string,
+    body: {
+      keyId: string;
+      publicKey: string;
+      label: string;
+      validFrom?: string;
+      validUntil?: string;
+    },
+  ) =>
+    request<{ publisherId: string; keyId: string; label: string }>(
+      `/marketplace/publishers/${encodeURIComponent(id)}/keys`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  revokeMarketplacePublisherKey: (id: string, keyId: string) =>
+    request<{ publisherId: string; keyId: string; revoked: boolean }>(
+      `/marketplace/publishers/${encodeURIComponent(id)}/keys`,
+      { method: "DELETE", body: JSON.stringify({ keyId }) },
+    ),
   publishMarketplace: (path: string) =>
     request<MarketDetail>("/marketplace/publish", {
       method: "POST",
@@ -426,6 +566,28 @@ export const api = {
   getSkillVersion: (id: string, version: string) =>
     request<SkillDetail>(
       `/skills/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}`,
+    ),
+  getSkillSource: (id: string, version: string) =>
+    request<SkillSource>(
+      `/skills/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/source`,
+    ),
+  saveSkillDraft: (
+    id: string,
+    version: string,
+    nextVersion: string,
+    files: Record<string, string>,
+  ) =>
+    request<ImportedSkill>(
+      `/skills/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/draft`,
+      {
+        method: "POST",
+        body: JSON.stringify({ version: nextVersion, files }),
+      },
+    ),
+  signSkill: (id: string, version: string) =>
+    request<{ signature: NonNullable<SkillDetail["signature"]> }>(
+      `/skills/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/sign`,
+      { method: "POST" },
     ),
   publishSkill: (id: string, version: string) =>
     request<{ published: boolean }>(

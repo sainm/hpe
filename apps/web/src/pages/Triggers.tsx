@@ -166,12 +166,14 @@ function TriggerCard({
   onFire: () => void;
 }) {
   const { t } = useTranslation();
-  const notWired = trigger.kind === "event" || trigger.kind === "mcp";
+  const notWired = trigger.kind === "mcp";
   return (
     <Panel className="min-w-0 p-3.5">
       <div className="flex flex-wrap items-center gap-1.5">
         {trigger.kind === "schedule" ? (
           <Timer className="h-3.5 w-3.5 text-accent" />
+        ) : trigger.kind === "event" ? (
+          <Zap className="h-3.5 w-3.5 text-warning" />
         ) : (
           <Webhook className="h-3.5 w-3.5 text-success" />
         )}
@@ -236,6 +238,18 @@ function TriggerCard({
             <span className="font-mono text-[10px] text-faint">
               {trigger.webhook.signatureHeader}
             </span>
+          </div>
+        </div>
+      ) : null}
+
+      {trigger.event ? (
+        <div className="mt-2 grid gap-1">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <Badge tone="warning">{trigger.event.topic}</Badge>
+            <code className="min-w-0 flex-1 truncate rounded-sm border border-line bg-panel-2 px-1.5 py-1 font-mono text-[10.5px] text-muted">
+              {trigger.event.publishUrl}
+            </code>
+            <CopyButton text={trigger.event.publishUrl} />
           </div>
         </div>
       ) : null}

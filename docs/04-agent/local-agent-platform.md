@@ -56,6 +56,7 @@ Schema：`hpa.agent/v1`；会话状态：`hpa.agent.session/v1`。
 - `approval` 只能覆盖已声明工具；高风险工具不允许 `never`。
 - 确定性 planner 必须有非空 plan；plan 中的工具与 subAgent 必须已声明。
 - OpenAI planner 的 endpoint 必须是 http(s)，且不能包含 userinfo。
+- `python` planner 显式选择 Python/LangGraph Worker；model 可覆盖 `HPA_AI_MODELS`，可用工具和 instructions 来自当前 AgentVersion。`subAgents` 通过 Rust ToolService 的 `agent.handoff` 执行，并继承父会话剩余预算与深度。
 
 ### 参数解析
 
@@ -72,7 +73,7 @@ Schema：`hpa.agent/v1`；会话状态：`hpa.agent.session/v1`。
 - `agentId@version` 相同哈希重复提交返回 `inserted: false`。
 - 相同版本不同内容返回 `AGENT_VERSION_FROZEN`，必须提升版本号。
 - 发布后版本内容与哈希不可改写；运行默认使用最新已发布版本，也可显式指定版本。
-- 本地状态写入 SQLite：`agents`、`agent_versions`、`agent_sessions`、`agent_events`、`agent_approvals`。
+- 本地状态写入 SQLite：`agents`、`agent_versions`、`agent_sessions`、`agent_events`、`agent_approvals`、`agent_tool_calls`；PostgreSQL 同时定义 `agent_tool_calls` 与 FORCE RLS。
 
 ## 3. Rust Agent Runtime
 
@@ -87,6 +88,8 @@ Schema：`hpa.agent/v1`；会话状态：`hpa.agent.session/v1`。
 7. 每一步持久化状态与事件；进程重启后可从最近检查点继续。
 8. `respond` 结束会话；预算、超时、拒绝、循环等以明确代码失败。
 
+当 `planner.kind = "python"` 时，第 2～6 步改由 LangGraph Worker 规划；工具执行仍回到 Rust ToolService。Rust 从 AgentVersion 重新校验工具声明和风险，模型的自报 risk/approval 不得降低策略。工具调用使用 `callId + canonical arguments` 的稳定账本，审批能力绑定同一哈希。
+
 ### 工具
 
 | 工具 | 风险 | 执行 |
@@ -97,6 +100,7 @@ Schema：`hpa.agent/v1`；会话状态：`hpa.agent.session/v1`。
 | `execution.get` | low | 读取执行状态/输出/等待审批 |
 | `execution.wait` | low | 轮询最多 30s，遇终态或 waiting_approval 返回 |
 | `mcp.<server>.<tool>` | high | 复用 Phase 3 MCP Client 与外部服务器允许列表 |
+| `agent.handoff` | medium | 只能转到已声明 subAgent；使用父会话剩余预算/深度并由 Rust ToolService 启动 |
 
 MCP 与 Workflow 工具不向模型透传上游凭据；Workflow 执行使用官方发布版本与执行快照。
 

@@ -2,6 +2,8 @@
 
 > Connector 是外部系统适配器；Node/Tool/MCP Tool 是它的不同入口。凭证、网络策略、限流、重试、审计由运行时统一负责。
 
+> 当前已落地的 HTTP/File/PostgreSQL/Git/Redis MQ/S3 实现和明确边界见 [Connector 生产扩展](connector-implementation.md)。
+
 ## 1. 概念
 
 | 概念 | 作用 |

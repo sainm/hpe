@@ -10,7 +10,7 @@
 - 远程执行标记：`remote_executions` 表阻止服务重启时本地 Runtime 接管远程 execution。
 - UI：Enterprise Worker Center 中创建 Worker/token、查看队列与租约、派发 Workflow、取消任务。
 
-不做：Redis/Kafka、mTLS、双向隧道、任务产物对象存储、自动扩缩容、浏览器 SSO、控制面多节点。
+不做：Redis/Kafka、mTLS、双向隧道、任务产物对象存储、自动扩缩容、控制面多节点。
 
 ## 2. 角色与认证
 
@@ -147,7 +147,7 @@ GET    /api/enterprise/tenants/{id}/workflows  派发用 Workflow 摘要
 ## 5. Worker daemon
 
 ```bash
-HPA_WORKER_TOKEN=hpa_wrk_... hpa worker \
+HPA_WORKER_TOKEN=hpa_wrk_... hpa --data-dir ~/.hpa-worker worker \
   --control-url http://127.0.0.1:8787 \
   --max-concurrency 2 \
   --capabilities workflow
@@ -157,9 +157,10 @@ HPA_WORKER_TOKEN=hpa_wrk_... hpa worker \
 - 主循环：heartbeat（10s）→ lease（空闲 1s）→ 每个 Job 独立 tokio task。
 - 每个 Job：解析 workflow/state → compile（同一 `hpa_core`）→ `start_event`（仅 `resumed=false`）→ loop `step` → 每步上报 state/events → waiting/terminal 时 complete。
 - 取消：heartbeat 返回的 Job id 触发 CancellationToken；step 之间调用 `cancel_execution` 并 complete cancelled；长 HTTP/脚本调用为尽力取消。
-- 断线：上报失败指数退避重试；租约过期后控制面重排，旧 lease 的迟到上报 409 并被丢弃。
+- 上报持久化：start/events/complete 在 HTTP 发送前写入 `<data_dir>/worker-outbox.db`；上报失败指数退避并保留，重启后先排空；发送成功但确认删除前崩溃会安全重放。
+- 断线：租约过期后控制面重排，旧 lease 的迟到上报 409，当前 lease 的 outbox 记录被清理。
 - Worker 版本与控制面 `runtime_version` 不一致时不被派发；能力必须包含 Job 的 required capabilities。
-- 当前 CLI 没有 `--drain`；SIGTERM 直接停止进程，未上报的 Job 依赖 30s 租约过期重排。禁止把 SIGTERM 当成优雅排空承诺。
+- 当前 CLI 没有 `--drain`；已写入 outbox 的完成结果会在重启后上报，尚未完成的执行仍依赖 30s 租约过期重排。禁止把 SIGTERM 当成全部 Job 的优雅排空承诺。
 
 ## 6. 审批、取消与本地 Runtime 隔离
 
@@ -173,7 +174,7 @@ HPA_WORKER_TOKEN=hpa_wrk_... hpa worker \
 - 服务重启：
   - `RuntimeManager::recover`/审批扫描排除 `remote_executions` 中的 execution；
   - Worker 继续 heartbeat/lease；未上报的旧 lease 过期后重排。
-- 远程 execution 的审批 SLA 不自动超时（本地监控跳过）；需人工在 Approval Center 处理。
+- 远程 execution 的审批 SLA 由控制面后台扫描；到点后按 `onTimeout` 写入租户执行并重新入队，也可由人工提前处理。
 
 ## 7. 私有部署约束
 
@@ -202,7 +203,7 @@ HPA_WORKER_TOKEN=hpa_wrk_... hpa worker \
 - `crates/hpa-local/src/enterprise.rs`：`/api/worker/*`、`/api/enterprise/worker-jobs`、Worker Center 接口；Worker 首次 start 时把 execution/events/artifacts 写回租户库。
 - 租户库 `remote_executions` 标记；本地 `RuntimeManager::recover` 与审批 SLA 扫描跳过远程 execution，审批 API 通过 `requeue_execution` 恢复远程 Job。
 - Enterprise Center 的“ワーカー”页：注册/能力/并发/一次性 token、轮换、派发、队列、取消；截图 `docs/assets/phase8/`。
-- `hpa worker --control-url ... --max-concurrency N --capabilities workflow`；token 来自 `HPA_WORKER_TOKEN`。
+- `hpa --data-dir <state-dir> worker --control-url ... --max-concurrency N --capabilities workflow`；token 来自 `HPA_WORKER_TOKEN`，`<state-dir>/worker-outbox.db` 是持久上报队列。
 
 验收：
 
@@ -214,7 +215,7 @@ HPA_WORKER_TOKEN=hpa_wrk_... hpa worker \
 
 ![Worker Center 607](../assets/phase8/workers-607.png)
 
-仍未实现：持久 outbox（进程崩溃前未上报的结果依赖租约重排/至少一次）、远程 Worker 的凭证注入/对象存储、审批 SLA 自动超时、Redis/多节点、mTLS、自动扩缩容。部署与运维见 [Hybrid Worker 私有部署](hybrid-worker-deployment.md)。
+仍未实现：远程 Worker 的凭证注入/对象存储、Redis/多节点、mTLS、自动扩缩容。持久 outbox 与远程审批 SLA 已实现；部署与运维见 [Hybrid Worker 私有部署](hybrid-worker-deployment.md)。
 
 ## 10. 相关文档
 

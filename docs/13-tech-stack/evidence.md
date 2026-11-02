@@ -1,18 +1,21 @@
 # 技术栈证据
 
-> 核查日期：2026-11-01。方法：crates.io API + 下载 `.crate` 源码；npm registry + 官方文档；PyPI/GitHub 源码与许可证；GitHub API 元数据。未安装 Rust/uv，未编译任何 Rust/Python；本机 Node 为 26.0.0（推荐 LTS 26.13）。
+> 核查日期：2026-11-02。方法：crates.io API + 下载 `.crate` 源码；npm registry + 官方文档；PyPI/GitHub 源码与许可证；GitHub API 元数据。Rust/Cargo 1.99.1、Node 26.13、pnpm 12.16.1、Python 3.13 和 Podman 5.8.5 已完成本地编译/测试；Python Worker 为显式 `planner.kind = "python"` 的可选独立进程，不改变既有 deterministic/OpenAI planner。
 
 ## 1. 工具链证据
 
 | 项 | 当前/目标 | 证据 | 结论 |
 | --- | --- | --- | --- |
 | Rust stable | 1.99.1（2026-10-16） | GitHub `rust-lang/rust` release | 目标工具链；项目 MSRV 取依赖最高值 1.97 |
-| Cargo | 未安装 | `which cargo` 为空 | 本轮未编译；构建前需安装 Rust 1.97+ |
-| Node.js | 本机 26.0.0；LTS 26.13.0（2026-10-28） | `node -v`、nodejs.org/dist/index.json | 目标 Node 26 LTS（≥26.13） |
+| Cargo | 1.99.1 | `cargo --version` | 当前工作区可编译；MSRV 1.97 |
+| Node.js | 全局 26.0.0；验证使用 26.13.0（2026-10-28） | `node -v`、`npx -p node@26.13.0 node -v`、nodejs.org/dist/index.json | 目标 Node 26 LTS（≥26.13） |
 | TypeScript | 5.9.3（生产）/ 7.0.2（最新） | npm registry | 生产用 5.9.3；7.0.2 待 Nest/Vite/装饰器兼容验证 |
-| pnpm | 未安装；最新 12.16.1 | `which pnpm`、npm registry | 目标 pnpm 12.x；本轮未安装 |
-| Python | 本机 3.9.6；目标 3.13 | `python3 --version` | 本机不满足 LangGraph/Pydantic（≥3.10）；AI Worker 需用户安装 3.13 |
-| uv | 0.13.6 | PyPI/GitHub | Python 依赖/虚拟环境/构建 |
+| pnpm | 12.16.1（经 npx 固定版本） | `npx -y -p pnpm@12.16.1 pnpm --version` | 当前门禁用固定 pnpm |
+| Python | 3.13.18 | Homebrew `python3.13 --version` | LangGraph/LiteLLM Worker 已安装与测试 |
+| uv | 0.12.18（本机固定） | `uv --version` | Python 依赖/虚拟环境/构建；清华镜像 |
+| Podman | 5.8.5 rootless / AppleHV | `podman version`、container smoke | Worker 只读 rootfs/cgroup/network isolation 演练 |
+| Go | 1.27.1 | `go version` | 国内 proxy 安装 cosign |
+| cosign | 2.6.0 | `target/tools/cosign version` | Sigstore bundle provenance；二进制 SHA-256 `27b8044467aa832ef5e28840273a222db2d34903480ab46aa888d6351b3a7bd8` |
 | Buf | 1.75.0（Apache-2.0） | GitHub release | Proto lint/breaking；代码生成由 tonic-prost-build |
 
 ## 2. Rust crates（核心）
@@ -22,29 +25,29 @@
 | tokio | 1.54.1 | MIT | 1.85 | 2026-10-21 | Async runtime/process/time | 采用 |
 | axum | 0.8.9 | MIT | 1.80 | 2026-04-14 | 本地/Worker HTTP API | 采用 |
 | serde | 1.0.229 | MIT OR Apache-2.0 | 1.56 | 2026-07-18 | JSON/配置序列化 | 采用 |
-| schemars | 1.2.3 | MIT | 1.74 | 2026-10-12 | Node/Tool JSON Schema | 采用 |
+| schemars | 1.2.3 | MIT | 1.74 | 2026-10-12 | Node/Tool JSON Schema | 评估过，未直接依赖 |
 | jsonschema | 0.60.2 | MIT | 1.85 | 2026-10-26 | IR/工具 schema 校验 | 采用 |
 | saphyr | 0.3.3 | MIT OR Apache-2.0 | 1.85 | 2026-10-27 | YAML 1.2/annotated span | 采用（YAML） |
 | jaq-core / jaq-std / jaq-json | 3.1.2 / 3.0.4 / 2.0.3 | MIT | 1.69/1.70 | 2026-10-21 | jq 表达式 | 采用（表达式） |
 | sqlx | 0.9.0 | MIT OR Apache-2.0 | 1.94 | 2026-05-21 | Postgres/SQLite 访问、迁移 | 采用 |
-| tonic | 0.14.9 | MIT | 1.88 | 2026-10-29 | 内部 gRPC | 采用 |
-| tonic-prost / -build | 0.14.9 | MIT | 1.88 | 2026-10-29 | gRPC 代码生成 | 采用 |
+| tonic | 0.14.9 | MIT | 1.88 | 2026-10-29 | 内部 gRPC | 当前仅作为 OTel protobuf 测试的传递依赖 |
+| tonic-prost / -build | 0.14.9 | MIT | 1.88 | 2026-10-29 | gRPC 代码生成 | 当前无内部 gRPC 服务 |
 | tracing | 0.1.44 | MIT | 1.65 | 2025-12-18 | 日志/span | 采用 |
 | opentelemetry | 0.33.1 | Apache-2.0 | 1.75 | 2026-10-09 | OTel API/SDK | 采用 |
 | opentelemetry-otlp | 0.33.1 | Apache-2.0 | 1.75 | 2026-10-09 | OTLP 导出 | 采用 |
 | tracing-opentelemetry | 0.34.0 | MIT | 1.75 | 2026-09-23 | tracing ↔ OTel（依赖 otel 0.33） | 采用 |
-| wasmtime | 50.0.1 | Apache-2.0 WITH LLVM-exception | **1.97** | 2026-10-29 | WASM/组件/WASI | 采用（插件沙箱） |
-| wasmtime-wasi | 50.0.1 | Apache-2.0 WITH LLVM-exception | **1.97** | 2026-10-29 | WASI p2/p3 | 采用 |
-| rmcp | 3.8.0 | Apache-2.0（MIT→Apache 过渡声明） | 1.88 | 2026-10-26 | MCP client/server | 采用 |
+| wasmtime | 50.0.1 | Apache-2.0 WITH LLVM-exception | **1.97** | 2026-10-29 | WASM/组件/WASI | 评估过，未直接依赖 |
+| wasmtime-wasi | 50.0.1 | Apache-2.0 WITH LLVM-exception | **1.97** | 2026-10-29 | WASI p2/p3 | 评估过，未直接依赖 |
+| rmcp | 3.8.0 | Apache-2.0（MIT→Apache 过渡声明） | 1.88 | 2026-10-26 | MCP client/server | 评估过；当前使用项目自有 MCP 实现 |
 
-### 核心证据路径
+### 依赖证据路径
 
 - Tokio：`process/mod.rs`（`kill_on_drop`）、`time`、`sync`、`signal`。
 - Axum：`Cargo.toml` features（json/http1/tokio/tracing）、Tower 中间件。
 - SQLx：`sqlite-bundled` feature（`sqlx-sqlite/bundled`）；`runtime-tokio`、`postgres`、`migrate`、`macros`。
-- Tonic：`transport`/`codegen`/`tls-ring`；`tonic-prost-build` 0.14.9 生成代码。
-- Wasmtime：`Config::epoch_interruption`、`Store::set_epoch_deadline`、`ResourceLimiter`；`wasmtime-wasi` 提供 p2/p3。
-- RMCP：`src/model.rs` 定义 `V_2025_11_25`、`V_2026_07_28`、`KNOWN_VERSIONS`；`src/model/mrtr.rs`、`subscriptions/listen`、`server/discover`、Streamable HTTP、OAuth。
+- OpenTelemetry：项目启用 trace/metrics/logs + http-proto + blocking reqwest；Rust 使用 tracing bridge，Python 使用 OTLP 三信号 exporter。
+- Tonic：仅通过 `opentelemetry-proto` 的 protobuf 类型进入测试，不是 HPA RPC 传输。
+- Wasmtime/RMCP：保留在技术选型证据表中，但当前 Cargo workspace 未依赖，不能视为已采用。
 
 ### 核心 crate 源码哈希
 
@@ -64,7 +67,7 @@
 
 ### 关键发现
 
-1. **RMCP 3.8.0 已支持 MCP 2026-07-28**（discover、MRTR、resultType、subscriptions/listen、tasks、Streamable HTTP、OAuth）。这修正了仅依赖 TS SDK 1.32.2（稳定版仍为 2025-11-25）的结论：Rust MCP Runtime 是主实现，TS 只做管理 API/UI。
+1. **当前 MCP 2026-07-28 支持来自项目自有 Rust HTTP/stdio 实现**（discover、MRTR、resultType、subscriptions/listen、tasks、Streamable HTTP 子集、OAuth）；RMCP 3.8.0 只作为替代方案证据，不在 Cargo 依赖中。
 2. **Wasmtime 50 的 MSRV 是 1.97**，SQLx 0.9 是 1.94；项目最低 Rust 取 1.97，实际用 1.99。
 3. **tracing-opentelemetry 0.33 依赖 otel 0.32**；必须用 0.34 + otel 0.33，不能混用最新版。
 4. `jsonschema` 默认启用 HTTP/文件解析；处理不可信 schema 时应关闭远程/文件解析，只允许本地注册 ref。
@@ -91,7 +94,7 @@
 
 | 包 | 版本 | License | 结论 |
 | --- | --- | --- | --- |
-| Node.js | 26.13 LTS（本机 26.0） | — | 目标运行时 |
+| Node.js | 26.13 LTS（npx 验证；全局 26.0） | — | 目标运行时 |
 | TypeScript | 5.9.3 生产 / 7.0.2 评估 | Apache-2.0 | 5.9.3 稳定；7.0.2 需工具链验证 |
 | React / React DOM | 19.3.1 | MIT | 采用 |
 | Vite | 8.3.5 | MIT | engines Node ^20.19 或 ≥22.12 |
@@ -130,7 +133,7 @@
 
 | 包 | 版本 | License | 用途 | 结论 |
 | --- | --- | --- | --- | --- |
-| Python | 3.13（目标） | PSF | AI Worker | 本机 3.9.6 不满足；需安装 |
+| Python | 3.13.18 | PSF | AI Worker | 已安装并通过测试 |
 | LangGraph | 1.2.19 | MIT | Agent 状态图/checkpoint/interrupt | 采用（可选 Worker） |
 | Pydantic | 2.14.2 | MIT | 请求/响应/配置模型 | 采用 |
 | FastAPI | 0.162.0 | MIT | 可选健康/管理 HTTP | 仅辅，不承载核心 |
@@ -141,6 +144,7 @@
 | anthropic | 2.3.0 | Apache-2.0 | Provider SDK（适配器内） | 可选 |
 | langchain-core | 1.7.3 | MIT | LangGraph 依赖 | 随 LangGraph |
 | langgraph-checkpoint-postgres / sqlite | 3.2.0 / 3.1.3 | MIT | Agent 检查点 | 采用（Worker 私有 schema） |
+| psycopg / psycopg-pool | 3.3.6 / 3.3.3 | LGPL-3.0 | PostgreSQL 异步 checkpoint 连接/池 | 采用（仅 Worker 私有 schema） |
 | uv | 0.13.6 | Apache-2.0 | 依赖/环境/构建 | 采用 |
 | pytest | 9.2.0 | MIT | 测试 | 采用 |
 | ruff | 0.17.3 | MIT | lint/format | 采用 |
@@ -150,7 +154,7 @@
 
 ## 6. 未验证/未做
 
-- 未安装 Rust/Cargo/uv/pnpm，未编译或运行。
+- Rust/Cargo/pnpm/uv/Python 3.13 已安装并完成本地全量测试。
 - 未在 Windows/macOS/Linux 三平台构建/打包；跨平台结论是设计+官方支持信息。
 - 未做性能基准；文档中的性能/资源数字是目标，不是实测。
 - 未做全量传递依赖许可证扫描；只核查核心直接依赖与源码许可证。

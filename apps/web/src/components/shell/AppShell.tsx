@@ -177,7 +177,7 @@ export function AppShell() {
   return (
     <div className={styles.shell}>
       <aside className={styles.sidebar}>
-        <Link to="/" className={styles.brand} aria-label={productName}>
+        <Link to="/" className={styles.brand}>
           <span className={styles.brandMark} aria-hidden="true">
             h
           </span>

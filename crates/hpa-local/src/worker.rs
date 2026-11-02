@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use hpa_local::postgres_worker::{
+    PostgresWorkerError, PostgresWorkerStore, WorkerAuthRecord, WorkerJobRecord, WorkerRecord,
+};
+
 const LEASE_TTL_MS: i64 = 30_000;
 const DEFAULT_CAPABILITY: &str = "workflow";
 const MAX_CONCURRENCY: i64 = 64;
@@ -19,6 +23,7 @@ const JOB_SELECT: &str = "SELECT id, tenant_id, worker_id, execution_id, workflo
 #[derive(Clone)]
 pub struct WorkerService {
     control: SqlitePool,
+    postgres: Option<PostgresWorkerStore>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +52,40 @@ pub struct WorkerJob {
     pub error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl From<WorkerJobRecord> for WorkerJob {
+    fn from(record: WorkerJobRecord) -> Self {
+        Self {
+            id: record.id,
+            tenant_id: record.tenant_id,
+            worker_id: record.worker_id,
+            execution_id: record.execution_id,
+            workflow_id: record.workflow_id,
+            workflow_version: record.workflow_version,
+            workflow_json: record.workflow_json,
+            state_json: record.state_json,
+            status: record.status,
+            attempts: record.attempts,
+            lease_id: record.lease_id,
+            lease_expires_at: record.lease_expires_at,
+            runtime_version: record.runtime_version,
+            resumed: record.resumed,
+            cancel_requested: record.cancel_requested,
+            error: record.error,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<WorkerAuthRecord> for WorkerAuth {
+    fn from(record: WorkerAuthRecord) -> Self {
+        Self {
+            worker_id: record.worker_id,
+            tenant_id: record.tenant_id,
+        }
+    }
 }
 
 impl WorkerJob {
@@ -161,7 +200,87 @@ impl From<serde_json::Error> for WorkerError {
 
 impl WorkerService {
     pub fn new(control: SqlitePool) -> Self {
-        Self { control }
+        Self {
+            control,
+            postgres: None,
+        }
+    }
+
+    pub fn with_postgres(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.postgres = Some(PostgresWorkerStore::new(pool));
+        self
+    }
+
+    fn map_postgres(error: PostgresWorkerError) -> WorkerError {
+        match error {
+            PostgresWorkerError::WorkerNotFound(message)
+            | PostgresWorkerError::JobNotFound(message) => WorkerError::not_found(message),
+            PostgresWorkerError::StaleLease => WorkerError::conflict("lease is stale"),
+            PostgresWorkerError::DuplicateExecution(execution_id) => {
+                WorkerError::conflict(format!("execution `{execution_id}` is already enqueued"))
+            }
+            PostgresWorkerError::Invalid(message) => WorkerError::invalid(message),
+            other => WorkerError::internal(other.to_string()),
+        }
+    }
+
+    pub fn has_postgres(&self) -> bool {
+        self.postgres.is_some()
+    }
+
+    pub async fn sync_worker_value(&self, worker: &Value) -> Result<(), WorkerError> {
+        let Some(postgres) = self.postgres.as_ref() else {
+            return Ok(());
+        };
+        let tenant_id = worker["tenantId"]
+            .as_str()
+            .ok_or_else(|| WorkerError::invalid("worker tenantId is required"))?;
+        let id = worker["id"]
+            .as_str()
+            .ok_or_else(|| WorkerError::invalid("worker id is required"))?;
+        let capabilities = worker["capabilities"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        postgres
+            .upsert_worker(
+                tenant_id,
+                id,
+                worker["name"].as_str().unwrap_or(id),
+                worker["kind"].as_str().unwrap_or("runner"),
+                worker["status"].as_str().unwrap_or("active"),
+                &capabilities,
+                worker["maxConcurrency"].as_i64().unwrap_or(1),
+                worker["runtimeVersion"].as_str(),
+                worker["lastHeartbeatAt"].as_i64().unwrap_or_else(now_ms),
+                worker["registeredAt"].as_i64().unwrap_or_else(now_ms),
+                &worker.get("metadata").cloned().unwrap_or_else(|| json!({})),
+            )
+            .await
+            .map_err(Self::map_postgres)?;
+        Ok(())
+    }
+
+    pub async fn list_workers_pg(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<Value>, WorkerError> {
+        let Some(postgres) = self.postgres.as_ref() else {
+            return Err(WorkerError::internal(
+                "PostgreSQL worker backend is disabled",
+            ));
+        };
+        postgres
+            .list_workers(tenant_id)
+            .await
+            .map(|workers| workers.into_iter().map(worker_record_json).collect())
+            .map_err(Self::map_postgres)
     }
 
     pub async fn ensure_schema(&self) -> Result<(), WorkerError> {
@@ -263,6 +382,12 @@ impl WorkerService {
         &self,
         worker_id: &str,
     ) -> Result<(String, String), WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .mint_worker_token(worker_id, now_ms())
+                .await
+                .map_err(Self::map_postgres);
+        }
         let worker: Option<(String,)> =
             sqlx::query_as("SELECT tenant_id FROM enterprise_workers WHERE id = ?")
                 .bind(worker_id)
@@ -306,6 +431,12 @@ impl WorkerService {
     }
 
     pub async fn revoke_worker_tokens(&self, worker_id: &str) -> Result<(), WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .revoke_worker_tokens(worker_id, now_ms())
+                .await
+                .map_err(Self::map_postgres);
+        }
         sqlx::query(
             "UPDATE enterprise_worker_tokens SET revoked_at = ?
              WHERE worker_id = ? AND revoked_at IS NULL",
@@ -321,6 +452,13 @@ impl WorkerService {
         &self,
         token: &str,
     ) -> Result<Option<WorkerAuth>, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .authenticate_worker(token)
+                .await
+                .map(|auth| auth.map(Into::into))
+                .map_err(Self::map_postgres);
+        }
         if !token.starts_with("hpa_wrk_") || token.len() <= "hpa_wrk_".len() {
             return Ok(None);
         }
@@ -409,6 +547,23 @@ impl WorkerService {
         if runtime_version.trim().is_empty() {
             return Err(WorkerError::invalid("runtime version is required"));
         }
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .enqueue_job(
+                    tenant_id,
+                    worker_id,
+                    execution_id,
+                    workflow_id,
+                    workflow_version,
+                    workflow_json,
+                    state_json,
+                    runtime_version,
+                    now_ms(),
+                )
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres);
+        }
         let tenant: Option<String> = sqlx::query_scalar(
             "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
         )
@@ -491,6 +646,17 @@ impl WorkerService {
         capabilities: &[String],
     ) -> Result<(Vec<WorkerJob>, Vec<String>), WorkerError> {
         let capabilities = validate_capabilities(capabilities)?;
+        if let Some(postgres) = self.postgres.as_ref() {
+            let auth = WorkerAuthRecord {
+                worker_id: auth.worker_id.clone(),
+                tenant_id: auth.tenant_id.clone(),
+            };
+            let (jobs, cancels) = postgres
+                .lease_jobs(&auth, slots, version, &capabilities, now_ms())
+                .await
+                .map_err(Self::map_postgres)?;
+            return Ok((jobs.into_iter().map(Into::into).collect(), cancels));
+        }
         let requested: HashSet<String> = capabilities.iter().cloned().collect();
         let now = now_ms();
         let mut tx = self.control.begin().await?;
@@ -614,6 +780,23 @@ impl WorkerService {
                 "max concurrency must be between 1 and {MAX_CONCURRENCY}"
             )));
         }
+        if let Some(postgres) = self.postgres.as_ref() {
+            let auth = WorkerAuthRecord {
+                worker_id: auth.worker_id.clone(),
+                tenant_id: auth.tenant_id.clone(),
+            };
+            return postgres
+                .heartbeat(
+                    &auth,
+                    version,
+                    &capabilities,
+                    max_concurrency,
+                    active_jobs,
+                    now_ms(),
+                )
+                .await
+                .map_err(Self::map_postgres);
+        }
         let now = now_ms();
         let mut tx = self.control.begin().await?;
         let worker: Option<(String, String)> =
@@ -677,6 +860,17 @@ impl WorkerService {
         job_id: &str,
         lease_id: &str,
     ) -> Result<WorkerJob, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            let auth = WorkerAuthRecord {
+                worker_id: auth.worker_id.clone(),
+                tenant_id: auth.tenant_id.clone(),
+            };
+            return postgres
+                .start_job(&auth, job_id, lease_id, now_ms())
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres);
+        }
         let job = self
             .fetch_job(job_id, &auth.tenant_id)
             .await?
@@ -725,6 +919,17 @@ impl WorkerService {
             return Err(WorkerError::invalid(format!(
                 "status `{status}` is not accepted"
             )));
+        }
+        if let Some(postgres) = self.postgres.as_ref() {
+            let auth = WorkerAuthRecord {
+                worker_id: auth.worker_id.clone(),
+                tenant_id: auth.tenant_id.clone(),
+            };
+            return postgres
+                .report_job(&auth, job_id, lease_id, status, state_json, now_ms())
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres);
         }
         let job = self
             .fetch_job(job_id, &auth.tenant_id)
@@ -798,6 +1003,17 @@ impl WorkerService {
             return Err(WorkerError::invalid(format!(
                 "status `{status}` is not accepted"
             )));
+        }
+        if let Some(postgres) = self.postgres.as_ref() {
+            let auth = WorkerAuthRecord {
+                worker_id: auth.worker_id.clone(),
+                tenant_id: auth.tenant_id.clone(),
+            };
+            return postgres
+                .complete_job(&auth, job_id, lease_id, status, state_json, error, now_ms())
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres);
         }
         let job = self
             .fetch_job(job_id, &auth.tenant_id)
@@ -876,6 +1092,13 @@ impl WorkerService {
         tenant_id: &str,
         job_id: &str,
     ) -> Result<WorkerJob, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .cancel_job(tenant_id, job_id, now_ms())
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres);
+        }
         let job = self
             .fetch_job(job_id, tenant_id)
             .await?
@@ -924,6 +1147,13 @@ impl WorkerService {
         &self,
         execution_id: &str,
     ) -> Result<Option<WorkerJob>, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .job_for_execution(execution_id)
+                .await
+                .map(|job| job.map(Into::into))
+                .map_err(Self::map_postgres);
+        }
         let query = format!("{JOB_SELECT} WHERE execution_id = ?");
         Ok(sqlx::query_as::<_, WorkerJob>(sqlx::AssertSqlSafe(query))
             .bind(execution_id)
@@ -936,6 +1166,13 @@ impl WorkerService {
         execution_id: &str,
         state_json: &str,
     ) -> Result<Option<WorkerJob>, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .requeue_execution(execution_id, state_json, now_ms())
+                .await
+                .map(|job| job.map(Into::into))
+                .map_err(Self::map_postgres);
+        }
         let Some(job) = self.job_for_execution(execution_id).await? else {
             return Ok(None);
         };
@@ -987,6 +1224,13 @@ impl WorkerService {
         limit: i64,
     ) -> Result<Vec<WorkerJob>, WorkerError> {
         let limit = limit.clamp(1, 200);
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .list_jobs(tenant_id, limit)
+                .await
+                .map(|jobs| jobs.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres);
+        }
         let jobs = match tenant_id {
             Some(tenant_id) => {
                 validate_tenant(tenant_id)?;
@@ -1011,15 +1255,45 @@ impl WorkerService {
         Ok(jobs)
     }
 
+    pub async fn waiting_approval_jobs(&self) -> Result<Vec<WorkerJob>, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .waiting_approval_jobs()
+                .await
+                .map(|jobs| jobs.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres);
+        }
+        let query = format!(
+            "{JOB_SELECT} WHERE status = 'waiting_approval' AND cancel_requested = 0
+             ORDER BY created_at ASC LIMIT 200"
+        );
+        Ok(sqlx::query_as::<_, WorkerJob>(sqlx::AssertSqlSafe(query))
+            .fetch_all(&self.control)
+            .await?)
+    }
+
     pub async fn get_job(
         &self,
         tenant_id: &str,
         job_id: &str,
     ) -> Result<Option<WorkerJob>, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .get_job(tenant_id, job_id)
+                .await
+                .map(|job| job.map(Into::into))
+                .map_err(Self::map_postgres);
+        }
         self.fetch_job(job_id, tenant_id).await
     }
 
     pub async fn expire_leases(&self) -> Result<usize, WorkerError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            return postgres
+                .expire_leases(now_ms())
+                .await
+                .map_err(Self::map_postgres);
+        }
         let mut tx = self.control.begin().await?;
         let expired = expire_leases_with(&mut tx, now_ms()).await?;
         tx.commit().await?;
@@ -1139,6 +1413,22 @@ fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn worker_record_json(worker: WorkerRecord) -> Value {
+    json!({
+        "id": worker.id,
+        "tenantId": worker.tenant_id,
+        "name": worker.name,
+        "kind": worker.kind,
+        "status": worker.status,
+        "lastHeartbeatAt": worker.last_heartbeat_at,
+        "registeredAt": worker.registered_at,
+        "metadata": worker.metadata,
+        "capabilities": worker.capabilities,
+        "maxConcurrency": worker.max_concurrency,
+        "runtimeVersion": worker.runtime_version
+    })
 }
 
 fn now_ms() -> i64 {

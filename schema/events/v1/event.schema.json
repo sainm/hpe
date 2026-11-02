@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hpa.dev/schema/events/v1/event.schema.json",
+  "title": "HPA Execution Event v1",
+  "type": "object",
+  "required": ["id", "executionId", "sequence", "at", "kind"],
+  "properties": {
+    "id": { "type": "string" },
+    "executionId": { "type": "string" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "at": { "type": "string", "format": "date-time" },
+    "kind": { "type": "string" },
+    "nodeId": { "type": ["string", "null"] },
+    "attempt": { "type": ["integer", "null"], "minimum": 1 },
+    "durationMs": { "type": ["integer", "null"], "minimum": 0 },
+    "data": {}
+  },
+  "additionalProperties": true
+}

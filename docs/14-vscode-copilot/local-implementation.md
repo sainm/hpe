@@ -120,8 +120,8 @@ Skill 内容不进入扩展 bundle，扩展也不执行脚本。流程：
 
 ```text
 npm test                     # 60 Vitest passed
-npm run test:host            # 7 Extension Host checks passed
-npm run package              # hpa-workbench.vsix
+pnpm --dir apps/vscode-extension run test:host   # 7 checks; starts local Runtime
+pnpm --dir apps/vscode-extension run package     # hpa-workbench.vsix
 code --install-extension ... # 临时 extensions-dir 安装/升级成功
 ```
 

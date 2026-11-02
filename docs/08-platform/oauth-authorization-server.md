@@ -3,6 +3,8 @@
 > 状态：本地实现完成（2026-11-01）。范围是 **授权服务器**，不是完整 IdP：不签发 ID Token、不做用户注册、不做密码登录。
 > 目标：让 MCP 客户端用标准 OAuth 拿到访问令牌，不再只能依赖 PAT。
 
+> 产品边界：内置 AS 不实现 PAR/CIMD/DPoP/JARM/RS256；需要这些能力的部署必须前接企业 OAuth/OIDC Gateway。取舍和 fail-closed 行为见 [ADR-0021](../adr/0021-oauth-protocol-boundary.md)。
+
 ## 1. 为什么需要它
 
 Phase 3 的 MCP Gateway 只接受本地 PAT / stdio 能力令牌，`.well-known/oauth-protected-resource` 里也没有 `authorization_servers`。这带来两个实际后果：

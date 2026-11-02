@@ -1,0 +1,39 @@
+groups:
+  - name: hpa-runtime
+    rules:
+      - alert: HpaNotReady
+        expr: up{job="hpa-local"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: HPA readiness endpoint is unavailable
+      - alert: HpaHttpServerErrors
+        expr: |
+          sum(rate(hpa_http_requests_total{status=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(hpa_http_requests_total[5m])), 0.001)
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than 5 percent of HTTP requests fail for 10 minutes
+      - alert: HpaExecutionP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(hpa_workflow_execution_seconds_bucket[10m]))
+          ) > 300
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: Workflow execution p95 exceeds five minutes
+      - alert: HpaCollectorDown
+        expr: up{job="otel-collector"} == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: OTLP collector scrape target is unavailable

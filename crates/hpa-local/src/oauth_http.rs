@@ -93,6 +93,12 @@ struct AuthorizeQuery {
     resource: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    #[serde(default)]
+    request: Option<String>,
+    #[serde(default)]
+    request_uri: Option<String>,
+    #[serde(default)]
+    response_mode: Option<String>,
 }
 
 async fn authorize(
@@ -101,6 +107,18 @@ async fn authorize(
     uri: Uri,
     Query(query): Query<AuthorizeQuery>,
 ) -> Response {
+    if headers.contains_key("dpop") {
+        return error_page(
+            "invalid_request",
+            "DPoP is not supported by the built-in authorization server",
+        );
+    }
+    if query.request.is_some() || query.request_uri.is_some() {
+        return error_page(
+            "invalid_request",
+            "JAR / request_uri is not supported by the built-in authorization server",
+        );
+    }
     let Some(client_id) = query.client_id.as_deref().filter(|value| !value.is_empty()) else {
         return error_page(
             "invalid_request",
@@ -137,6 +155,13 @@ async fn authorize(
     let denial = |code: &str, description: &str| {
         redirect_error(redirect_uri, state_param.as_deref(), code, description)
     };
+    if query
+        .response_mode
+        .as_deref()
+        .is_some_and(|mode| mode != "query")
+    {
+        return denial("invalid_request", "only response_mode=query is supported");
+    }
     if query.response_type.as_deref() != Some("code") {
         return denial(
             "unsupported_response_type",
@@ -339,8 +364,14 @@ struct RegisterRequest {
 
 async fn register(
     State(state): State<EnterpriseState>,
+    headers: HeaderMap,
     Json(body): Json<RegisterRequest>,
 ) -> Response {
+    if headers.contains_key("dpop") {
+        return protocol_error(OauthError::InvalidRequest(
+            "DPoP is not supported by the built-in authorization server".to_string(),
+        ));
+    }
     let redirect_uris = body.redirect_uris.unwrap_or_default();
     if let Some(grant_types) = body.grant_types.as_deref() {
         let unsupported = grant_types
@@ -427,6 +458,11 @@ async fn token(
     headers: HeaderMap,
     Form(form): Form<TokenRequest>,
 ) -> Response {
+    if headers.contains_key("dpop") {
+        return protocol_error(OauthError::InvalidRequest(
+            "DPoP is not supported by the built-in authorization server".to_string(),
+        ));
+    }
     let (basic_id, basic_secret) = basic_credentials(&headers);
     let client_id = form.client_id.clone().or(basic_id).unwrap_or_default();
     if client_id.trim().is_empty() {
@@ -549,6 +585,11 @@ async fn revoke(
     headers: HeaderMap,
     Form(form): Form<RevokeRequest>,
 ) -> Response {
+    if headers.contains_key("dpop") {
+        return protocol_error(OauthError::InvalidRequest(
+            "DPoP is not supported by the built-in authorization server".to_string(),
+        ));
+    }
     let Some(token) = form.token.as_deref().filter(|value| !value.is_empty()) else {
         return protocol_error(OauthError::InvalidRequest("token is required".to_string()));
     };
@@ -584,8 +625,14 @@ struct IntrospectRequest {
 
 async fn introspect(
     State(state): State<EnterpriseState>,
+    headers: HeaderMap,
     Form(form): Form<IntrospectRequest>,
 ) -> Response {
+    if headers.contains_key("dpop") {
+        return protocol_error(OauthError::InvalidRequest(
+            "DPoP is not supported by the built-in authorization server".to_string(),
+        ));
+    }
     let Some(token) = form.token.as_deref().filter(|value| !value.is_empty()) else {
         return protocol_error(OauthError::InvalidRequest("token is required".to_string()));
     };

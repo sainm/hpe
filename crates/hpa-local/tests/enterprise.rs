@@ -93,34 +93,38 @@ struct Server {
 
 impl Server {
     async fn start(data_dir: &Path, enterprise: bool) -> Self {
-        let port = free_port();
-        let mut command = Command::new(binary());
-        command
-            .arg("--data-dir")
-            .arg(data_dir)
-            .args(["serve", "--port", &port.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .env_remove("HPA_ENTERPRISE_MODE");
-        if enterprise {
-            command.env("HPA_ENTERPRISE_MODE", "required");
-        }
-        let mut child = command.spawn().expect("spawn server");
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("http client");
-        if !wait_for_health(&client, port).await {
+        for _ in 0..5 {
+            let port = free_port();
+            let mut command = Command::new(binary());
+            command
+                .arg("--data-dir")
+                .arg(data_dir)
+                .args(["serve", "--port", &port.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .env("HPA_APPROVAL_TICK_MS", "100")
+                .env_remove("HPA_ENTERPRISE_MODE");
+            if enterprise {
+                command.env("HPA_ENTERPRISE_MODE", "required");
+            }
+            let mut child = command.spawn().expect("spawn server");
+            if wait_for_health(&client, port).await {
+                return Self {
+                    child,
+                    port,
+                    client,
+                };
+            }
             let _ = child.kill();
             let _ = child.wait();
-            panic!("server did not become healthy on port {port}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Self {
-            child,
-            port,
-            client,
-        }
+        panic!("server did not become healthy after retries");
     }
 
     fn url(&self, path: &str) -> String {
@@ -325,6 +329,548 @@ async fn enterprise_auth_boundary_and_health() {
 }
 
 #[tokio::test]
+async fn scim_users_groups_filters_etags_and_role_mapping_are_fail_closed() {
+    const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
+    const GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
+    const PATCH_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
+    const ROLE_SCHEMA: &str = "urn:hpa:params:scim:schemas:extension:role:1.0";
+
+    let data_dir = temp_dir("scim");
+    let admin = init_admin(&data_dir);
+    let mut server = Server::start(&data_dir, true).await;
+    let tenant = create_tenant(&server, &admin, "SCIM Tenant").await;
+    let other_tenant = create_tenant(&server, &admin, "SCIM Other Tenant").await;
+    let (owner, _) = create_token(&server, &admin, &tenant, "scim-owner", "owner").await;
+    let (tenant_admin, _) = create_token(&server, &admin, &tenant, "scim-admin", "admin").await;
+    let (viewer, _) = create_token(&server, &admin, &tenant, "scim-viewer", "viewer").await;
+    let (other_owner, _) =
+        create_token(&server, &admin, &other_tenant, "scim-other-owner", "owner").await;
+
+    let unauthorized = server.get("/scim/v2/Users", None).await;
+    assert_eq!(unauthorized.status, 401);
+    assert_eq!(
+        unauthorized.content_type.as_deref(),
+        Some("application/scim+json")
+    );
+    let non_tenant_token = server
+        .get("/scim/v2/Users", Some("header.payload.signature"))
+        .await;
+    assert_eq!(non_tenant_token.status, 403);
+    let forbidden = server.get("/scim/v2/Users", Some(&viewer)).await;
+    assert_eq!(forbidden.status, 403);
+    let forbidden_write = server
+        .post(
+            "/scim/v2/Users",
+            Some(&viewer),
+            json!({"schemas": [USER_SCHEMA], "userName": "viewer@example.test"}),
+        )
+        .await;
+    assert_eq!(forbidden_write.status, 403);
+
+    let config = server
+        .get("/scim/v2/ServiceProviderConfig", Some(&owner))
+        .await;
+    assert_eq!(config.status, 200, "{}", config.body);
+    assert_eq!(
+        config.content_type.as_deref(),
+        Some("application/scim+json")
+    );
+    assert_eq!(config.json()["patch"]["supported"], true);
+    assert_eq!(config.json()["etag"]["supported"], true);
+
+    let malformed = server
+        .client
+        .post(server.url("/scim/v2/Users"))
+        .bearer_auth(&owner)
+        .header("content-type", "application/scim+json")
+        .body("{")
+        .send()
+        .await
+        .expect("malformed SCIM request");
+    assert_eq!(malformed.status(), 400);
+    assert_eq!(
+        malformed
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/scim+json")
+    );
+    let malformed = malformed
+        .json::<Value>()
+        .await
+        .expect("malformed SCIM response JSON");
+    assert_eq!(malformed["scimType"], "invalidSyntax");
+
+    let owner_escalation = server
+        .post(
+            "/scim/v2/Users",
+            Some(&tenant_admin),
+            json!({
+                "schemas": [USER_SCHEMA, ROLE_SCHEMA],
+                "userName": "owner-escalation@example.test",
+                ROLE_SCHEMA: {"role": "owner"}
+            }),
+        )
+        .await;
+    assert_eq!(owner_escalation.status, 403, "{}", owner_escalation.body);
+
+    let owner_group = server
+        .post(
+            "/scim/v2/Groups",
+            Some(&owner),
+            json!({
+                "schemas": [GROUP_SCHEMA, ROLE_SCHEMA],
+                "displayName": "Owners",
+                ROLE_SCHEMA: {"role": "owner"}
+            }),
+        )
+        .await;
+    assert_eq!(owner_group.status, 201, "{}", owner_group.body);
+    let owner_group_id = owner_group.json()["id"]
+        .as_str()
+        .expect("owner group id")
+        .to_string();
+    let admin_owner_group_patch = server
+        .send(
+            Method::PATCH,
+            &format!("/scim/v2/Groups/{owner_group_id}"),
+            Some(&tenant_admin),
+            Some(json!({
+                "schemas": [PATCH_SCHEMA],
+                "Operations": [{"op": "replace", "path": "displayName", "value": "Owners Changed"}]
+            })),
+        )
+        .await;
+    assert_eq!(
+        admin_owner_group_patch.status, 403,
+        "{}",
+        admin_owner_group_patch.body
+    );
+    assert_eq!(
+        server
+            .delete(
+                &format!("/scim/v2/Groups/{owner_group_id}"),
+                Some(&owner),
+                json!({}),
+            )
+            .await
+            .status,
+        204
+    );
+
+    let user = server
+        .post(
+            "/scim/v2/Users",
+            Some(&owner),
+            json!({
+                "schemas": [USER_SCHEMA, ROLE_SCHEMA],
+                "userName": "Scim.User@example.test",
+                "externalId": "oidc|scim-user",
+                "displayName": "SCIM User",
+                "name": {"formatted": "SCIM User", "givenName": "SCIM", "familyName": "User"},
+                "emails": [{"value": "scim.user@example.test", "type": "work", "primary": true}],
+                "active": true,
+                "title": "Auditor",
+                ROLE_SCHEMA: {"role": "auditor"}
+            }),
+        )
+        .await;
+    assert_eq!(user.status, 201, "{}", user.body);
+    let user = user.json();
+    let user_id = user["id"].as_str().expect("SCIM user id").to_string();
+    assert_eq!(user["userName"], "Scim.User@example.test");
+    assert_eq!(user["externalId"], "oidc|scim-user");
+    assert_eq!(user["name"]["givenName"], "SCIM");
+    assert_eq!(user[ROLE_SCHEMA]["role"], "auditor");
+    assert_eq!(user[ROLE_SCHEMA]["effectiveRole"], "auditor");
+
+    let duplicate = server
+        .post(
+            "/scim/v2/Users",
+            Some(&owner),
+            json!({
+                "schemas": [USER_SCHEMA],
+                "userName": "scim.user@example.test",
+                "externalId": "oidc|different",
+                "active": true
+            }),
+        )
+        .await;
+    assert_eq!(duplicate.status, 409, "{}", duplicate.body);
+    assert_eq!(duplicate.json()["scimType"], "uniqueness");
+
+    let duplicate_email = server
+        .post(
+            "/scim/v2/Users",
+            Some(&owner),
+            json!({
+                "schemas": [USER_SCHEMA],
+                "userName": "different-name@example.test",
+                "externalId": "oidc|different-email",
+                "emails": [{"value": "SCIM.USER@example.test", "primary": true}],
+                "active": true
+            }),
+        )
+        .await;
+    assert_eq!(duplicate_email.status, 409, "{}", duplicate_email.body);
+
+    let missing_schema = server
+        .post(
+            "/scim/v2/Users",
+            Some(&owner),
+            json!({"userName": "missing-schema@example.test"}),
+        )
+        .await;
+    assert_eq!(missing_schema.status, 400, "{}", missing_schema.body);
+
+    let filtered = server
+        .get(
+            "/scim/v2/Users?filter=userName%20eq%20%22scim.user%40example.test%22&count=1",
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(filtered.status, 200, "{}", filtered.body);
+    let filtered = filtered.json();
+    assert_eq!(filtered["totalResults"], 1);
+    assert_eq!(filtered["Resources"][0]["id"], user_id);
+
+    let patched = server
+        .send(
+            Method::PATCH,
+            &format!("/scim/v2/Users/{user_id}"),
+            Some(&owner),
+            Some(json!({
+                "schemas": [PATCH_SCHEMA],
+                "Operations": [
+                    {"op": "replace", "path": "active", "value": false},
+                    {"op": "replace", "path": "title", "value": "Principal Auditor"},
+                    {"op": "replace", "path": ROLE_SCHEMA, "value": "developer"}
+                ]
+            })),
+        )
+        .await;
+    assert_eq!(patched.status, 200, "{}", patched.body);
+    let patched = patched.json();
+    assert_eq!(patched["active"], false);
+    assert_eq!(patched["title"], "Principal Auditor");
+    assert_eq!(patched[ROLE_SCHEMA]["role"], "developer");
+    let inactive = server
+        .get("/scim/v2/Users?filter=active%20eq%20false", Some(&owner))
+        .await;
+    assert_eq!(inactive.status, 200, "{}", inactive.body);
+    assert_eq!(inactive.json()["totalResults"], 1);
+
+    let group_one = server
+        .post(
+            "/scim/v2/Groups",
+            Some(&owner),
+            json!({
+                "schemas": [GROUP_SCHEMA, ROLE_SCHEMA],
+                "displayName": "Developers One",
+                "externalId": "group-developers-one",
+                ROLE_SCHEMA: {"role": "developer"},
+                "members": [{"value": user_id}]
+            }),
+        )
+        .await;
+    assert_eq!(group_one.status, 201, "{}", group_one.body);
+    let group_one = group_one.json();
+    let group_one_id = group_one["id"].as_str().expect("group one id").to_string();
+    let group_filter = server
+        .get(
+            "/scim/v2/Groups?filter=displayName%20eq%20%22Developers%20One%22",
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(group_filter.status, 200, "{}", group_filter.body);
+    assert_eq!(group_filter.json()["totalResults"], 1);
+
+    let managed_role = server
+        .put(
+            &format!("/api/enterprise/members/{user_id}"),
+            Some(&admin),
+            json!({"role": "viewer"}),
+        )
+        .await;
+    assert_eq!(managed_role.status, 409, "{}", managed_role.body);
+    assert_eq!(
+        managed_role.json()["error"]["code"],
+        "MEMBER_ROLE_MANAGED_BY_GROUP"
+    );
+
+    let effective = server
+        .get(&format!("/scim/v2/Users/{user_id}"), Some(&owner))
+        .await;
+    assert_eq!(effective.status, 200, "{}", effective.body);
+    assert_eq!(effective.json()[ROLE_SCHEMA]["effectiveRole"], "developer");
+
+    let conflicting = server
+        .post(
+            "/scim/v2/Groups",
+            Some(&owner),
+            json!({
+                "schemas": [GROUP_SCHEMA, ROLE_SCHEMA],
+                "displayName": "Viewers",
+                "externalId": "group-viewers",
+                ROLE_SCHEMA: {"role": "viewer"},
+                "members": [{"value": user_id}]
+            }),
+        )
+        .await;
+    assert_eq!(conflicting.status, 409, "{}", conflicting.body);
+    assert_eq!(conflicting.json()["scimType"], "invalidValue");
+    let rejected_group_not_stored = server
+        .get(
+            "/scim/v2/Groups?filter=displayName%20eq%20%22Viewers%22",
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(rejected_group_not_stored.json()["totalResults"], 0);
+
+    let group_two = server
+        .post(
+            "/scim/v2/Groups",
+            Some(&owner),
+            json!({
+                "schemas": [GROUP_SCHEMA, ROLE_SCHEMA],
+                "displayName": "Developers Two",
+                "externalId": "group-developers-two",
+                ROLE_SCHEMA: {"role": "developer"},
+                "members": [{"value": user_id}]
+            }),
+        )
+        .await;
+    assert_eq!(group_two.status, 201, "{}", group_two.body);
+    let group_two_id = group_two.json()["id"]
+        .as_str()
+        .expect("group two id")
+        .to_string();
+
+    let other_group = server
+        .post(
+            "/scim/v2/Groups",
+            Some(&other_owner),
+            json!({
+                "schemas": [GROUP_SCHEMA],
+                "displayName": "Other Tenant Group"
+            }),
+        )
+        .await;
+    assert_eq!(other_group.status, 201, "{}", other_group.body);
+    let other_group_id = other_group.json()["id"]
+        .as_str()
+        .expect("other group id")
+        .to_string();
+    assert_eq!(
+        server
+            .get(&format!("/scim/v2/Groups/{other_group_id}"), Some(&owner))
+            .await
+            .status,
+        404
+    );
+
+    let current = server
+        .client
+        .get(server.url(&format!("/scim/v2/Users/{user_id}")))
+        .bearer_auth(&owner)
+        .send()
+        .await
+        .expect("SCIM user ETag");
+    let etag = current
+        .headers()
+        .get("etag")
+        .and_then(|value| value.to_str().ok())
+        .expect("SCIM user ETag header")
+        .to_string();
+    let stale = server
+        .client
+        .patch(server.url(&format!("/scim/v2/Users/{user_id}")))
+        .bearer_auth(&owner)
+        .header("if-match", "W/\"stale\"")
+        .json(&json!({
+            "schemas": [PATCH_SCHEMA],
+            "Operations": [{"op": "replace", "path": "active", "value": true}]
+        }))
+        .send()
+        .await
+        .expect("stale SCIM patch");
+    assert_eq!(stale.status(), 412);
+    let current = server
+        .client
+        .patch(server.url(&format!("/scim/v2/Users/{user_id}")))
+        .bearer_auth(&owner)
+        .header("if-match", etag)
+        .json(&json!({
+            "schemas": [PATCH_SCHEMA],
+            "Operations": [{"op": "replace", "path": "active", "value": true}]
+        }))
+        .send()
+        .await
+        .expect("current SCIM patch");
+    assert_eq!(current.status(), 200);
+
+    let removed = server
+        .send(
+            Method::PATCH,
+            &format!("/scim/v2/Groups/{group_one_id}"),
+            Some(&owner),
+            Some(json!({
+                "schemas": [PATCH_SCHEMA],
+                "Operations": [{"op": "remove", "path": "members", "value": [{"value": user_id}]}]
+            })),
+        )
+        .await;
+    assert_eq!(removed.status, 200, "{}", removed.body);
+    let after_first_removal = server
+        .get(&format!("/scim/v2/Users/{user_id}"), Some(&owner))
+        .await;
+    assert_eq!(
+        after_first_removal.json()[ROLE_SCHEMA]["effectiveRole"],
+        "developer"
+    );
+
+    let base_role_update = server
+        .send(
+            Method::PATCH,
+            &format!("/scim/v2/Users/{user_id}"),
+            Some(&owner),
+            Some(json!({
+                "schemas": [PATCH_SCHEMA],
+                "Operations": [{"op": "replace", "path": ROLE_SCHEMA, "value": "auditor"}]
+            })),
+        )
+        .await;
+    assert_eq!(base_role_update.status, 200, "{}", base_role_update.body);
+    assert_eq!(
+        base_role_update.json()[ROLE_SCHEMA]["effectiveRole"],
+        "developer"
+    );
+
+    let deleted = server
+        .delete(
+            &format!("/scim/v2/Groups/{group_two_id}"),
+            Some(&owner),
+            json!({}),
+        )
+        .await;
+    assert_eq!(deleted.status, 204, "{}", deleted.body);
+    let restored = server
+        .get(&format!("/scim/v2/Users/{user_id}"), Some(&owner))
+        .await;
+    assert_eq!(restored.json()[ROLE_SCHEMA]["effectiveRole"], "auditor");
+    let restored_after_admin_change = server
+        .delete(
+            &format!("/scim/v2/Groups/{group_one_id}"),
+            Some(&owner),
+            json!({}),
+        )
+        .await;
+    assert_eq!(restored_after_admin_change.status, 204);
+    let restored = server
+        .get(&format!("/scim/v2/Users/{user_id}"), Some(&owner))
+        .await;
+    assert_eq!(restored.json()[ROLE_SCHEMA]["effectiveRole"], "auditor");
+
+    let invalid_filter = server
+        .get(
+            "/scim/v2/Groups?filter=members%20co%20%22x%22",
+            Some(&owner),
+        )
+        .await;
+    assert_eq!(invalid_filter.status, 400);
+    assert_eq!(invalid_filter.json()["scimType"], "invalidFilter");
+
+    let user_deleted = server
+        .delete(
+            &format!("/scim/v2/Users/{user_id}"),
+            Some(&owner),
+            json!({}),
+        )
+        .await;
+    assert_eq!(user_deleted.status, 204, "{}", user_deleted.body);
+    assert_eq!(
+        server
+            .get(&format!("/scim/v2/Users/{user_id}"), Some(&owner))
+            .await
+            .status,
+        404
+    );
+    server.stop();
+}
+
+#[tokio::test]
+async fn scim_migrates_existing_sqlite_members_without_losing_direct_roles() {
+    let data_dir = temp_dir("scim-old-schema");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "sqlite:{}/control.db?mode=rwc",
+            data_dir.display()
+        ))
+        .await
+        .expect("create old control DB");
+    sqlx::query(
+        "CREATE TABLE enterprise_members (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            email TEXT,
+            role TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (tenant_id, subject)
+        )",
+    )
+    .execute(&pool)
+    .await
+    .expect("create old members table");
+    sqlx::query(
+        "INSERT INTO enterprise_members
+         (id, tenant_id, subject, display_name, email, role, status, created_at, updated_at)
+         VALUES ('legacy-member', 'local', 'legacy-subject', 'Legacy Member',
+                 'legacy@example.test', 'auditor', 'active', ?, ?)",
+    )
+    .bind("2026-11-01T00:00:00Z")
+    .bind("2026-11-01T00:00:00Z")
+    .execute(&pool)
+    .await
+    .expect("insert legacy member");
+    pool.close().await;
+
+    let admin = init_admin(&data_dir);
+    let mut server = Server::start(&data_dir, true).await;
+    let members = server
+        .get("/api/enterprise/members?tenantId=local", Some(&admin))
+        .await;
+    assert_eq!(members.status, 200, "{}", members.body);
+    assert!(members.body.contains("legacy-member"));
+    server.stop();
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite:{}/control.db", data_dir.display()))
+        .await
+        .expect("open migrated control DB");
+    let row: (String, Option<String>, String) = sqlx::query_as(
+        "SELECT role, user_name, base_role FROM enterprise_members WHERE id = 'legacy-member'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read migrated member");
+    assert_eq!(row, ("auditor".to_string(), None, "auditor".to_string()));
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'trigger' AND name = 'enterprise_scim_group_members_tenant_insert'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read SCIM trigger");
+    assert_eq!(trigger_count, 1);
+}
+
+#[tokio::test]
 async fn tenant_isolation_and_admin_boundary() {
     let data_dir = temp_dir("isolation");
     let admin = init_admin(&data_dir);
@@ -333,6 +879,7 @@ async fn tenant_isolation_and_admin_boundary() {
     let alpha = create_tenant(&server, &admin, "Alpha").await;
     let beta = create_tenant(&server, &admin, "Beta").await;
     let (alpha_owner, _) = create_token(&server, &admin, &alpha, "alpha-owner", "owner").await;
+    let (beta_owner, _) = create_token(&server, &admin, &beta, "beta-owner", "owner").await;
     let (beta_viewer, _) = create_token(&server, &admin, &beta, "beta-viewer", "viewer").await;
 
     let created = server
@@ -344,6 +891,127 @@ async fn tenant_isolation_and_admin_boundary() {
         .await;
     assert_eq!(created.status, 200, "create failed: {}", created.body);
     assert_eq!(created.json()["id"], "wf_fixture_sequence");
+    let published = server
+        .post(
+            "/api/workflows/wf_fixture_sequence/publish",
+            Some(&alpha_owner),
+            json!({}),
+        )
+        .await;
+    assert_eq!(published.status, 200, "publish failed: {}", published.body);
+
+    let alpha_pat = server
+        .post(
+            "/api/mcp/tokens",
+            Some(&alpha_owner),
+            json!({"name": "alpha-mcp", "scopes": ["mcp:read", "mcp:execute"]}),
+        )
+        .await;
+    assert_eq!(alpha_pat.status, 200, "{}", alpha_pat.body);
+    let alpha_pat = alpha_pat.json()["token"]
+        .as_str()
+        .expect("alpha MCP token")
+        .to_string();
+    let beta_pat = server
+        .post(
+            "/api/mcp/tokens",
+            Some(&beta_owner),
+            json!({"name": "beta-mcp", "scopes": ["mcp:read", "mcp:execute"]}),
+        )
+        .await;
+    assert_eq!(beta_pat.status, 200, "{}", beta_pat.body);
+    let beta_pat = beta_pat.json()["token"]
+        .as_str()
+        .expect("beta MCP token")
+        .to_string();
+
+    let mcp_meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "tenant-test", "version": "1"}
+    });
+    let alpha_mcp: Value = server
+        .client
+        .post(server.url("/mcp"))
+        .bearer_auth(&alpha_pat)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "workflow.list")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 20,
+            "method": "tools/call",
+            "params": {"name": "workflow.list", "arguments": {}, "_meta": mcp_meta.clone()}
+        }))
+        .send()
+        .await
+        .expect("alpha MCP")
+        .json()
+        .await
+        .expect("alpha MCP JSON");
+    assert_eq!(
+        alpha_mcp["result"]["structuredContent"]["workflows"][0]["workflowId"],
+        json!("wf_fixture_sequence"),
+        "{}",
+        alpha_mcp
+    );
+    let task_execution = server
+        .post(
+            "/api/workflows/wf_fixture_sequence/executions",
+            Some(&alpha_owner),
+            json!({"input": {"value": 1}}),
+        )
+        .await;
+    assert_eq!(task_execution.status, 200, "{}", task_execution.body);
+    let task_id = task_execution.json()["summary"]["id"]
+        .as_str()
+        .expect("task execution id")
+        .to_string();
+    let task: Value = server
+        .client
+        .post(server.url("/mcp"))
+        .bearer_auth(&alpha_pat)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tasks/get")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 22,
+            "method": "tasks/get",
+            "params": {"taskId": task_id, "_meta": mcp_meta.clone()}
+        }))
+        .send()
+        .await
+        .expect("task get")
+        .json()
+        .await
+        .expect("task JSON");
+    assert_eq!(task["result"]["taskId"], json!(task_id));
+    assert!(task["result"]["status"].is_string());
+    let beta_mcp: Value = server
+        .client
+        .post(server.url("/mcp"))
+        .bearer_auth(&beta_pat)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "workflow.list")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": "tools/call",
+            "params": {"name": "workflow.list", "arguments": {}, "_meta": mcp_meta}
+        }))
+        .send()
+        .await
+        .expect("beta MCP")
+        .json()
+        .await
+        .expect("beta MCP JSON");
+    assert!(
+        beta_mcp["result"]["structuredContent"]["workflows"]
+            .as_array()
+            .expect("beta workflows")
+            .is_empty()
+    );
 
     let alpha_list = server.get("/api/workflows", Some(&alpha_owner)).await;
     assert_eq!(
@@ -970,6 +1638,39 @@ async fn tenant_lifecycle_delete_and_protected_local() {
     let before = server.get("/api/workflows", Some(&token)).await;
     assert_eq!(before.status, 200, "tenant should exist: {}", before.body);
 
+    let suspended = server
+        .put(
+            &format!("/api/enterprise/tenants/{disposable}"),
+            Some(&admin),
+            json!({"status": "suspended"}),
+        )
+        .await;
+    assert_eq!(suspended.status, 200, "suspend failed: {}", suspended.body);
+    let while_suspended = server.get("/api/workflows", Some(&token)).await;
+    assert_eq!(
+        while_suspended.status, 401,
+        "suspended tenant token still accepted: {}",
+        while_suspended.body
+    );
+    let resumed = server
+        .put(
+            &format!("/api/enterprise/tenants/{disposable}"),
+            Some(&admin),
+            json!({"status": "active"}),
+        )
+        .await;
+    assert_eq!(resumed.status, 200, "resume failed: {}", resumed.body);
+    assert_eq!(server.get("/api/workflows", Some(&token)).await.status, 200);
+
+    let local_suspend = server
+        .put(
+            "/api/enterprise/tenants/local",
+            Some(&admin),
+            json!({"status": "suspended"}),
+        )
+        .await;
+    assert_eq!(local_suspend.status, 409);
+
     let deleted = server
         .delete(
             &format!("/api/enterprise/tenants/{disposable}"),
@@ -1061,6 +1762,14 @@ async fn worker_daemon_executes_remote_workflow_and_resumes_approval() {
         )
         .await;
     assert_eq!(approval.status, 200, "{}", approval.body);
+    let mut sla_ir = fixture_workflow("08_approval.json");
+    sla_ir["id"] = json!("wf_fixture_approval_sla");
+    sla_ir["name"] = json!("Approval SLA");
+    sla_ir["nodes"][1]["config"]["slaMs"] = json!(250);
+    let sla = server
+        .post("/api/workflows", None, json!({"ir": sla_ir}))
+        .await;
+    assert_eq!(sla.status, 200, "{}", sla.body);
 
     let worker = server
         .post(
@@ -1159,6 +1868,32 @@ async fn worker_daemon_executes_remote_workflow_and_resumes_approval() {
     let approved = wait_for_execution(&server, &approval_execution, "succeeded").await;
     assert_eq!(approved["summary"]["workflowId"], "wf_fixture_approval");
 
+    let sla_job = server
+        .post(
+            "/api/enterprise/worker-jobs",
+            Some(&admin),
+            json!({
+                "tenantId": "local",
+                "workflowId": "wf_fixture_approval_sla",
+                "input": {}
+            }),
+        )
+        .await;
+    assert_eq!(sla_job.status, 200, "{}", sla_job.body);
+    let sla_execution = sla_job.json()["executionId"]
+        .as_str()
+        .expect("SLA execution")
+        .to_string();
+    let sla_completed = wait_for_execution(&server, &sla_execution, "succeeded").await;
+    assert_eq!(
+        sla_completed["summary"]["workflowId"],
+        "wf_fixture_approval_sla"
+    );
+    assert_eq!(
+        sla_completed["state"]["nodeOutputs"]["rejected"]["decision"],
+        json!("rejected")
+    );
+
     let pending_job = server
         .post(
             "/api/enterprise/worker-jobs",
@@ -1199,13 +1934,13 @@ async fn worker_daemon_executes_remote_workflow_and_resumes_approval() {
     assert_eq!(jobs.status, 200, "{}", jobs.body);
     let job_values = jobs.json();
     let job_list = job_values["jobs"].as_array().expect("jobs");
-    assert_eq!(job_list.len(), 3);
+    assert_eq!(job_list.len(), 4);
     assert_eq!(
         job_list
             .iter()
             .filter(|job| job["status"] == "succeeded")
             .count(),
-        2
+        3
     );
     assert_eq!(
         job_list

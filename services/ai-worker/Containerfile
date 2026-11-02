@@ -1,0 +1,26 @@
+FROM docker.m.daocloud.io/library/python:3.13-slim@sha256:7b58e4266b99c869d2225c050345f7c7fec255d9e3baeca19ea7de9411411c91
+
+ARG UV_VERSION=0.12.18
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp \
+    UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PATH=/app/.venv/bin:${PATH}
+
+RUN python -m pip install --no-cache-dir \
+      --index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+      "uv==${UV_VERSION}" \
+    && groupadd --gid 10001 worker \
+    && useradd --uid 10001 --gid worker --home-dir /tmp --no-create-home worker
+
+WORKDIR /app
+COPY --chown=10001:10001 pyproject.toml uv.lock README.md ./
+COPY --chown=10001:10001 src ./src
+
+RUN uv sync --frozen --no-dev \
+    && chmod -R a-w /app
+
+USER 10001:10001
+
+ENTRYPOINT ["hpa-ai-worker"]

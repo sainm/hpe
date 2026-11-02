@@ -4,9 +4,12 @@ import {
   Download,
   FileCode2,
   FlaskConical,
+  PencilLine,
   Play,
   RefreshCw,
   Rocket,
+  Save,
+  ShieldCheck,
   Upload,
 } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -52,6 +55,10 @@ export function SkillsPage() {
   const [scriptId, setScriptId] = useState("");
   const [runResult, setRunResult] = useState<SkillRunResult | null>(null);
   const [testResults, setTestResults] = useState<SkillTestResult[] | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editorVersion, setEditorVersion] = useState("");
+  const [editorFiles, setEditorFiles] = useState<Record<string, string>>({});
+  const [editorFile, setEditorFile] = useState("");
 
   const skills = useQuery({ queryKey: ["skills"], queryFn: api.listSkills, retry: 1 });
   const show = useQuery({
@@ -70,6 +77,12 @@ export function SkillsPage() {
     queryKey: ["skill-runs", selectedId],
     queryFn: () => api.listSkillRuns(selectedId ?? "", 20),
     enabled: Boolean(selectedId),
+    retry: 1,
+  });
+  const source = useQuery({
+    queryKey: ["skill-source", selectedId, version],
+    queryFn: () => api.getSkillSource(selectedId ?? "", version ?? ""),
+    enabled: Boolean(selectedId && version && editorOpen),
     retry: 1,
   });
 
@@ -95,7 +108,15 @@ export function SkillsPage() {
     setInputText(JSON.stringify(data.tests[0]?.input ?? {}, null, 2));
     setRunResult(null);
     setTestResults(null);
+    setEditorOpen(false);
   }, [data?.skill.id, data?.skill.version]);
+
+  useEffect(() => {
+    if (!source.data || !editorOpen) return;
+    setEditorFiles(source.data.files);
+    setEditorFile(Object.keys(source.data.files)[0] ?? "");
+    setEditorVersion(bumpPatch(source.data.version));
+  }, [editorOpen, source.data]);
 
   const importSkill = useMutation({
     mutationFn: () => api.importSkill(importPath.trim()),
@@ -120,6 +141,34 @@ export function SkillsPage() {
       void queryClient.invalidateQueries({ queryKey: ["skill-version", selectedId, version] });
     },
     onError: (error) => pushToast(messageOf(error, t("skills.publish"), t), "error"),
+  });
+
+  const saveDraft = useMutation({
+    mutationFn: () =>
+      api.saveSkillDraft(
+        selectedId ?? "",
+        version ?? "",
+        editorVersion.trim(),
+        editorFiles,
+      ),
+    onSuccess: (result) => {
+      pushToast(t("skills.draftSaved"), "success");
+      setEditorOpen(false);
+      setVersion(result.skill.skill.version);
+      void queryClient.invalidateQueries({ queryKey: ["skills"] });
+      void queryClient.invalidateQueries({ queryKey: ["skill", result.skill.skill.id] });
+      void queryClient.invalidateQueries({ queryKey: ["skill-version"] });
+    },
+    onError: (error) => pushToast(messageOf(error, t("skills.saveDraft"), t), "error"),
+  });
+
+  const signSkill = useMutation({
+    mutationFn: () => api.signSkill(selectedId ?? "", version ?? ""),
+    onSuccess: () => {
+      pushToast(t("skills.signatureSaved"), "success");
+      void queryClient.invalidateQueries({ queryKey: ["skill-version", selectedId, version] });
+    },
+    onError: (error) => pushToast(messageOf(error, t("skills.signSkill"), t), "error"),
   });
 
   const exportSkill = useMutation({
@@ -320,6 +369,23 @@ export function SkillsPage() {
                   <Button
                     size="sm"
                     variant="secondary"
+                    onClick={() => setEditorOpen((value) => !value)}
+                  >
+                    <PencilLine className="h-3.5 w-3.5" />
+                    {t("skills.editDraft")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={signSkill.isPending}
+                    onClick={() => signSkill.mutate()}
+                  >
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                    {data.signature?.verified ? t("skills.signed") : t("skills.signSkill")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
                     loading={publishSkill.isPending}
                     disabled={data.skill.status === "published" || !data.summary.licenseAllowed}
                     onClick={() => publishSkill.mutate()}
@@ -348,6 +414,15 @@ export function SkillsPage() {
                 />
                 <Info label={t("skills.versions")} value={version ?? "—"} mono />
                 <Info label={t("skills.sandbox")} value={show.data?.sandbox ?? "process"} mono />
+                <Info
+                  label={t("skills.signature")}
+                  value={
+                    data.signature?.verified
+                      ? `${data.signature.keyId} · ${t("skills.signatureVerified")}`
+                      : t("skills.unsigned")
+                  }
+                  mono
+                />
               </dl>
 
               {data.report.issues.length > 0 ? (
@@ -359,6 +434,89 @@ export function SkillsPage() {
                 </div>
               ) : null}
             </Panel>
+
+            {editorOpen ? (
+              <Panel className="p-4">
+                <div className="flex flex-wrap items-center gap-2">
+                  <PencilLine className="h-3.5 w-3.5 text-accent" />
+                  <h3 className="text-sm font-semibold text-ink">{t("skills.editDraft")}</h3>
+                  <span className="text-[10.5px] text-muted">{t("skills.editDraftHint")}</span>
+                  <input
+                    className={cn(
+                      inputClass,
+                      "ml-auto h-7 w-[130px] font-mono text-xs",
+                    )}
+                    value={editorVersion}
+                    onChange={(event) => setEditorVersion(event.target.value)}
+                    aria-label={t("skills.newVersion")}
+                  />
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    loading={saveDraft.isPending}
+                    disabled={
+                      source.isLoading ||
+                      !editorVersion.trim() ||
+                      !editorFile ||
+                      editorVersion.trim() === version
+                    }
+                    onClick={() => saveDraft.mutate()}
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    {t("skills.saveDraft")}
+                  </Button>
+                </div>
+                {source.isError ? (
+                  <p className="mt-3 text-xs text-danger">{t("errors.loadFailed")}</p>
+                ) : source.isLoading ? (
+                  <p className="mt-3 text-xs text-muted">{t("common.loading")}</p>
+                ) : (
+                  <div className="mt-3 grid gap-3 md:grid-cols-[240px_minmax(0,1fr)]">
+                    <div className="grid content-start gap-1">
+                      {Object.keys(editorFiles).map((file) => (
+                        <button
+                          key={file}
+                          type="button"
+                          onClick={() => setEditorFile(file)}
+                          className={cn(
+                            "truncate rounded-sm border px-2.5 py-2 text-left font-mono text-[10.5px]",
+                            editorFile === file
+                              ? "border-accent/45 bg-accent/10 text-accent"
+                              : "border-line bg-panel-2 text-muted hover:border-line-strong",
+                          )}
+                        >
+                          {file}
+                        </button>
+                      ))}
+                      {(source.data?.binaryFiles ?? []).map((file) => (
+                        <span
+                          key={file}
+                          className="truncate rounded-sm border border-line bg-panel-2 px-2.5 py-2 font-mono text-[10px] text-faint"
+                          title={t("skills.binaryReadOnly")}
+                        >
+                          {file}
+                        </span>
+                      ))}
+                    </div>
+                    <textarea
+                      className={cn(
+                        textareaClass,
+                        "min-h-[320px] font-mono text-[11px]",
+                      )}
+                      value={editorFile ? editorFiles[editorFile] ?? "" : ""}
+                      onChange={(event) =>
+                        setEditorFiles((current) => ({
+                          ...current,
+                          [editorFile]: event.target.value,
+                        }))
+                      }
+                      aria-label={t("skills.editFile")}
+                      spellCheck={false}
+                    />
+                  </div>
+                )}
+              </Panel>
+            ) : null}
 
             <div className="grid gap-3 xl:grid-cols-2">
               <Panel className="p-4">
@@ -598,6 +756,12 @@ function Info({ label, value, mono }: { label: string; value: string; mono?: boo
       <dd className={cn("mt-1 break-all text-xs text-ink", mono && "font-mono")}>{value}</dd>
     </div>
   );
+}
+
+function bumpPatch(version: string): string {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version);
+  if (!match) return version;
+  return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
 }
 
 function messageOf(

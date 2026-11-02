@@ -163,6 +163,26 @@
         "title": "%command.mcp.register%"
       },
       {
+        "command": "hpa.marketplace.manage",
+        "title": "%command.marketplace.manage%",
+        "icon": "$(cloud)"
+      },
+      {
+        "command": "hpa.marketplace.refreshSource",
+        "title": "%command.marketplace.refreshSource%",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "hpa.marketplace.scan",
+        "title": "%command.marketplace.scan%",
+        "icon": "$(shield)"
+      },
+      {
+        "command": "hpa.marketplace.install",
+        "title": "%command.marketplace.install%",
+        "icon": "$(cloud-download)"
+      },
+      {
         "command": "hpa.web.open",
         "title": "%command.web.open%",
         "icon": "$(link-external)"
@@ -201,6 +221,11 @@
         {
           "command": "hpa.skill.install",
           "when": "view == hpa.skills",
+          "group": "navigation@2"
+        },
+        {
+          "command": "hpa.marketplace.manage",
+          "when": "view == hpa.plugins",
           "group": "navigation@2"
         },
         {
@@ -247,6 +272,15 @@
           "command": "hpa.skill.remove",
           "when": "view == hpa.skills && viewItem == hpa.skill.installed",
           "group": "inline@2"
+        },
+        {
+          "command": "hpa.marketplace.scan",
+          "when": "view == hpa.plugins && viewItem == hpa.marketplace.package",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.marketplace.install",
+          "when": "view == hpa.plugins && viewItem == hpa.marketplace.package"
         }
       ]
     },

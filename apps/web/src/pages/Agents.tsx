@@ -75,7 +75,36 @@ function workflowInput(): JsonValue {
   };
 }
 
-function agentConfigTemplate(kind: "deterministic" | "model" | "supervisor"): JsonValue {
+function agentConfigTemplate(
+  kind: "deterministic" | "model" | "python" | "supervisor",
+): JsonValue {
+  if (kind === "python") {
+    return {
+      schemaVersion: "hpa.agent/v1",
+      id: "agent_python_planner",
+      name: "Python LangGraph Agent",
+      version: "1.0.0",
+      description: "Optional Python/LangGraph planner routed through the Rust control plane.",
+      instructions:
+        "Inspect the workflow catalog once, then return a concise JSON summary. Never claim a tool ran without a tool result.",
+      tools: ["workflow.list"],
+      planner: {
+        kind: "python",
+        model: "openai/your-model",
+      },
+      limits: {
+        maxSteps: 10,
+        maxToolCalls: 4,
+        timeoutMs: 60000,
+        maxTokens: 16000,
+        maxCostUsd: 0.5,
+        maxHandoffs: 2,
+        maxDepth: 2,
+      },
+      approval: [],
+      subAgents: [],
+    };
+  }
   if (kind === "model") {
     return {
       schemaVersion: "hpa.agent/v1",
@@ -588,6 +617,13 @@ export function AgentsPage() {
               onClick={() => setNewConfig(JSON.stringify(agentConfigTemplate("model"), null, 2))}
             >
               {t("agents.template.model")}
+            </Button>
+            <Button
+              size="sm"
+              variant="subtle"
+              onClick={() => setNewConfig(JSON.stringify(agentConfigTemplate("python"), null, 2))}
+            >
+              {t("agents.template.python")}
             </Button>
             <Button
               size="sm"

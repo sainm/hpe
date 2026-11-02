@@ -14,8 +14,14 @@ const skipDirs = new Set([
   ".qoder",
   ".hpa",
   ".workbuddy",
+  ".turbo",
+  ".venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
 ]);
-const binaryExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".zip", ".gz", ".vsix"]);
+const binaryExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".zip", ".gz", ".vsix", ".pyc", ".db", ".sqlite"]);
 const allowedFiles = new Set([
   "README.md",
   "BRANDING.md",

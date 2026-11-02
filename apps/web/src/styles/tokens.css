@@ -10,7 +10,7 @@ html[data-theme="light"] {
   --hpa-ink: #1b1f24;
   --hpa-ink-strong: #1b1f24;
   --hpa-muted: #4c5560;
-  --hpa-faint: #79838f;
+  --hpa-faint: #5f6873;
   --hpa-accent: #1557b0;
   --hpa-accent-strong: #124993;
   --hpa-accent-ink: #ffffff;
@@ -44,7 +44,7 @@ html[data-theme="dark"] {
   --hpa-ink: #e8ebef;
   --hpa-ink-strong: #f5f7fa;
   --hpa-muted: #a7b0ba;
-  --hpa-faint: #79838f;
+  --hpa-faint: #98a3af;
   --hpa-accent: #6ba5e8;
   --hpa-accent-strong: #84b6f0;
   --hpa-accent-ink: #0f1a26;
@@ -78,7 +78,7 @@ html[data-theme="ocean"] {
   --hpa-ink: #eef2f6;
   --hpa-ink-strong: #ffffff;
   --hpa-muted: #adb8c4;
-  --hpa-faint: #7f8b98;
+  --hpa-faint: #9aa7b5;
   --hpa-accent: #8ab4f8;
   --hpa-accent-strong: #a7c7ff;
   --hpa-accent-ink: #0c1624;

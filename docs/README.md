@@ -1,7 +1,7 @@
-# Hisha 设计文档
+# Hisha / Auralis 设计与实现文档
 
-> Phase 0 · Research & Architecture<br>
-> 证据冻结日期：2026-11-01<br>
+> 设计基线始于 Phase 0；当前实现状态见 [实现状态与验收边界](10-quality/implementation-status.md)。<br>
+> 文档与本地实现核对日期：2026-11-01<br>
 > 文档语言：中文；产品术语保留英文原文。<br>
 > UI 默认语言：日本語；支持日本語 / English / 中文。<br>
 > 品牌与内部 ID：展示名 Auralis；永久内部 ID **hpa**；历史别名 Hisha。规则见 [BRANDING.md](../BRANDING.md)。
@@ -107,6 +107,14 @@
 ### 08 平台
 
 - [数据模型](08-platform/data-model.md)
+- [PostgreSQL 控制面基线](08-platform/postgres-control-plane.md)
+- [PostgreSQL 分布式运行时原语](08-platform/postgres-distributed-runtime.md)
+- [MCP 持久状态](06-mcp/persistent-state.md)
+- [Python LangGraph Worker](04-agent/python-worker.md)
+- [Connector 生产扩展](08-platform/connector-implementation.md)
+- [Remote Marketplace 与发布者治理](07-plugin/remote-marketplace.md)
+- [OTLP 与跨进程追踪](08-platform/otlp.md)
+- [外部 AI 客户端发布验收](10-quality/external-ai-client-acceptance.md)
 - [API 规范](08-platform/api-specification.md)
 - [连接器架构](08-platform/connector-architecture.md)
 - [权限模型](08-platform/permission-model.md)
@@ -116,8 +124,10 @@
 - [Phase 8 Hybrid Worker 协议](08-platform/hybrid-workers.md)
 - [Hybrid Worker 私有部署](08-platform/hybrid-worker-deployment.md)
 - [Phase 9 Browser SSO](08-platform/browser-sso.md)
+- [SCIM 2.0 Users/Groups 与角色映射](08-platform/scim.md)
 - [Phase 10 OAuth 2.1 授权服务器](08-platform/oauth-authorization-server.md)
 - [Phase 12 可观测性](08-platform/observability.md)
+- [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI
 
@@ -136,11 +146,13 @@
 
 - [测试策略](10-quality/test-strategy.md)
 - [验收标准](10-quality/acceptance-criteria.md)
+- [实现状态与验收边界](10-quality/implementation-status.md)
 - [性能要求](10-quality/performance-requirements.md)
 
 ### 11 路线图
 
 - [实施路线图](11-roadmap/implementation-roadmap.md)
+- [Phase 13 生产级补全（下一个目标）](11-roadmap/phase-13-production-completion.md)
 - [风险登记](11-roadmap/risk-register.md)
 - [三个 PoC](11-roadmap/poc-plan.md)
 
@@ -195,6 +207,6 @@
 | 待决 | 需要用户或业务方裁决，见 open-issues |
 | 未做 | 本阶段明确不交付 |
 
-## 非目标
+## 总体非目标
 
-本阶段不交付可运行平台、不自研大模型、不构建云计费系统、不实现完整 BPMN 兼容、不承诺外部系统的 Exactly Once。PoC 方案已给出，但不在本轮执行。
+当前本地 MVP 已提供可运行平台，但不自研大模型、不构建云计费系统、不实现完整 BPMN 兼容，也不承诺外部系统的 Exactly Once。完整 SaaS、PostgreSQL RLS、HA、远程 Marketplace 与真实云端一致性仍属于后续阶段。

@@ -230,6 +230,7 @@ export function JsonView({
   const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
   return (
     <pre
+      tabIndex={0}
       className={cn(
         "hpa-scroll overflow-auto rounded-sm border border-line bg-panel-2 p-2.5 font-mono text-[10.5px] leading-relaxed text-ink",
         className,

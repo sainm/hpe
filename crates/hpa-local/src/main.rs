@@ -1,4 +1,5 @@
 mod agent;
+mod ai_worker_client;
 mod api;
 mod assets;
 mod connector;
@@ -6,6 +7,7 @@ mod db;
 mod driver;
 mod enterprise;
 mod enterprise_ops;
+mod event_bus;
 mod hooks;
 mod mcp;
 mod mcp_client;
@@ -17,8 +19,11 @@ mod observe;
 mod plugin;
 mod scheduler;
 mod skills;
+#[allow(dead_code)]
+mod telemetry;
 mod worker;
 mod worker_daemon;
+mod worker_outbox;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -101,6 +106,11 @@ enum Command {
         #[command(subcommand)]
         command: EnterpriseCommand,
     },
+    #[command(name = "db", alias = "database")]
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
     Worker {
         #[arg(long, default_value = "http://127.0.0.1:8787")]
         control_url: String,
@@ -132,9 +142,75 @@ enum EnterpriseCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DbCommand {
+    Migrate,
+    Status,
+    ImportSqlite {
+        #[arg(long)]
+        source: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum PluginCommand {
     Key,
     Keys,
+    PublisherAdd {
+        id: String,
+        name: String,
+    },
+    PublisherKeyAdd {
+        publisher: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long, default_value = "Publisher key")]
+        label: String,
+        #[arg(long)]
+        valid_from: Option<String>,
+        #[arg(long)]
+        valid_until: Option<String>,
+    },
+    PublisherKeyRevoke {
+        publisher: String,
+        #[arg(long)]
+        key_id: String,
+    },
+    MarketplaceSourceAdd {
+        id: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        index: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long, default_value = "Marketplace index key")]
+        key_label: String,
+    },
+    MarketplaceSourceRotate {
+        id: String,
+        #[arg(long)]
+        key_id: String,
+        #[arg(long)]
+        public_key: String,
+        #[arg(long, default_value = "Rotated marketplace key")]
+        label: String,
+    },
+    MarketplaceSourceRefresh {
+        id: String,
+    },
+    MarketplaceRemote {
+        #[arg(long)]
+        source: Option<String>,
+    },
+    MarketplaceRemoteInstall {
+        source: String,
+        id: String,
+        version: String,
+    },
     Sign {
         path: PathBuf,
     },
@@ -333,6 +409,11 @@ enum SkillCommand {
         #[arg(long)]
         version: Option<String>,
     },
+    Sign {
+        id: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
     Test {
         id: String,
         #[arg(long)]
@@ -372,14 +453,7 @@ enum SkillExportTarget {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hpa=info,tower_http=info".into()),
-        )
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    let _telemetry = hpa_local::telemetry::init("hpa-local")?;
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
@@ -404,6 +478,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Enterprise { command } => {
             enterprise_command(resolve_data_dir(cli.data_dir)?, command).await?
         }
+        Command::Db { command } => database_command(command).await?,
         Command::Worker {
             control_url,
             max_concurrency,
@@ -426,11 +501,97 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 capabilities,
                 heartbeat_interval: Duration::from_secs(10),
                 poll_interval: Duration::from_secs(1),
+                outbox_path: resolve_data_dir(cli.data_dir)?.join("worker-outbox.db"),
             })
             .await?;
         }
     }
     Ok(())
+}
+
+async fn database_command(command: DbCommand) -> Result<(), Box<dyn Error>> {
+    let database_url = std::env::var("HPA_POSTGRES_URL")
+        .or_else(|_| std::env::var("DATABASE_URL"))
+        .map_err(|_| {
+            CliError("HPA_POSTGRES_URL or DATABASE_URL is required for database commands".into())
+        })?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
+
+    match command {
+        DbCommand::Migrate => {
+            let before = postgres_migration_count(&pool).await?;
+            MIGRATOR.run(&pool).await?;
+            let after = postgres_migration_count(&pool).await?;
+            print_json(&json!({
+                "database": "postgresql",
+                "before": before,
+                "after": after,
+                "applied": after - before,
+                "available": MIGRATOR.migrations.len(),
+            }));
+        }
+        DbCommand::Status => {
+            let installed: bool =
+                sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
+                    .fetch_one(&pool)
+                    .await?;
+            let migrations = if installed {
+                sqlx::query(
+                    "SELECT version, description, success, installed_on
+                     FROM public._sqlx_migrations
+                     ORDER BY version",
+                )
+                .fetch_all(&pool)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    use sqlx::Row;
+                    json!({
+                        "version": row.get::<i64, _>("version"),
+                        "description": row.get::<String, _>("description"),
+                        "success": row.get::<bool, _>("success"),
+                        "installedOn": row
+                            .get::<time::OffsetDateTime, _>("installed_on")
+                            .to_string(),
+                    })
+                })
+                .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            print_json(&json!({
+                "database": "postgresql",
+                "installed": installed,
+                "applied": migrations.len(),
+                "available": MIGRATOR.migrations.len(),
+                "migrations": migrations,
+            }));
+        }
+        DbCommand::ImportSqlite { source } => {
+            MIGRATOR.run(&pool).await?;
+            let report = hpa_local::postgres_import::import_data_dir(&pool, &source).await?;
+            print_json(&serde_json::to_value(report)?);
+        }
+    }
+    pool.close().await;
+    Ok(())
+}
+
+async fn postgres_migration_count(pool: &sqlx::postgres::PgPool) -> Result<i64, sqlx::Error> {
+    let installed: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations') IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    if !installed {
+        return Ok(0);
+    }
+    sqlx::query_scalar("SELECT COUNT(*) FROM public._sqlx_migrations WHERE success")
+        .fetch_one(pool)
+        .await
 }
 
 async fn skill_command(data_dir: PathBuf, command: SkillCommand) -> Result<(), Box<dyn Error>> {
@@ -485,6 +646,13 @@ async fn skill_command(data_dir: PathBuf, command: SkillCommand) -> Result<(), B
                 .await
                 .map_err(|error| CliError(error.to_string()))?;
             print_json(&json!({"published": published}));
+        }
+        SkillCommand::Sign { id, version } => {
+            let signature = service
+                .sign(&id, version.as_deref())
+                .await
+                .map_err(|error| CliError(error.to_string()))?;
+            print_json(&json!({"signature": signature}));
         }
         SkillCommand::Test { id, version, case } => {
             let results = service
@@ -596,6 +764,7 @@ fn loaded_skill_json(loaded: &crate::skills::LoadedSkill) -> Value {
             "size": file.size,
             "sha256": file.sha256,
         })).collect::<Vec<_>>(),
+        "signature": loaded.signature,
     })
 }
 
@@ -921,6 +1090,84 @@ async fn plugin_command(data_dir: PathBuf, command: PluginCommand) -> Result<(),
                 .await
                 .map_err(|error| CliError(error.to_string()))?,
         })),
+        PluginCommand::PublisherAdd { id, name } => print_json(
+            &plugins
+                .add_publisher(&id, &name)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::PublisherKeyAdd {
+            publisher,
+            key_id,
+            public_key,
+            label,
+            valid_from,
+            valid_until,
+        } => print_json(
+            &plugins
+                .add_publisher_key(
+                    &publisher,
+                    &key_id,
+                    &public_key,
+                    &label,
+                    valid_from.as_deref(),
+                    valid_until.as_deref(),
+                )
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::PublisherKeyRevoke { publisher, key_id } => print_json(
+            &plugins
+                .revoke_publisher_key(&publisher, &key_id)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::MarketplaceSourceAdd {
+            id,
+            label,
+            index,
+            key_id,
+            public_key,
+            key_label,
+        } => print_json(
+            &plugins
+                .add_marketplace_source(&id, &label, &index, &key_id, &public_key, &key_label)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::MarketplaceSourceRotate {
+            id,
+            key_id,
+            public_key,
+            label,
+        } => print_json(
+            &plugins
+                .rotate_marketplace_source_key(&id, &key_id, &public_key, &label)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::MarketplaceSourceRefresh { id } => print_json(
+            &plugins
+                .refresh_marketplace_source(&id)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
+        PluginCommand::MarketplaceRemote { source } => print_json(&json!({
+            "packages": plugins
+                .remote_marketplace_packages(source.as_deref())
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        })),
+        PluginCommand::MarketplaceRemoteInstall {
+            source,
+            id,
+            version,
+        } => print_json(
+            &plugins
+                .install_remote_package(&source, &id, &version)
+                .await
+                .map_err(|error| CliError(error.to_string()))?,
+        ),
         PluginCommand::Sign { path } => print_json(
             &plugins
                 .sign_directory(&path)
@@ -1083,10 +1330,34 @@ async fn connector_command(
             let mut definitions = Vec::new();
             for row in &rows {
                 let mut value = connector::definition_value(row);
-                value["configShape"] = if row.kind == "http" {
-                    json!({"baseUrl": "http://127.0.0.1:8787", "allowedHosts": [], "auth": {"kind": "none"}})
-                } else {
-                    json!({"root": "/absolute/workspace/path", "allowWrite": false})
+                value["configShape"] = match row.kind.as_str() {
+                    "http" => json!({
+                        "baseUrl": "http://127.0.0.1:8787",
+                        "allowedHosts": [],
+                        "auth": {"kind": "none"}
+                    }),
+                    "database" => json!({
+                        "allowedHosts": ["db.internal:5432"],
+                        "statementTimeoutMs": 15000,
+                        "maxRows": 500
+                    }),
+                    "git" => json!({
+                        "repositoryRoot": "/absolute/git/repository",
+                        "allowWrite": false
+                    }),
+                    "mq" => json!({
+                        "url": "redis://127.0.0.1:6379",
+                        "allowedHosts": ["127.0.0.1"],
+                        "allowedChannels": ["hpa.*"],
+                        "database": 0
+                    }),
+                    "s3" => json!({
+                        "endpoint": "https://s3.example.com",
+                        "region": "us-east-1",
+                        "bucket": "hpa-artifacts",
+                        "allowedHosts": ["s3.example.com"]
+                    }),
+                    _ => json!({"root": "/absolute/workspace/path", "allowWrite": false}),
                 };
                 definitions.push(value);
             }
@@ -1250,11 +1521,90 @@ fn now_rfc3339() -> String {
 async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir_all(&data_dir)?;
     let base_url = format!("http://127.0.0.1:{port}");
+    let node_id = std::env::var("HPA_NODE_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("node:{base_url}"));
     let require_auth = std::env::var("HPA_ENTERPRISE_MODE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "required"))
         .unwrap_or(false);
-    let enterprise =
+    let mut enterprise =
         enterprise::EnterpriseState::new(data_dir.clone(), base_url.clone(), require_auth).await?;
+    let postgres_execution = std::env::var("HPA_POSTGRES_RUNTIME")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false);
+    let postgres_event_bus = std::env::var("HPA_POSTGRES_EVENT_BUS")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false);
+    let postgres_event_bus_consumer = std::env::var("HPA_EVENT_BUS_CONSUMER")
+        .map(|value| !matches!(value.as_str(), "0" | "false"))
+        .unwrap_or(true);
+    if postgres_event_bus && !postgres_execution {
+        return Err(CliError(
+            "HPA_POSTGRES_EVENT_BUS=1 requires HPA_POSTGRES_RUNTIME=1".to_string(),
+        )
+        .into());
+    }
+    let postgres_mcp = std::env::var("HPA_POSTGRES_MCP")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false);
+    let postgres_scheduler = std::env::var("HPA_POSTGRES_SCHEDULER")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false);
+    let postgres_pool = if postgres_execution
+        || postgres_event_bus
+        || postgres_mcp
+        || postgres_scheduler
+    {
+        let database_url = std::env::var("HPA_POSTGRES_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .map_err(|_| {
+                CliError(
+                    "HPA_POSTGRES_URL or DATABASE_URL is required when PostgreSQL runtime mode is enabled".to_string(),
+                )
+            })?;
+        Some(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(8)
+                .connect(&database_url)
+                .await?,
+        )
+    } else {
+        None
+    };
+    if postgres_execution {
+        let pool = postgres_pool
+            .as_ref()
+            .expect("PostgreSQL pool is configured for execution runtime");
+        let installed: bool =
+            sqlx::query_scalar("SELECT to_regclass('hpa_tenant.executions') IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
+        if !installed {
+            return Err(CliError(
+                "PostgreSQL execution schema is missing; run `hpa db migrate` first".to_string(),
+            )
+            .into());
+        }
+        enterprise = enterprise.with_postgres_execution(pool.clone());
+        if postgres_event_bus {
+            let installed: bool = sqlx::query_scalar(
+                "SELECT to_regprocedure(
+                     'hpa_internal.claim_outbox_topic(text,text,integer,integer)'
+                 ) IS NOT NULL",
+            )
+            .fetch_one(pool)
+            .await?;
+            if !installed {
+                return Err(CliError(
+                    "event bus schema is missing; run `hpa db migrate` first".to_string(),
+                )
+                .into());
+            }
+            enterprise = enterprise.with_postgres_event_bus(pool.clone());
+        }
+    }
     let oauth = enterprise.oauth_service();
     let local_state = enterprise
         .local_state()
@@ -1264,15 +1614,81 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
         local_state.agents.skills.clone(),
         local_state.runtime.clone(),
     );
-    let gateway = McpGatewayState::new(mcp_service, base_url)
+    let mut gateway = McpGatewayState::new(mcp_service, base_url)
         .with_oauth(oauth)
+        .with_enterprise(enterprise.clone())
         .with_rate_limit(
             std::env::var("HPA_MCP_RATE_LIMIT")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(120),
         );
-    let scheduler = scheduler::spawn(enterprise.clone());
+    let mut task_update_monitor = None;
+    if postgres_mcp {
+        let pool = postgres_pool
+            .as_ref()
+            .expect("PostgreSQL pool is configured for MCP");
+        let installed: bool =
+            sqlx::query_scalar("SELECT to_regclass('hpa_control.mcp_sessions') IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
+        if !installed {
+            return Err(CliError(
+                "persistent MCP schema is missing; run `hpa db migrate` first".to_string(),
+            )
+            .into());
+        }
+        gateway = gateway.with_postgres(pool.clone());
+        task_update_monitor =
+            mcp_http::spawn_task_update_monitor(gateway.clone(), enterprise.clone());
+    }
+    let scheduler_coordination = if postgres_scheduler {
+        let pool = postgres_pool
+            .as_ref()
+            .expect("PostgreSQL pool is configured for scheduler");
+        let installed: bool =
+            sqlx::query_scalar("SELECT to_regclass('hpa_control.runtime_leases') IS NOT NULL")
+                .fetch_one(pool)
+                .await?;
+        if !installed {
+            return Err(CliError(
+                "scheduler lease schema is missing; run `hpa db migrate` first".to_string(),
+            )
+            .into());
+        }
+        Some(scheduler::SchedulerCoordination::postgres(
+            pool.clone(),
+            node_id.clone(),
+        ))
+    } else {
+        None
+    };
+    let scheduler = scheduler::spawn(enterprise.clone(), scheduler_coordination);
+    let event_bus = if postgres_event_bus && postgres_event_bus_consumer {
+        Some(event_bus::spawn(
+            enterprise.clone(),
+            postgres_pool
+                .as_ref()
+                .expect("PostgreSQL pool is configured for event bus")
+                .clone(),
+            node_id.clone(),
+        ))
+    } else {
+        None
+    };
+    let remote_approval_monitor = enterprise::spawn_remote_approval_monitor(enterprise.clone());
+    if task_update_monitor.is_some() {
+        println!("mcp node: {}", gateway.node_id());
+    }
+    if postgres_scheduler {
+        println!("scheduler node: {node_id}");
+    }
+    if postgres_execution {
+        println!("execution store: postgresql");
+    }
+    if postgres_event_bus {
+        println!("event bus: postgresql outbox");
+    }
     let app = Router::new()
         .merge(enterprise::router(enterprise))
         .merge(mcp_http::router(gateway))
@@ -1294,7 +1710,14 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    scheduler.abort();
+    scheduler.shutdown().await;
+    if let Some(event_bus) = event_bus {
+        event_bus.shutdown().await;
+    }
+    remote_approval_monitor.abort();
+    if let Some(monitor) = task_update_monitor {
+        monitor.abort();
+    }
     Ok(())
 }
 

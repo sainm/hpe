@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hpa.dev/schema/ir/v0.1/node-registry.schema.json",
+  "title": "HPA Node Registry v1",
+  "type": "object",
+  "required": ["registryVersion", "nodes"],
+  "properties": {
+    "registryVersion": { "type": "string", "minLength": 1 },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "versions",
+          "defaultVersion",
+          "outputPorts",
+          "permissionKinds"
+        ],
+        "properties": {
+          "type": { "type": "string", "minLength": 1 },
+          "versions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["version", "deprecated", "configSchema"],
+              "properties": {
+                "version": { "type": "string" },
+                "deprecated": { "type": "boolean" },
+                "configSchema": { "type": "object" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "defaultVersion": { "type": "string" },
+          "outputPorts": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "permissionKinds": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

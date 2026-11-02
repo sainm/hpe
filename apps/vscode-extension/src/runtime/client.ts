@@ -9,14 +9,19 @@ import type {
   ExecutionSummary,
   Health,
   JsonValue,
+  MarketplaceEvent,
+  MarketplacePublisher,
+  MarketplaceSource,
   McpCatalog,
   McpOverview,
   McpServer,
   McpTokenCreateResult,
   PluginSummary,
+  RemoteMarketplacePackage,
   SkillDetail,
   SkillSummary,
   Stats,
+  VulnerabilityReport,
   WorkflowSummary,
 } from "./types";
 
@@ -176,6 +181,177 @@ export class RuntimeClient {
     return this.request<{ plugins: PluginSummary[] }>("/api/plugins").then(
       (value) => value.plugins,
     );
+  }
+
+  listMarketplaceSources(): Promise<MarketplaceSource[]> {
+    return this.request<{ sources: MarketplaceSource[] }>("/api/marketplace/sources").then(
+      (value) => value.sources,
+    );
+  }
+
+  addMarketplaceSource(body: {
+    id: string;
+    label: string;
+    indexUri: string;
+    keyId: string;
+    publicKey: string;
+    keyLabel: string;
+  }): Promise<{ sourceId: string; keyId: string; status: string }> {
+    return this.request("/api/marketplace/sources", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  rotateMarketplaceSourceKey(
+    sourceId: string,
+    body: { keyId: string; publicKey: string; label: string },
+  ): Promise<{ sourceId: string; keyId: string; rotatedAt: string }> {
+    return this.request(
+      `/api/marketplace/sources/${encodeURIComponent(sourceId)}/rotate-key`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+  }
+
+  refreshMarketplaceSource(sourceId: string): Promise<JsonValue> {
+    return this.request(
+      `/api/marketplace/sources/${encodeURIComponent(sourceId)}/refresh`,
+      { method: "POST", body: "{}" },
+    );
+  }
+
+  listMarketplacePublishers(): Promise<MarketplacePublisher[]> {
+    return this.request<{ publishers: MarketplacePublisher[] }>(
+      "/api/marketplace/publishers",
+    ).then((value) => value.publishers);
+  }
+
+  addMarketplacePublisher(body: {
+    id: string;
+    name: string;
+  }): Promise<{ publisherId: string; name: string; status: string }> {
+    return this.request("/api/marketplace/publishers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  addMarketplacePublisherKey(
+    publisherId: string,
+    body: {
+      keyId: string;
+      publicKey: string;
+      label: string;
+      validFrom?: string;
+      validUntil?: string;
+    },
+  ): Promise<JsonValue> {
+    return this.request(
+      `/api/marketplace/publishers/${encodeURIComponent(publisherId)}/keys`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+  }
+
+  revokeMarketplacePublisherKey(publisherId: string, keyId: string): Promise<JsonValue> {
+    return this.request(
+      `/api/marketplace/publishers/${encodeURIComponent(publisherId)}/keys`,
+      { method: "DELETE", body: JSON.stringify({ keyId }) },
+    );
+  }
+
+  listRemoteMarketplace(sourceId?: string): Promise<RemoteMarketplacePackage[]> {
+    const query = sourceId ? `?source=${encodeURIComponent(sourceId)}` : "";
+    return this.request<{ packages: RemoteMarketplacePackage[] }>(
+      `/api/marketplace/remote${query}`,
+    ).then((value) => value.packages);
+  }
+
+  installRemoteMarketplacePackage(
+    sourceId: string,
+    pluginId: string,
+    version: string,
+  ): Promise<JsonValue> {
+    return this.request(
+      `/api/marketplace/remote/${encodeURIComponent(sourceId)}/${encodeURIComponent(pluginId)}/versions/${encodeURIComponent(version)}/install`,
+      { method: "POST", body: "{}" },
+    );
+  }
+
+  marketplaceVulnerability(
+    pluginId: string,
+    version: string,
+  ): Promise<VulnerabilityReport> {
+    return this.request(
+      `/api/marketplace/vulnerabilities/${encodeURIComponent(pluginId)}/${encodeURIComponent(version)}`,
+    );
+  }
+
+  marketplaceEventCursor(): Promise<number> {
+    return this.request<{ sequence: number }>(
+      "/api/marketplace/events/latest",
+    ).then((value) => value.sequence);
+  }
+
+  async streamMarketplaceEvents(
+    since: number | null,
+    onEvent: (event: MarketplaceEvent) => void,
+    signal?: AbortSignal,
+    onReady?: (sequence: number) => void,
+  ): Promise<void> {
+    const headers = new Headers({ accept: "text/event-stream" });
+    if (since !== null) {
+      headers.set("last-event-id", String(Math.max(0, since)));
+    }
+    const token = await this.tokenProvider?.();
+    if (token) headers.set("authorization", `Bearer ${token}`);
+    const response = await this.fetchImpl(
+      this.url(
+        since === null
+          ? "/api/marketplace/events/stream"
+          : `/api/marketplace/events/stream?since=${Math.max(0, since)}`,
+      ),
+      { headers, signal },
+    ).catch((error: unknown) => {
+      throw networkError(error);
+    });
+    if (!response.ok) {
+      throw httpError(response.status, await response.text().catch(() => ""));
+    }
+    const readySequence = Number(response.headers.get("x-hpa-event-sequence"));
+    if (Number.isSafeInteger(readySequence) && readySequence >= 0) {
+      onReady?.(readySequence);
+    }
+    if (!response.body) throw new RuntimeApiError(0, "NETWORK", "response body is empty");
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          const data = frame
+            .split("\n")
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.slice(5).trimStart())
+            .join("\n");
+          if (data) {
+            try {
+              onEvent(JSON.parse(data) as MarketplaceEvent);
+            } catch {
+              throw new RuntimeApiError(0, "INVALID_JSON", "invalid marketplace event payload");
+            }
+          }
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   mcpOverview(): Promise<McpOverview> {

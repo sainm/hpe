@@ -1,29 +1,35 @@
 # Python 技术栈
 
-> 定位：**可选 AI Worker**。Agent 规划/模型调用/LangGraph 在 Python；Workflow 执行、权限、沙箱、MCP、Skill 文件与脚本仍由 Rust Core 负责。没有 Python 时，确定性 Workflow/Skill 不受影响。
+> 定位：**可选 AI Worker（显式 `planner.kind = "python"`）**。Agent 规划/模型调用/LangGraph 在 Python；Workflow 执行、权限、沙箱、MCP、Skill 文件与脚本仍由 Rust Core 负责。checkpoint 使用 SQLite 或按租户隔离的 PostgreSQL schema；未配置 Python 时，既有 deterministic/OpenAI-compatible Agent 和确定性 Workflow/Skill 不受影响。当前交付边界见 [Python Worker](../04-agent/python-worker.md)。
 
 ## 1. 运行时与依赖
 
 | 包 | 版本（2026-11-01） | License | 说明 |
 | --- | --- | --- | --- |
-| Python | 3.13.x | PSF | 本机 3.9.6 不满足；需安装 3.13 |
+| Python | 3.13.18 | PSF | Homebrew 3.13 已验证 |
 | LangGraph | 1.2.19 | MIT | Agent 状态图/checkpoint/interrupt |
-| langgraph-checkpoint-postgres / sqlite | 3.2.0 / 3.1.3 | MIT | Agent 检查点（AI 独立 schema/本地 SQLite） |
+| langgraph-checkpoint / sqlite | 4.3.1 / 3.1.3 | MIT | Agent 检查点；当前使用 SQLite，PostgreSQL 为后续 |
 | Pydantic | 2.14.2 | MIT | AI 请求/响应/配置模型 |
-| FastAPI | 0.162.0 | MIT | 仅健康/指标/可选管理 HTTP |
+| FastAPI | 0.162.0 | MIT | 已锁定；当前 JSONL Worker 启动路径不依赖 HTTP |
 | Uvicorn | 0.54.0 | BSD-3-Clause | FastAPI server（可选） |
 | LiteLLM | 1.106.6 | MIT 核心 + EE | 模型网关（独立服务；HTTP） |
-| grpcio / grpcio-tools | 1.85.1 | Apache-2.0 | gRPC 服务/客户端/生成 |
-| protobuf | ≥7.35.1,<8 | BSD-3-Clause | 由 grpcio-tools 约束 |
+| grpcio / grpcio-tools | 未安装 | Apache-2.0 | 当前选择认证 JSONL；gRPC 为后续 |
+| protobuf | 未安装 | BSD-3-Clause | 当前无 Proto 生成 |
 | openai | 3.42.0 | Apache-2.0 | Provider 适配器（可选） |
 | anthropic | 2.3.0 | Apache-2.0 | Provider 适配器（可选） |
 | langchain-core | 1.7.3 | MIT | LangGraph 依赖 |
-| uv | 0.13.6 | Apache-2.0 | 依赖/虚拟环境/构建 |
+| uv | 0.12.18 | Apache-2.0 | 依赖/虚拟环境/构建；清华镜像验证 |
 | pytest | 9.2.0 | MIT | 测试 |
 | ruff | 0.17.3 | MIT | lint/format |
 | mypy | 2.4.1 | MIT | 类型检查 |
 
 > 使用 Python 3.13 作为基线；3.14 需在 LangGraph/Pydantic/protobuf 兼容验证后再升级。
+
+`services/ai-worker/uv.lock` 固定清华 PyPI 下载 URL 和 SHA-256；CI/本地使用 `uv sync --frozen`。
+
+LiteLLM 1.106.6 的上游约束不兼容已修复的 FileLock 4.x；项目显式 override
+`filelock==4.2.1`，通过 LiteLLM 受控调用和 `pip-audit`（0 已知漏洞）验证，并在升级
+LiteLLM 时重新审查该临时 override。Python CycloneDX SBOM 由 `uv export --format cyclonedx1.5` 生成。
 
 ## 2. 职责
 

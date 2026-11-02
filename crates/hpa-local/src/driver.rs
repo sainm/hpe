@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
 use hpa_core::runtime::{ExecutionStatus, StepStatus, expire_approval, step};
+use hpa_local::postgres_execution::ExecutionLeaseRecord;
+use opentelemetry::trace::FutureExt as _;
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::db::{Db, parse_state, status_text};
 use crate::metrics::{metrics, now_ms};
@@ -17,31 +19,84 @@ use crate::metrics::{metrics, now_ms};
 pub struct RuntimeManager {
     db: Db,
     running: Arc<Mutex<HashSet<String>>>,
+    holder_id: String,
+    lease_ttl_seconds: i32,
 }
 
 impl RuntimeManager {
     pub fn new(db: Db) -> Self {
+        let holder_id = std::env::var("HPA_NODE_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("runtime:{}", uuid::Uuid::now_v7()));
+        let lease_ttl_seconds = std::env::var("HPA_EXECUTION_LEASE_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (1..=3600).contains(value))
+            .unwrap_or(30);
         Self {
             db,
             running: Arc::new(Mutex::new(HashSet::new())),
+            holder_id,
+            lease_ttl_seconds,
         }
     }
 
     pub fn trigger(&self, execution_id: String) {
         let manager = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let acquired = {
-                    let mut running = manager.running.lock().await;
-                    running.insert(execution_id.clone())
-                };
-                if acquired {
-                    break;
+        let parent = hpa_local::telemetry::current_context();
+        let span = tracing::info_span!(
+            "workflow.trigger",
+            workflow.execution.id = %execution_id
+        );
+        tokio::spawn(
+            async move {
+                loop {
+                    let acquired = {
+                        let mut running = manager.running.lock().await;
+                        running.insert(execution_id.clone())
+                    };
+                    if acquired {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                let lease = match manager
+                    .db
+                    .acquire_execution_lease(
+                        &execution_id,
+                        &manager.holder_id,
+                        manager.lease_ttl_seconds,
+                    )
+                    .await
+                {
+                    Ok(Some(lease)) => lease,
+                    Ok(None) => {
+                        metrics().inc("hpa_execution_lease_skipped_total", &[]);
+                        let mut running = manager.running.lock().await;
+                        running.remove(&execution_id);
+                        return;
+                    }
+                    Err(error) => {
+                        error!(execution_id, error = %error, "cannot acquire execution lease");
+                        let mut running = manager.running.lock().await;
+                        running.remove(&execution_id);
+                        return;
+                    }
+                };
+                manager.drive(execution_id.clone(), &lease).await;
+                if let Err(error) = manager
+                    .db
+                    .release_execution_lease(&execution_id, &lease.holder_id, lease.fencing_token)
+                    .await
+                {
+                    warn!(execution_id, error = %error, "cannot release execution lease");
+                }
             }
-            manager.drive(execution_id).await;
-        });
+            .instrument(span)
+            .with_context(parent),
+        );
     }
 
     pub async fn recover(&self) -> Result<usize, crate::db::DbError> {
@@ -64,6 +119,31 @@ impl RuntimeManager {
                 interval.tick().await;
                 if let Err(message) = manager.expire_approvals().await {
                     warn!(error = %message, "approval SLA scan failed");
+                }
+            }
+        });
+    }
+
+    pub fn start_recovery_monitor(&self) {
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let interval_ms = std::env::var("HPA_EXECUTION_RECOVERY_TICK_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value >= 100)
+                .unwrap_or(5_000);
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                interval.tick().await;
+                match manager.db.running_executions().await {
+                    Ok(rows) => {
+                        for row in rows {
+                            manager.trigger(row.id);
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "execution recovery scan failed");
+                    }
                 }
             }
         });
@@ -103,6 +183,14 @@ impl RuntimeManager {
                     continue;
                 }
             };
+            let Some(lease) = self
+                .db
+                .acquire_execution_lease(&row.id, &self.holder_id, self.lease_ttl_seconds)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
             let events = match expire_approval(
                 &mut state,
                 &compilation.plan,
@@ -112,13 +200,29 @@ impl RuntimeManager {
                 Ok(events) => events,
                 Err(error) => {
                     warn!(execution_id = %row.id, error = %error, "cannot expire approval");
+                    let _ = self
+                        .db
+                        .release_execution_lease(&row.id, &lease.holder_id, lease.fencing_token)
+                        .await;
                     continue;
                 }
             };
-            if let Err(error) = self.db.save_execution(&state, &events).await {
+            if let Err(error) = self
+                .db
+                .save_execution_fenced(&state, &events, &lease.holder_id, lease.fencing_token)
+                .await
+            {
                 warn!(execution_id = %row.id, error = %error, "cannot persist approval timeout");
+                let _ = self
+                    .db
+                    .release_execution_lease(&row.id, &lease.holder_id, lease.fencing_token)
+                    .await;
                 continue;
             }
+            let _ = self
+                .db
+                .release_execution_lease(&row.id, &lease.holder_id, lease.fencing_token)
+                .await;
             info!(
                 execution_id = %row.id,
                 node_id = %request.node_id,
@@ -129,8 +233,15 @@ impl RuntimeManager {
         Ok(())
     }
 
-    async fn drive(&self, execution_id: String) {
-        let result = self.drive_inner(&execution_id).await;
+    async fn drive(&self, execution_id: String, lease: &ExecutionLeaseRecord) {
+        let span = tracing::info_span!(
+            "workflow.execute",
+            workflow.execution.id = %execution_id
+        );
+        let result = self
+            .drive_inner(&execution_id, lease)
+            .instrument(span)
+            .await;
         if let Err(message) = &result {
             error!(execution_id = %execution_id, error = %message, "execution driver failed");
         }
@@ -138,7 +249,11 @@ impl RuntimeManager {
         running.remove(&execution_id);
     }
 
-    async fn drive_inner(&self, execution_id: &str) -> Result<(), String> {
+    async fn drive_inner(
+        &self,
+        execution_id: &str,
+        lease: &ExecutionLeaseRecord,
+    ) -> Result<(), String> {
         let Some(row) = self
             .db
             .get_execution(execution_id)
@@ -178,10 +293,39 @@ impl RuntimeManager {
                 break;
             }
             let started = Instant::now();
-            let result = step(&workflow, &compilation.plan, &mut state).await;
+            let span = tracing::info_span!(
+                "workflow.step",
+                workflow.execution.id = %execution_id,
+                workflow.step.number = state.step_count + 1
+            );
+            let renewed = self
+                .db
+                .renew_execution_lease(
+                    execution_id,
+                    &lease.holder_id,
+                    lease.fencing_token,
+                    self.lease_ttl_seconds,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            if !renewed {
+                return Err("execution lease was lost or expired".to_string());
+            }
+            let result = step(&workflow, &compilation.plan, &mut state)
+                .instrument(span)
+                .await;
             let elapsed = started.elapsed().as_secs_f64();
             record_node_metrics(&result.events, &node_types, elapsed);
-            if let Err(error) = self.db.save_execution(&state, &result.events).await {
+            if let Err(error) = self
+                .db
+                .save_execution_fenced(
+                    &state,
+                    &result.events,
+                    &lease.holder_id,
+                    lease.fencing_token,
+                )
+                .await
+            {
                 return Err(format!("cannot persist execution state: {error}"));
             }
             match result.status {
@@ -195,10 +339,7 @@ impl RuntimeManager {
 
         if state.status.is_terminal() {
             let status = status_text(state.status);
-            metrics().inc(
-                "hpa_workflow_executions_total",
-                &[("tenant", state.tenant_id.as_str()), ("status", status)],
-            );
+            metrics().inc("hpa_workflow_executions_total", &[("status", status)]);
             let duration = ((now_ms() - state.started_ms as i64).max(0) as f64) / 1000.0;
             metrics().observe("hpa_workflow_execution_seconds", &[], duration);
             metrics().observe(

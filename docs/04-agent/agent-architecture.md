@@ -1,5 +1,7 @@
 # Agent 架构
 
+> 状态说明：本文包含目标形态与可选 Python Worker；当前本地实现采用 Rust Agent Runtime，跨语言 gRPC/LangGraph 尚未部署。实现边界见 [local-agent-platform.md](local-agent-platform.md)。
+
 > Agent 负责动态规划与决策；Workflow 负责确定性编排。两者可互相调用，但不是同一种执行模型。Agent 不得绕过 Workflow 的权限、审批与策略。
 
 ## 1. 定义

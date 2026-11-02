@@ -484,6 +484,58 @@ async fn authorization_server_rejects_bad_requests() {
         Some("invalid_request")
     );
 
+    let jar = server
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", &redirect_uri),
+            ("scope", "mcp:read"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("request_uri", "urn:ietf:params:oauth:request_uri:test"),
+        ])
+        .await;
+    assert_eq!(jar.status(), 400);
+
+    let jarm = server
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", &redirect_uri),
+            ("scope", "mcp:read"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("response_mode", "jwt"),
+        ])
+        .await;
+    let location = jarm
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .expect("JARM error redirect");
+    assert_eq!(
+        redirect_param(location, "error").as_deref(),
+        Some("invalid_request")
+    );
+
+    let mut dpop_url = reqwest::Url::parse(&server.url("/oauth/authorize")).expect("authorize URL");
+    dpop_url
+        .query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", &client_id)
+        .append_pair("redirect_uri", &redirect_uri)
+        .append_pair("scope", "mcp:read")
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256");
+    let dpop = server
+        .client
+        .get(dpop_url)
+        .header("DPoP", "not-supported")
+        .send()
+        .await
+        .expect("DPoP request");
+    assert_eq!(dpop.status(), 400);
+
     let insecure = server
         .client
         .post(server.url("/oauth/register"))

@@ -17,9 +17,13 @@ ed25519-dalek.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
-hpa-core = { path = "../hpa-core" }
+hpa-core.workspace = true
 hpa-skill.workspace = true
 jsonschema.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
 reqwest.workspace = true
 ring = "0.17.14"
 rust-embed.workspace = true
@@ -35,5 +39,12 @@ tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+opentelemetry-proto = { version = "0.33.1", features = ["gen-tonic-messages"] }
+prost = "0.14"

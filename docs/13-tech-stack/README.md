@@ -1,9 +1,11 @@
 # 技术栈方案
 
-> 状态：Phase 0 技术选型基线（2026-11-01）。<br>
+> 状态：Phase 0 技术选型基线，附 2026-11-01 本地实现核对。<br>
 > 结论：**Rust Core + TypeScript Control Plane/Web + Python 可选 AI Worker**；内部 gRPC，外部 REST/OpenAPI，AI 工具 MCP，数据契约 JSON Schema。
 > 品牌：展示名 Auralis；永久内部 ID **hpa**；历史别名 Hisha。规则见 [BRANDING.md](../../BRANDING.md)。
-> 说明：本机未安装 Rust/Python 目标版本，未编译；版本/许可证来自 crates.io/npm/PyPI/GitHub 源码核查，详见 [证据](evidence.md)。
+> 说明：当前本地产品已用 Rust 1.99.1、Node 26 和 SQLite 编译/测试；PostgreSQL schema/RLS 与显式 `python` planner 的 Python 3.13 LangGraph Worker 已建立，但默认业务数据路由仍未切换到 PostgreSQL，生产多副本 Agent 调度和 Redis 统一事件总线未闭合。NestJS 仍未部署。目标架构与已落地实现必须在 [实现状态](../10-quality/implementation-status.md) 中区分。
+
+中国大陆网络初始化与镜像完整性要求见 [国内依赖下载源](domestic-download-mirrors.md)。
 
 ## 1. 最终组合
 
@@ -93,7 +95,7 @@
 
 ## 7. 状态/限制
 
-- 本机：Rust/Cargo/uv/pnpm 未安装；Node 26.0；Python 3.9.6。未编译/运行。
+- 本机全局 Node 为 26.0，最终验证通过 `npx node@26.13.0` 固定到目标 LTS；Rust/Cargo 1.99.1、pnpm 12.16.1 已安装。Python 目标版本与 uv 仍未安装，云/Python 组件未部署。
 - 未做三平台构建/签名/公证；未做性能基准；未做全量传递许可证扫描。
 - Mermaid/CSS 未浏览器渲染；PoC 未执行。
 - 任何版本/许可结论在引入前复验；商业发布前法务复核。

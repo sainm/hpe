@@ -122,7 +122,9 @@ impl OpsService {
                 scopes TEXT NOT NULL DEFAULT 'openid email profile',
                 admin_subjects_json TEXT NOT NULL DEFAULT '[]',
                 cookie_secure INTEGER NOT NULL DEFAULT 0,
-                session_ttl_seconds INTEGER NOT NULL DEFAULT 28800
+                session_ttl_seconds INTEGER NOT NULL DEFAULT 28800,
+                end_session_endpoint TEXT NOT NULL DEFAULT '',
+                post_logout_redirect_uri TEXT NOT NULL DEFAULT ''
             )",
         )
         .execute(&self.control_pool)
@@ -630,14 +632,25 @@ impl OpsService {
         jwks_url: &str,
         network: Vec<String>,
     ) -> Result<Value, OpsError> {
-        let row: Option<(String, String, String, String, String, String, i64, i64)> =
-            sqlx::query_as(
-                "SELECT client_id, authorization_endpoint, token_endpoint, redirect_uri,
-                        scopes, admin_subjects_json, cookie_secure, session_ttl_seconds
+        let row: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT client_id, authorization_endpoint, token_endpoint, redirect_uri,
+                        scopes, admin_subjects_json, cookie_secure, session_ttl_seconds,
+                        end_session_endpoint, post_logout_redirect_uri
                  FROM enterprise_oidc WHERE id = 1",
-            )
-            .fetch_optional(&self.control_pool)
-            .await?;
+        )
+        .fetch_optional(&self.control_pool)
+        .await?;
         let (
             client_id,
             authorization_endpoint,
@@ -647,6 +660,8 @@ impl OpsService {
             admin_subjects_json,
             cookie_secure,
             session_ttl_seconds,
+            end_session_endpoint,
+            post_logout_redirect_uri,
         ) = row.unwrap_or_else(|| {
             (
                 String::new(),
@@ -657,6 +672,8 @@ impl OpsService {
                 "[]".to_string(),
                 0,
                 DEFAULT_SESSION_TTL,
+                String::new(),
+                String::new(),
             )
         });
         let admin_subjects: Vec<String> = serde_json::from_str(&admin_subjects_json)
@@ -674,6 +691,8 @@ impl OpsService {
             admin_subjects,
             cookie_secure != 0,
             session_ttl_seconds,
+            &end_session_endpoint,
+            &post_logout_redirect_uri,
         )
         .await
     }
@@ -693,6 +712,8 @@ impl OpsService {
         admin_subjects: Vec<String>,
         cookie_secure: bool,
         session_ttl_seconds: i64,
+        end_session_endpoint: &str,
+        post_logout_redirect_uri: &str,
     ) -> Result<Value, OpsError> {
         if issuer.trim().is_empty() {
             return Err(OpsError::Invalid("OIDC issuer is required".to_string()));
@@ -710,6 +731,8 @@ impl OpsService {
         let authorization_endpoint = authorization_endpoint.trim();
         let token_endpoint = token_endpoint.trim();
         let redirect_uri = redirect_uri.trim();
+        let end_session_endpoint = end_session_endpoint.trim();
+        let post_logout_redirect_uri = post_logout_redirect_uri.trim();
         let browser_fields = [
             client_id,
             authorization_endpoint,
@@ -735,6 +758,41 @@ impl OpsService {
                     "redirectUri must end with /auth/oidc/callback".to_string(),
                 ));
             }
+            if end_session_endpoint.is_empty() != post_logout_redirect_uri.is_empty() {
+                return Err(OpsError::Invalid(
+                    "endSessionEndpoint and postLogoutRedirectUri must be configured together"
+                        .to_string(),
+                ));
+            }
+            if !end_session_endpoint.is_empty() {
+                self.validate_oidc_endpoint(end_session_endpoint, &network, "end session endpoint")
+                    .await?;
+                let logout_redirect = validate_oidc_url(
+                    post_logout_redirect_uri,
+                    &[],
+                    "post-logout redirect URI",
+                    false,
+                )
+                .await?;
+                if !logout_redirect
+                    .path()
+                    .ends_with("/auth/oidc/logout/callback")
+                {
+                    return Err(OpsError::Invalid(
+                        "postLogoutRedirectUri must end with /auth/oidc/logout/callback"
+                            .to_string(),
+                    ));
+                }
+                if logout_redirect.origin() != redirect.origin() {
+                    return Err(OpsError::Invalid(
+                        "postLogoutRedirectUri must use the same origin as redirectUri".to_string(),
+                    ));
+                }
+            }
+        } else if !end_session_endpoint.is_empty() || !post_logout_redirect_uri.is_empty() {
+            return Err(OpsError::Invalid(
+                "browser OIDC endpoints must be configured before RP-initiated logout".to_string(),
+            ));
         }
         if !(SESSION_TTL_MIN..=SESSION_TTL_MAX).contains(&session_ttl_seconds) {
             return Err(OpsError::Invalid(format!(
@@ -766,8 +824,9 @@ impl OpsService {
             "INSERT INTO enterprise_oidc
              (id, issuer, audience, jwks_url, network_json, updated_at, client_id,
               authorization_endpoint, token_endpoint, redirect_uri, scopes,
-              admin_subjects_json, cookie_secure, session_ttl_seconds)
-             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              admin_subjects_json, cookie_secure, session_ttl_seconds,
+              end_session_endpoint, post_logout_redirect_uri)
+             VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                 issuer = excluded.issuer,
                 audience = excluded.audience,
@@ -781,7 +840,9 @@ impl OpsService {
                 scopes = excluded.scopes,
                 admin_subjects_json = excluded.admin_subjects_json,
                 cookie_secure = excluded.cookie_secure,
-                session_ttl_seconds = excluded.session_ttl_seconds",
+                session_ttl_seconds = excluded.session_ttl_seconds,
+                end_session_endpoint = excluded.end_session_endpoint,
+                post_logout_redirect_uri = excluded.post_logout_redirect_uri",
         )
         .bind(issuer)
         .bind(audience)
@@ -796,6 +857,8 @@ impl OpsService {
         .bind(&admin_subjects_json)
         .bind(cookie_secure as i64)
         .bind(session_ttl_seconds)
+        .bind(end_session_endpoint)
+        .bind(post_logout_redirect_uri)
         .execute(&self.control_pool)
         .await?;
         if let Ok(mut cache) = jwks_cache().lock() {
@@ -829,10 +892,13 @@ impl OpsService {
             String,
             i64,
             i64,
+            String,
+            String,
         )> = sqlx::query_as(
             "SELECT issuer, audience, jwks_url, network_json, updated_at, client_id,
                     authorization_endpoint, token_endpoint, redirect_uri, scopes,
-                    admin_subjects_json, cookie_secure, session_ttl_seconds
+                    admin_subjects_json, cookie_secure, session_ttl_seconds,
+                    end_session_endpoint, post_logout_redirect_uri
              FROM enterprise_oidc WHERE id = 1",
         )
         .fetch_optional(&self.control_pool)
@@ -851,6 +917,8 @@ impl OpsService {
             admin_subjects_json,
             cookie_secure,
             session_ttl_seconds,
+            end_session_endpoint,
+            post_logout_redirect_uri,
         )) = row
         else {
             return Ok(json!({
@@ -866,6 +934,8 @@ impl OpsService {
                 "adminSubjects": Vec::<String>::new(),
                 "cookieSecure": false,
                 "sessionTtlSeconds": DEFAULT_SESSION_TTL,
+                "endSessionEndpoint": "",
+                "postLogoutRedirectUri": "",
                 "updatedAt": Value::Null
             }));
         };
@@ -886,6 +956,8 @@ impl OpsService {
             "adminSubjects": admin_subjects,
             "cookieSecure": cookie_secure != 0,
             "sessionTtlSeconds": session_ttl_seconds,
+            "endSessionEndpoint": end_session_endpoint,
+            "postLogoutRedirectUri": post_logout_redirect_uri,
             "updatedAt": updated_at
         }))
     }
@@ -1168,6 +1240,14 @@ async fn ensure_oidc_columns(pool: &SqlitePool) -> Result<(), OpsError> {
             "session_ttl_seconds",
             "ALTER TABLE enterprise_oidc ADD COLUMN session_ttl_seconds INTEGER NOT NULL DEFAULT 28800",
         ),
+        (
+            "end_session_endpoint",
+            "ALTER TABLE enterprise_oidc ADD COLUMN end_session_endpoint TEXT NOT NULL DEFAULT ''",
+        ),
+        (
+            "post_logout_redirect_uri",
+            "ALTER TABLE enterprise_oidc ADD COLUMN post_logout_redirect_uri TEXT NOT NULL DEFAULT ''",
+        ),
     ];
     for (name, statement) in additions {
         if !columns.iter().any(|column| column == name) {
@@ -1193,6 +1273,11 @@ async fn validate_oidc_url(
     if !url.username().is_empty() || url.password().is_some() {
         return Err(OpsError::Forbidden(format!(
             "{label} URL must not contain userinfo"
+        )));
+    }
+    if url.fragment().is_some() {
+        return Err(OpsError::Invalid(format!(
+            "{label} URL must not contain a fragment"
         )));
     }
     let host = url
@@ -1371,6 +1456,8 @@ mod browser_sso_config_tests {
                 ],
                 true,
                 7200,
+                "http://127.0.0.1:9/logout",
+                "http://127.0.0.1:9/auth/oidc/logout/callback",
             )
             .await
             .unwrap();
@@ -1381,6 +1468,10 @@ mod browser_sso_config_tests {
         );
         assert_eq!(configured["cookieSecure"], true);
         assert_eq!(configured["sessionTtlSeconds"], 7200);
+        assert_eq!(
+            configured["endSessionEndpoint"],
+            "http://127.0.0.1:9/logout"
+        );
 
         let updated = ops
             .set_oidc_config(
@@ -1406,6 +1497,10 @@ mod browser_sso_config_tests {
             json!(["admin@example.com", "subject-admin"])
         );
         assert_eq!(updated["cookieSecure"], true);
+        assert_eq!(
+            updated["postLogoutRedirectUri"],
+            "http://127.0.0.1:9/auth/oidc/logout/callback"
+        );
     }
 
     #[tokio::test]
@@ -1469,6 +1564,8 @@ mod browser_sso_config_tests {
                     Vec::new(),
                     false,
                     ttl,
+                    "",
+                    "",
                 )
                 .await
                 .is_err()
@@ -1489,6 +1586,8 @@ mod browser_sso_config_tests {
                 Vec::new(),
                 false,
                 ttl,
+                "",
+                "",
             )
             .await
             .is_ok()
@@ -1507,6 +1606,68 @@ mod browser_sso_config_tests {
                 Vec::new(),
                 false,
                 28800,
+                "",
+                "",
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            ops.set_browser_oidc_config(
+                "https://issuer.example/",
+                "hpa",
+                "http://127.0.0.1:9/jwks",
+                vec!["*".to_string()],
+                "client",
+                "http://127.0.0.1:9/authorize",
+                "http://127.0.0.1:9/token",
+                "http://127.0.0.1:9/auth/oidc/callback",
+                "openid",
+                Vec::new(),
+                false,
+                28800,
+                "http://127.0.0.1:9/logout",
+                "",
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            ops.set_browser_oidc_config(
+                "https://issuer.example/",
+                "hpa",
+                "http://127.0.0.1:9/jwks",
+                vec!["*".to_string()],
+                "client",
+                "http://127.0.0.1:9/authorize",
+                "http://127.0.0.1:9/token",
+                "http://127.0.0.1:9/auth/oidc/callback",
+                "openid",
+                Vec::new(),
+                false,
+                28800,
+                "http://127.0.0.1:9/logout",
+                "http://127.0.0.1:9/wrong/callback",
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            ops.set_browser_oidc_config(
+                "https://issuer.example/",
+                "hpa",
+                "http://127.0.0.1:9/jwks",
+                vec!["*".to_string()],
+                "client",
+                "http://127.0.0.1:9/authorize",
+                "http://127.0.0.1:9/token",
+                "http://127.0.0.1:9/auth/oidc/callback",
+                "openid",
+                Vec::new(),
+                false,
+                28800,
+                "http://127.0.0.1:9/logout",
+                "http://127.0.0.1:10/auth/oidc/logout/callback",
             )
             .await
             .is_err()
@@ -1525,6 +1686,8 @@ mod browser_sso_config_tests {
                 Vec::new(),
                 false,
                 28800,
+                "",
+                "",
             )
             .await
             .is_ok()
@@ -1543,6 +1706,8 @@ mod browser_sso_config_tests {
                 Vec::new(),
                 false,
                 28800,
+                "",
+                "",
             )
             .await
             .is_err()
@@ -1561,6 +1726,8 @@ mod browser_sso_config_tests {
                 Vec::new(),
                 false,
                 28800,
+                "",
+                "",
             )
             .await
             .is_err()
@@ -1579,6 +1746,8 @@ mod browser_sso_config_tests {
                 vec!["  ".to_string()],
                 false,
                 28800,
+                "",
+                "",
             )
             .await
             .is_err()

@@ -1,12 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
+  CloudDownload,
   CheckCircle2,
   FileJson2,
   Fingerprint,
+  Globe2,
   KeyRound,
   Package,
   Plug,
+  Plus,
   Power,
   PowerOff,
   RefreshCw,
@@ -17,6 +20,7 @@ import {
   Store,
   Trash2,
   Upload,
+  UserRound,
   XCircle,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
@@ -39,8 +43,11 @@ import { api, ApiError } from "../lib/api";
 import type {
   MarketDetail,
   MarketSummary,
+  MarketplacePublisher,
   PluginInspection,
   PluginSbom,
+  RemoteMarketplacePackage,
+  VulnerabilityReport,
 } from "../lib/types";
 import { useUiStore } from "../stores/ui";
 
@@ -72,6 +79,7 @@ export function PluginsPage() {
   const queryClient = useQueryClient();
   const pushToast = useUiStore((state) => state.pushToast);
   const [tab, setTab] = useState<PluginTab>("installed");
+  const [remoteOpen, setRemoteOpen] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [version, setVersion] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -381,6 +389,7 @@ export function PluginsPage() {
           <button
             key={key}
             type="button"
+            data-testid={`plugins-tab-${key}`}
             onClick={() => setTab(key)}
             className={cn(
               "inline-flex h-7 items-center gap-1.5 rounded-sm border px-2.5 text-[11.5px] font-medium",
@@ -924,7 +933,31 @@ export function PluginsPage() {
           </div>
         </div>
       ) : (
-        <div className="grid gap-3 xl:grid-cols-[300px_minmax(0,1fr)_320px]">
+        <>
+          <Panel className="p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <Globe2 className="h-4 w-4 text-accent" />
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-ink">
+                  {t("plugins.remote.title")}
+                </h2>
+                <p className="text-[10.5px] text-faint">{t("plugins.remote.subtitle")}</p>
+              </div>
+              <Badge tone="warning">{t("plugins.remote.provenancePending")}</Badge>
+              <Button
+                size="sm"
+                variant={remoteOpen ? "secondary" : "primary"}
+                className="ml-auto"
+                data-testid="marketplace-remote-toggle"
+                onClick={() => setRemoteOpen((value) => !value)}
+              >
+                <CloudDownload className="h-3.5 w-3.5" />
+                {remoteOpen ? t("plugins.remote.hide") : t("plugins.remote.open")}
+              </Button>
+            </div>
+          </Panel>
+          {remoteOpen ? <RemoteMarketplacePanel /> : null}
+          <div className="grid gap-3 xl:grid-cols-[300px_minmax(0,1fr)_320px]">
           <div className="grid content-start gap-3">
             <Panel className="p-4">
               <div className="flex flex-wrap items-center gap-2">
@@ -1067,7 +1100,8 @@ export function PluginsPage() {
               onSubmit={() => trustKey.mutate()}
             />
           </div>
-        </div>
+          </div>
+        </>
       )}
     </div>
   );
@@ -1330,6 +1364,667 @@ function MarketDetailPanel({
         )}
       </Panel>
     </>
+  );
+}
+
+function RemoteMarketplacePanel() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const pushToast = useUiStore((state) => state.pushToast);
+  const [sourceId, setSourceId] = useState("");
+  const [sourceLabel, setSourceLabel] = useState("");
+  const [indexUri, setIndexUri] = useState("");
+  const [sourceKeyId, setSourceKeyId] = useState("");
+  const [sourcePublicKey, setSourcePublicKey] = useState("");
+  const [sourceKeyLabel, setSourceKeyLabel] = useState("");
+  const [selectedSource, setSelectedSource] = useState("");
+  const [rotateKeyId, setRotateKeyId] = useState("");
+  const [rotatePublicKey, setRotatePublicKey] = useState("");
+  const [rotateLabel, setRotateLabel] = useState("");
+  const [publisherId, setPublisherId] = useState("");
+  const [publisherName, setPublisherName] = useState("");
+  const [keyPublisherId, setKeyPublisherId] = useState("");
+  const [publisherKeyId, setPublisherKeyId] = useState("");
+  const [publisherPublicKey, setPublisherPublicKey] = useState("");
+  const [publisherKeyLabel, setPublisherKeyLabel] = useState("");
+  const [publisherKeyValidFrom, setPublisherKeyValidFrom] = useState("");
+  const [publisherKeyValidUntil, setPublisherKeyValidUntil] = useState("");
+  const [vulnerabilityReports, setVulnerabilityReports] = useState<
+    Record<string, VulnerabilityReport>
+  >({});
+
+  const sources = useQuery({
+    queryKey: ["marketplace-sources"],
+    queryFn: api.listMarketplaceSources,
+    retry: 1,
+  });
+  const publishers = useQuery({
+    queryKey: ["marketplace-publishers"],
+    queryFn: api.listMarketplacePublishers,
+    retry: 1,
+  });
+  const packages = useQuery({
+    queryKey: ["marketplace-remote", selectedSource],
+    queryFn: () => api.listRemoteMarketplace(selectedSource || undefined),
+    retry: 1,
+  });
+
+  const sourceList = sources.data?.sources ?? [];
+  const publisherList = publishers.data?.publishers ?? [];
+  const packageList = packages.data?.packages ?? [];
+  const approved = packageList.filter(
+    (entry) => entry.reviewStatus === "approved" && !entry.withdrawnAt,
+  ).length;
+  const withdrawn = packageList.filter((entry) => Boolean(entry.withdrawnAt)).length;
+
+  useEffect(() => {
+    if (!keyPublisherId && publisherList.length > 0) {
+      setKeyPublisherId(publisherList[0]!.id);
+    }
+  }, [keyPublisherId, publisherList]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let sequence: number | null = null;
+    void (async () => {
+      while (!controller.signal.aborted) {
+        try {
+          await api.streamMarketplaceEvents(
+            sequence,
+            (event) => {
+              sequence = Math.max(sequence ?? 0, event.sequence);
+              if (!event.kind.includes("withdrawn")) return;
+              void queryClient.invalidateQueries({ queryKey: ["marketplace-remote"] });
+              void queryClient.invalidateQueries({ queryKey: ["marketplace"] });
+              void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+              pushToast(
+                t("plugins.remote.withdrawnPush", {
+                  plugin: `${event.pluginId ?? ""}@${event.version ?? ""}`,
+                  reason: String(
+                    (event.detail as { reason?: string } | null)?.reason ?? "",
+                  ),
+                }),
+                "error",
+              );
+            },
+            controller.signal,
+            (readySequence) => {
+              sequence = Math.max(sequence ?? 0, readySequence);
+            },
+          );
+        } catch {
+          if (controller.signal.aborted) return;
+        }
+        if (!controller.signal.aborted) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+      }
+    })();
+    return () => controller.abort();
+  }, [pushToast, queryClient, t]);
+
+  function refreshMarketplace() {
+    void queryClient.invalidateQueries({ queryKey: ["marketplace-sources"] });
+    void queryClient.invalidateQueries({ queryKey: ["marketplace-publishers"] });
+    void queryClient.invalidateQueries({ queryKey: ["marketplace-remote"] });
+    void queryClient.invalidateQueries({ queryKey: ["marketplace"] });
+    void queryClient.invalidateQueries({ queryKey: ["plugins"] });
+  }
+
+  const addSource = useMutation({
+    mutationFn: () =>
+      api.addMarketplaceSource({
+        id: sourceId.trim(),
+        label: sourceLabel.trim(),
+        indexUri: indexUri.trim(),
+        keyId: sourceKeyId.trim(),
+        publicKey: sourcePublicKey.trim(),
+        keyLabel: sourceKeyLabel.trim() || "primary",
+      }),
+    onSuccess: (result) => {
+      pushToast(t("plugins.remote.sourceAdded"), "success");
+      setSelectedSource(result.sourceId);
+      setSourceId("");
+      setSourceLabel("");
+      setIndexUri("");
+      setSourceKeyId("");
+      setSourcePublicKey("");
+      setSourceKeyLabel("");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.sourceAddFailed")), "error"),
+  });
+
+  const refreshSource = useMutation({
+    mutationFn: (id: string) => api.refreshMarketplaceSource(id),
+    onSuccess: () => {
+      pushToast(t("plugins.remote.refreshed"), "success");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.refreshFailed")), "error"),
+  });
+
+  const rotateSourceKey = useMutation({
+    mutationFn: () =>
+      api.rotateMarketplaceSourceKey(selectedSource, {
+        keyId: rotateKeyId.trim(),
+        publicKey: rotatePublicKey.trim(),
+        label: rotateLabel.trim() || "rotated",
+      }),
+    onSuccess: () => {
+      pushToast(t("plugins.remote.keyRotated"), "success");
+      setRotateKeyId("");
+      setRotatePublicKey("");
+      setRotateLabel("");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.keyRotateFailed")), "error"),
+  });
+
+  const addPublisher = useMutation({
+    mutationFn: () =>
+      api.addMarketplacePublisher({
+        id: publisherId.trim(),
+        name: publisherName.trim(),
+      }),
+    onSuccess: (result) => {
+      pushToast(t("plugins.remote.publisherAdded"), "success");
+      setKeyPublisherId(result.publisherId);
+      setPublisherId("");
+      setPublisherName("");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.publisherAddFailed")), "error"),
+  });
+
+  const addPublisherKey = useMutation({
+    mutationFn: () =>
+      api.addMarketplacePublisherKey(keyPublisherId, {
+        keyId: publisherKeyId.trim(),
+        publicKey: publisherPublicKey.trim(),
+        label: publisherKeyLabel.trim() || "primary",
+        validFrom: publisherKeyValidFrom.trim() || undefined,
+        validUntil: publisherKeyValidUntil.trim() || undefined,
+      }),
+    onSuccess: () => {
+      pushToast(t("plugins.remote.publisherKeyAdded"), "success");
+      setPublisherKeyId("");
+      setPublisherPublicKey("");
+      setPublisherKeyLabel("");
+      setPublisherKeyValidFrom("");
+      setPublisherKeyValidUntil("");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.publisherKeyAddFailed")), "error"),
+  });
+
+  const revokePublisherKey = useMutation({
+    mutationFn: ({ id, keyId }: { id: string; keyId: string }) =>
+      api.revokeMarketplacePublisherKey(id, keyId),
+    onSuccess: () => {
+      pushToast(t("plugins.remote.publisherKeyRevoked"), "success");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.publisherKeyRevokeFailed")), "error"),
+  });
+
+  const installRemote = useMutation({
+    mutationFn: (entry: RemoteMarketplacePackage) =>
+      api.installRemoteMarketplacePackage(entry.sourceId, entry.pluginId, entry.version),
+    onSuccess: () => {
+      pushToast(t("plugins.remote.installed"), "success");
+      refreshMarketplace();
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.installFailed")), "error"),
+  });
+
+  const scanRemote = useMutation({
+    mutationFn: (entry: RemoteMarketplacePackage) =>
+      api.getMarketplaceVulnerability(entry.pluginId, entry.version).then((report) => ({
+        entry,
+        report,
+      })),
+    onSuccess: ({ entry, report }) => {
+      const key = `${entry.sourceId}/${entry.pluginId}/${entry.version}`;
+      setVulnerabilityReports((current) => ({ ...current, [key]: report }));
+      pushToast(
+        report.status === "vulnerable"
+          ? t("plugins.remote.vulnerableFound", { count: report.vulnerabilities.length })
+          : t(`plugins.remote.vulnerabilityStatus.${report.status}`, {
+              defaultValue: report.status,
+            }),
+        report.status === "vulnerable" ? "error" : "success",
+      );
+    },
+    onError: (error) =>
+      pushToast(errorMessage(error, t("plugins.remote.scanFailed")), "error"),
+  });
+
+  return (
+    <div className="grid gap-3">
+      <div className="grid grid-cols-2 gap-2 min-[560px]:grid-cols-4">
+        <Stat label={t("plugins.remote.statSources")} value={sourceList.length} />
+        <Stat label={t("plugins.remote.statPackages")} value={packageList.length} />
+        <Stat label={t("plugins.remote.statApproved")} value={approved} />
+        <Stat label={t("plugins.remote.statWithdrawn")} value={withdrawn} />
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-[340px_minmax(0,1fr)]">
+        <div className="grid content-start gap-3">
+          <Panel className="p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <Globe2 className="h-4 w-4 text-accent" />
+              <h2 className="text-sm font-semibold text-ink">
+                {t("plugins.remote.sources")}
+              </h2>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="ml-auto"
+                onClick={() => void sources.refetch()}
+              >
+                <RefreshCw className="h-3 w-3" />
+                {t("common.refresh")}
+              </Button>
+            </div>
+            {sources.isLoading ? (
+              <p className="mt-2 text-xs text-muted">{t("common.loading")}</p>
+            ) : sources.isError ? (
+              <p className="mt-2 text-xs text-danger">{t("errors.loadFailed")}</p>
+            ) : sourceList.length === 0 ? (
+              <p className="mt-2 text-xs text-muted">{t("plugins.remote.noSources")}</p>
+            ) : (
+              <div className="mt-2 grid gap-1.5">
+                {sourceList.map((source) => (
+                  <button
+                    key={source.id}
+                    type="button"
+                    onClick={() => setSelectedSource(source.id)}
+                    className={cn(
+                      "rounded-sm border px-2.5 py-2 text-left",
+                      selectedSource === source.id
+                        ? "border-accent/45 bg-accent/10"
+                        : "border-line bg-panel hover:border-line-strong",
+                    )}
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-ink">
+                        {source.label}
+                      </span>
+                      <Badge tone={source.enabled ? "success" : "neutral"}>
+                        {source.enabled ? t("plugins.remote.enabled") : t("plugins.remote.disabled")}
+                      </Badge>
+                    </div>
+                    <p className="truncate font-mono text-[9.5px] text-faint">{source.id}</p>
+                    <p className="truncate font-mono text-[9px] text-faint">{source.indexUri}</p>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[9.5px] text-faint">
+                      <span>seq {source.lastSequence}</span>
+                      <span>{t("plugins.remote.packageCount", { count: source.packageCount })}</span>
+                      <span>{t("plugins.remote.keyCount", { count: source.keys.length })}</span>
+                      <span className="ml-auto">
+                        {source.lastRefreshAt ? (
+                          <Timestamp value={source.lastRefreshAt} />
+                        ) : (
+                          t("plugins.remote.neverRefreshed")
+                        )}
+                      </span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+            {selectedSource ? (
+              <Button
+                size="sm"
+                variant="secondary"
+                className="mt-2"
+                loading={refreshSource.isPending}
+                onClick={() => refreshSource.mutate(selectedSource)}
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                {t("plugins.remote.refreshSource")}
+              </Button>
+            ) : null}
+          </Panel>
+
+          <Panel className="p-4">
+            <div className="flex items-center gap-2">
+              <Plus className="h-4 w-4 text-accent" />
+              <h2 className="text-sm font-semibold text-ink">
+                {t("plugins.remote.addSource")}
+              </h2>
+            </div>
+            <div className="mt-2 grid gap-1.5">
+              <Field label={t("plugins.remote.sourceId")}>
+                <input className={inputClass} value={sourceId} onChange={(event) => setSourceId(event.target.value)} />
+              </Field>
+              <Field label={t("plugins.remote.sourceLabel")}>
+                <input className={inputClass} value={sourceLabel} onChange={(event) => setSourceLabel(event.target.value)} />
+              </Field>
+              <Field label={t("plugins.remote.indexUri")}>
+                <input className={cn(inputClass, "font-mono text-[10px]")} value={indexUri} onChange={(event) => setIndexUri(event.target.value)} placeholder="https://…/index.json" />
+              </Field>
+              <Field label={t("plugins.remote.indexKeyId")}>
+                <input className={cn(inputClass, "font-mono text-[10px]")} value={sourceKeyId} onChange={(event) => setSourceKeyId(event.target.value)} />
+              </Field>
+              <Field label={t("plugins.remote.publicKey")}>
+                <textarea className={cn(textareaClass, "min-h-[58px] font-mono text-[9.5px]")} value={sourcePublicKey} onChange={(event) => setSourcePublicKey(event.target.value)} />
+              </Field>
+              <Field label={t("plugins.remote.keyLabel")}>
+                <input className={inputClass} value={sourceKeyLabel} onChange={(event) => setSourceKeyLabel(event.target.value)} />
+              </Field>
+              <Button
+                size="sm"
+                variant="primary"
+                loading={addSource.isPending}
+                disabled={!sourceId.trim() || !sourceLabel.trim() || !indexUri.trim() || !sourceKeyId.trim() || !sourcePublicKey.trim()}
+                onClick={() => addSource.mutate()}
+              >
+                {t("plugins.remote.addSourceAction")}
+              </Button>
+            </div>
+          </Panel>
+
+          <Panel className="p-4">
+            <div className="flex items-center gap-2">
+              <KeyRound className="h-4 w-4 text-accent" />
+              <h2 className="text-sm font-semibold text-ink">
+                {t("plugins.remote.rotateSourceKey")}
+              </h2>
+            </div>
+            <div className="mt-2 grid gap-1.5">
+              <input className={cn(inputClass, "font-mono text-[10px]")} value={rotateKeyId} onChange={(event) => setRotateKeyId(event.target.value)} placeholder={t("plugins.remote.indexKeyId")} />
+              <textarea className={cn(textareaClass, "min-h-[54px] font-mono text-[9.5px]")} value={rotatePublicKey} onChange={(event) => setRotatePublicKey(event.target.value)} placeholder={t("plugins.remote.publicKey")} />
+              <input className={inputClass} value={rotateLabel} onChange={(event) => setRotateLabel(event.target.value)} placeholder={t("plugins.remote.keyLabel")} />
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={rotateSourceKey.isPending}
+                disabled={!selectedSource || !rotateKeyId.trim() || !rotatePublicKey.trim()}
+                onClick={() => rotateSourceKey.mutate()}
+              >
+                {t("plugins.remote.rotateAction")}
+              </Button>
+            </div>
+          </Panel>
+        </div>
+
+        <Panel className="min-w-0 p-4">
+          <div className="flex flex-wrap items-center gap-2">
+            <CloudDownload className="h-4 w-4 text-accent" />
+            <h2 className="text-sm font-semibold text-ink">
+              {t("plugins.remote.packages")}
+            </h2>
+            <select
+              className={cn(inputClass, "ml-auto h-7 w-auto font-mono text-[10.5px]")}
+              value={selectedSource}
+              onChange={(event) => setSelectedSource(event.target.value)}
+              aria-label={t("plugins.remote.source")}
+            >
+              <option value="">{t("plugins.remote.allSources")}</option>
+              {sourceList.map((source) => (
+                <option key={source.id} value={source.id}>
+                  {source.label}
+                </option>
+              ))}
+            </select>
+            <Button
+              size="xs"
+              variant="ghost"
+              aria-label={t("common.refresh")}
+              onClick={() => void packages.refetch()}
+            >
+              <RefreshCw className="h-3 w-3" />
+            </Button>
+          </div>
+          {packages.isLoading ? (
+            <p className="mt-3 text-xs text-muted">{t("common.loading")}</p>
+          ) : packages.isError ? (
+            <p className="mt-3 text-xs text-danger">{t("errors.loadFailed")}</p>
+          ) : packageList.length === 0 ? (
+            <p className="mt-3 text-xs text-muted">{t("plugins.remote.noPackages")}</p>
+          ) : (
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full min-w-[900px] text-left text-[11px]">
+                <thead className="text-[9.5px] uppercase tracking-[0.12em] text-faint">
+                  <tr>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.source")}</th>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.package")}</th>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.publisher")}</th>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.signature")}</th>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.security")}</th>
+                    <th className="px-2 py-1 font-medium">{t("common.status")}</th>
+                    <th className="px-2 py-1 font-medium">{t("plugins.remote.sequence")}</th>
+                    <th className="px-2 py-1 font-medium" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {packageList.map((entry) => {
+                    const installable = entry.reviewStatus === "approved" && !entry.withdrawnAt;
+                    const reportKey = `${entry.sourceId}/${entry.pluginId}/${entry.version}`;
+                    const report = vulnerabilityReports[reportKey];
+                    const blockedByVulnerability = report?.status === "vulnerable";
+                    return (
+                      <tr key={`${entry.sourceId}-${entry.pluginId}-${entry.version}`} className="border-t border-line">
+                        <td className="px-2 py-1.5 font-mono text-faint">{entry.sourceId}</td>
+                        <td className="px-2 py-1.5">
+                          <p className="font-mono text-ink">{entry.pluginId}</p>
+                          <p className="font-mono text-[9px] text-faint">{entry.version}</p>
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-muted">{entry.publisherId}</td>
+                        <td className="max-w-[150px] truncate px-2 py-1.5 font-mono text-[9px] text-faint">
+                          {entry.signerKeyId}
+                        </td>
+                        <td className="px-2 py-1.5">
+                          <div className="flex items-center gap-1.5">
+                            {entry.provenance ? (
+                              <Badge tone="success">{t("plugins.remote.sigstore")}</Badge>
+                            ) : null}
+                            {entry.oci ? (
+                              <Badge tone="info">{t("plugins.remote.oci")}</Badge>
+                            ) : null}
+                            {report ? (
+                              <Badge
+                                tone={
+                                  report.status === "vulnerable"
+                                    ? "danger"
+                                    : report.status === "clean"
+                                      ? "success"
+                                      : "neutral"
+                                }
+                              >
+                                {t(`plugins.remote.vulnerabilityStatus.${report.status}`, {
+                                  defaultValue: report.status,
+                                })}
+                              </Badge>
+                            ) : null}
+                            <Button
+                              size="xs"
+                              variant="subtle"
+                              loading={
+                                scanRemote.isPending && scanRemote.variables === entry
+                              }
+                              onClick={() => scanRemote.mutate(entry)}
+                            >
+                              <ShieldCheck className="h-3 w-3" />
+                              {t("plugins.remote.scan")}
+                            </Button>
+                          </div>
+                          {report?.status === "vulnerable" ? (
+                            <p className="mt-1 max-w-[180px] truncate text-[9px] text-danger">
+                              {report.vulnerabilities.map((item) => item.id).join(", ")}
+                            </p>
+                          ) : null}
+                          {entry.oci?.digest ? (
+                            <p className="mt-1 max-w-[180px] truncate font-mono text-[9px] text-faint">
+                              {entry.oci.digest}
+                            </p>
+                          ) : null}
+                        </td>
+                        <td className="px-2 py-1.5">
+                          <Badge tone={entry.withdrawnAt ? "danger" : reviewTone(entry.reviewStatus)}>
+                            {entry.withdrawnAt
+                              ? t("plugins.remote.withdrawn")
+                              : t(`plugins.reviewStatus.${entry.reviewStatus}`, {
+                                  defaultValue: entry.reviewStatus,
+                                })}
+                          </Badge>
+                          {entry.withdrawnAt ? (
+                            <p className="mt-1 max-w-[140px] truncate text-[9px] text-danger">
+                              {entry.revocationReason}
+                            </p>
+                          ) : null}
+                        </td>
+                        <td className="px-2 py-1.5 font-mono text-faint">{entry.sequence}</td>
+                        <td className="px-2 py-1.5 text-right">
+                          <Button
+                            size="xs"
+                            variant="primary"
+                            loading={installRemote.isPending && installRemote.variables === entry}
+                            disabled={!installable || blockedByVulnerability}
+                            onClick={() => installRemote.mutate(entry)}
+                          >
+                            {t("plugins.installVersion")}
+                          </Button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Panel>
+      </div>
+
+      <div className="grid gap-3 xl:grid-cols-[340px_minmax(0,1fr)]">
+        <Panel className="p-4">
+          <div className="flex items-center gap-2">
+            <UserRound className="h-4 w-4 text-accent" />
+            <h2 className="text-sm font-semibold text-ink">
+              {t("plugins.remote.addPublisher")}
+            </h2>
+          </div>
+          <div className="mt-2 grid gap-1.5">
+            <input className={cn(inputClass, "font-mono text-[10px]")} value={publisherId} onChange={(event) => setPublisherId(event.target.value)} placeholder={t("plugins.remote.publisherId")} />
+            <input className={inputClass} value={publisherName} onChange={(event) => setPublisherName(event.target.value)} placeholder={t("plugins.remote.publisherName")} />
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={addPublisher.isPending}
+              disabled={!publisherId.trim() || !publisherName.trim()}
+              onClick={() => addPublisher.mutate()}
+            >
+              {t("plugins.remote.addPublisherAction")}
+            </Button>
+          </div>
+          <div className="mt-3 grid gap-1.5 border-t border-line pt-3">
+            <p className="text-[10.5px] font-semibold text-muted">
+              {t("plugins.remote.addPublisherKey")}
+            </p>
+            <select
+              className={inputClass}
+              value={keyPublisherId}
+              onChange={(event) => setKeyPublisherId(event.target.value)}
+              aria-label={t("plugins.remote.selectPublisher")}
+            >
+              <option value="">{t("plugins.remote.selectPublisher")}</option>
+              {publisherList.map((publisher) => (
+                <option key={publisher.id} value={publisher.id}>
+                  {publisher.name} · {publisher.id}
+                </option>
+              ))}
+            </select>
+            <input className={cn(inputClass, "font-mono text-[10px]")} value={publisherKeyId} onChange={(event) => setPublisherKeyId(event.target.value)} placeholder={t("plugins.remote.publisherKeyId")} />
+            <textarea className={cn(textareaClass, "min-h-[54px] font-mono text-[9.5px]")} value={publisherPublicKey} onChange={(event) => setPublisherPublicKey(event.target.value)} placeholder={t("plugins.remote.publicKey")} />
+            <input className={inputClass} value={publisherKeyLabel} onChange={(event) => setPublisherKeyLabel(event.target.value)} placeholder={t("plugins.remote.keyLabel")} />
+            <div className="grid grid-cols-2 gap-1.5">
+              <input className={cn(inputClass, "font-mono text-[9.5px]")} value={publisherKeyValidFrom} onChange={(event) => setPublisherKeyValidFrom(event.target.value)} placeholder={t("plugins.remote.validFrom")} />
+              <input className={cn(inputClass, "font-mono text-[9.5px]")} value={publisherKeyValidUntil} onChange={(event) => setPublisherKeyValidUntil(event.target.value)} placeholder={t("plugins.remote.validUntil")} />
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              loading={addPublisherKey.isPending}
+              disabled={!keyPublisherId || !publisherKeyId.trim() || !publisherPublicKey.trim()}
+              onClick={() => addPublisherKey.mutate()}
+            >
+              {t("plugins.remote.addPublisherKeyAction")}
+            </Button>
+          </div>
+        </Panel>
+
+        <Panel className="min-w-0 p-4">
+          <div className="flex items-center gap-2">
+            <Fingerprint className="h-4 w-4 text-accent" />
+            <h2 className="text-sm font-semibold text-ink">
+              {t("plugins.remote.publishers")}
+            </h2>
+            <span className="ml-auto font-mono text-[10px] text-faint">
+              {publisherList.length}
+            </span>
+          </div>
+          {publishers.isLoading ? (
+            <p className="mt-2 text-xs text-muted">{t("common.loading")}</p>
+          ) : publisherList.length === 0 ? (
+            <p className="mt-2 text-xs text-muted">{t("plugins.remote.noPublishers")}</p>
+          ) : (
+            <div className="mt-2 grid gap-2">
+              {publisherList.map((publisher: MarketplacePublisher) => (
+                <div key={publisher.id} className="rounded-sm border border-line px-2.5 py-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-[10.5px] text-ink">{publisher.id}</span>
+                    <span className="text-[11px] text-muted">{publisher.name}</span>
+                    <Badge tone={publisher.status === "active" ? "success" : "warning"}>
+                      {publisher.status}
+                    </Badge>
+                  </div>
+                  <div className="mt-1 grid gap-1">
+                    {publisher.keys.map((key) => (
+                      <div key={key.keyId} className="flex flex-wrap items-center gap-1.5 rounded-sm bg-panel-2 px-2 py-1">
+                        <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-faint">
+                          {key.keyId} · {key.label}
+                        </span>
+                        {key.revokedAt ? (
+                          <Badge tone="danger">{t("plugins.remote.revoked")}</Badge>
+                        ) : (
+                          <Button
+                            size="xs"
+                            variant="ghost"
+                            loading={
+                              revokePublisherKey.isPending &&
+                              revokePublisherKey.variables?.id === publisher.id &&
+                              revokePublisherKey.variables?.keyId === key.keyId
+                            }
+                            onClick={() =>
+                              revokePublisherKey.mutate({ id: publisher.id, keyId: key.keyId })
+                            }
+                          >
+                            {t("plugins.remote.revoke")}
+                          </Button>
+                        )}
+                      </div>
+                    ))}
+                    {publisher.keys.length === 0 ? (
+                      <p className="text-[9.5px] text-faint">
+                        {t("plugins.remote.noPublisherKeys")}
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Panel>
+      </div>
+    </div>
   );
 }
 

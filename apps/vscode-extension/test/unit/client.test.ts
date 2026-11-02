@@ -219,6 +219,33 @@ describe("RuntimeClient request construction", () => {
     expect(call?.init.method).toBe("POST");
     expect(JSON.parse(String(call?.init.body))).toEqual({ path: "/tmp/skills/demo" });
   });
+
+  it("builds remote marketplace source, scan and install requests", async () => {
+    const { calls, fetchImpl } = installFetch((url, init) => {
+      if (url.endsWith("/sources")) return jsonResponse({ sources: [] });
+      if (url.endsWith("/refresh")) return jsonResponse({ sourceId: "source/one" });
+      if (url.includes("/vulnerabilities/")) {
+        return jsonResponse({ status: "clean", vulnerabilities: [] });
+      }
+      if (init?.method === "POST") return jsonResponse({ plugin: { id: "plugin.one" } });
+      return jsonResponse({});
+    });
+    const client = createClient(fetchImpl);
+
+    await client.listMarketplaceSources();
+    await client.refreshMarketplaceSource("source/one");
+    await client.marketplaceVulnerability("plugin.one", "1.0.0");
+    await client.installRemoteMarketplacePackage("source/one", "plugin.one", "1.0.0");
+
+    expect(calls.map((call) => call.url)).toEqual([
+      "http://127.0.0.1:8787/api/marketplace/sources",
+      "http://127.0.0.1:8787/api/marketplace/sources/source%2Fone/refresh",
+      "http://127.0.0.1:8787/api/marketplace/vulnerabilities/plugin.one/1.0.0",
+      "http://127.0.0.1:8787/api/marketplace/remote/source%2Fone/plugin.one/versions/1.0.0/install",
+    ]);
+    expect(calls[1]?.init.method).toBe("POST");
+    expect(calls[3]?.init.method).toBe("POST");
+  });
 });
 
 describe("RuntimeClient streaming", () => {
@@ -260,5 +287,29 @@ describe("RuntimeClient streaming", () => {
 
     expect(error).toBeInstanceOf(RuntimeApiError);
     expect(error).toMatchObject({ status: 503, code: "HTTP_ERROR" });
+  });
+
+  it("resumes marketplace events with Last-Event-ID", async () => {
+    const payload =
+      'event: marketplace\nid: 8\ndata: {"sequence":8,"id":"evt-8","at":"2026-11-02T00:00:00Z","kind":"marketplace.remote_withdrawn","detail":{"reason":"advisory"}}\n\n';
+    const { calls, fetchImpl } = installFetch(
+      () =>
+        new Response(payload, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        }),
+    );
+    const client = createClient(fetchImpl);
+    const events: number[] = [];
+
+    await client.streamMarketplaceEvents(7, (event) => {
+      events.push(event.sequence);
+    });
+
+    expect(events).toEqual([8]);
+    expect(calls[0]?.url).toBe(
+      "http://127.0.0.1:8787/api/marketplace/events/stream?since=7",
+    );
+    expect(new Headers(calls[0]?.init.headers).get("last-event-id")).toBe("7");
   });
 });

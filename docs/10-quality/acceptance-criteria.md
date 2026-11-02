@@ -1,6 +1,8 @@
 # 验收标准
 
 > 每个 Phase 的退出标准必须可执行、可复现。未达标的项写“未做”，不得用文档/占位符冒充完成。
+>
+> 下表保留原完整路线图退出标准；当前本地实现的实际范围与剩余项见 [实现状态与验收边界](implementation-status.md)。
 
 ## Phase 0：Research & Architecture
 
@@ -104,6 +106,64 @@
 - 许可证只查根许可证；EE/专有内容混入。
 - 文档计数/链接/字段与实现不一致。
 - 未验证的 AI 生成流程可发布/执行。
+
+## Phase 7～12 增量本地验收
+
+这些 Phase 是 Phase 6 后增加的本地增量，不替代上面的完整 SaaS/云端退出标准。
+
+| 编号 | 本地标准 | 验证 |
+| --- | --- | --- |
+| P7-L01 | 扩展构建、单元测试并在真实 Runtime 在线时执行全部 Host 检查 | VSIX/Extension Host |
+| P7-L02 | Runtime、MCP、Skill 安装和未信任工作区边界可回归 | Host/负向检查 |
+| P8-L01 | start/events/complete 在发网前持久化，进程重启后排空 | outbox 重启/HTTP 集成 |
+| P8-L02 | 过期/旧 lease 上报拒绝并清理，不能污染新 lease | 409 集成 |
+| P8-L03 | 远程审批 SLA 到点按 `onTimeout` 恢复并重排 | 真实 daemon E2E |
+| P13-SCHED-01 | 两个 Scheduler 实例只有一个 leader，standby 不执行 schedule | 双进程 PostgreSQL |
+| P13-SCHED-02 | leader 被强杀后 standby 在 TTL 内接管；旧 leader 重启不能形成双 leader | 强杀/接管测试 |
+| P9-L01 | OIDC Code+PKCE、state/nonce、session/CSRF、登出与三种签名算法 | mock IdP + HTTP/浏览器 |
+| P10-L01 | OAuth Code+PKCE、DCR、同意、refresh 轮换、吊销、内省、JWKS | API + Playwright |
+| P11-L01 | schedule、webhook、event 均只能运行已发布版本 | 契约/HTTP |
+| P11-L02 | webhook/event 事件 ID 幂等，停用与错误签名拒绝 | 负向集成 |
+| P13-EVENT-01 | topic 多订阅者部分成功后，同一 Event ID 只补投缺失订阅者 | Scheduler 负向集成 |
+| P13-TRIGGER-01 | `HPA_POSTGRES_RUNTIME=1` 时 publish state、due/claim、启停、trigger fire 与 execution 写 PostgreSQL | 真实 PG + API |
+| P13-TRIGGER-02 | topic 发布重复 Event ID 返回 409，PostgreSQL trigger fire 不新增 | 真实 `hpa serve` E2E |
+| P13-EVENT-02 | Topic Event 经 PostgreSQL outbox queued→processed；崩溃可重投，API 不等待执行 | 真实 PG + 异步 consumer |
+| P13-EVENT-03 | 相同 Event ID/payload 返回 duplicate，不同 payload 冲突；最终只有一条 fire/execution | 负向 E2E |
+| P13-EVENT-04 | PostgreSQL execution、start event、trigger fire 原子提交；重复 fire 不留下孤立 execution | 真实 PG 事务测试 |
+| P12-L01 | Prometheus、readiness、执行时间线在 1440/607 可读取 | API + Playwright |
+| P12-L02 | 企业指标鉴权与探针公开边界 | 企业 HTTP |
+| P13-SCIM-01 | 仅租户 `hpa_ent_` owner/admin 或 platform admin 可读写 Users/Groups，跨租户 ID 不可解析 | HTTP 负向矩阵 |
+| P13-SCIM-02 | Users/Groups CRUD、精确 filter、分页、PATCH 与 ETag 语义完整 | HTTP + E2E |
+| P13-SCIM-03 | 不同角色映射组冲突整事务失败；删除组恢复直接角色；admin 不能改动 owner 记录 | 负向集成 |
+| P13-SCIM-04 | 旧 SQLite 成员 schema 无损升级，PostgreSQL RLS/复合外键/导入可重复 | migration + 真实 PG |
+| P13-SCIM-05 | 至少一个真实企业 IdP 完成 SCIM 推送和 token 轮换 | `BLOCKED_EXTERNAL` |
+| P13-MCP-01 | session/subscription/notification/task 在 PostgreSQL 中租户、token、TTL 隔离 | 真实 PG 负向测试 |
+| P13-MCP-02 | `tasks/get/update` 跨节点读取持久任务，取消命令按 owner node/lease 消费 | 双进程集成 |
+| P13-MCP-03 | 强停 task owner 后命令不丢，重启恢复并跨节点触发 tasks SSE | 双进程强停测试 |
+| P13-MCP-04 | 至少两个真实 MCP 客户端完成工具调用矩阵 | `BLOCKED_EXTERNAL` |
+| P13-MCP-05 | 持久通知 backlog 有界；慢消费者断开；窗口内按 `Last-Event-ID` 重放 | 真实 PG + HTTP SSE |
+| P13-MCP-06 | 官方 2025-11-25 核心 server 场景通过；测试夹具仅在显式测试模式启用 | `pnpm test:mcp-conformance` 9/9 |
+| P13-MCP-07 | 官方 2026-07-28 server conformance | `BLOCKED_EXTERNAL`（工具链尚无场景） |
+| P13-EXEC-01 | `HPA_POSTGRES_RUNTIME=1` 时 API/Runtime 的 execution、events、artifact 写入 PostgreSQL | 真实 PG + `hpa serve` |
+| P13-EXEC-02 | 强停并重启后 execution/events 仍可由 API 读取；workflow snapshot、state tenant、event execution 冲突失败关闭 | 重启 E2E + 负向测试 |
+| P13-EXEC-04 | PostgreSQL 模式同步 remote execution marker，local recovery 不接管远程执行 | 真实 PG 负向测试 |
+| P13-EXEC-05 | 每日执行与并发配额按 PostgreSQL execution 计数，不读取旧 SQLite 表 | Repository 测试 |
+| P13-EXEC-06 | execution lease 过期后另一节点接管，旧 holder 的 state commit/release 被拒绝 | 真实 PG fencing 测试 |
+| P13-EXEC-07 | 空 data_dir 节点从 PG 恢复 running execution、执行并释放 lease | 进程级 E2E |
+| P13-WORKFLOW-01 | `HPA_POSTGRES_RUNTIME=1` 时 draft/publish/list/get/version 全部走 PostgreSQL | 真实 PG Store + API |
+| P13-WORKFLOW-02 | 相同 workflow/version 内容变化失败关闭；新版本可发布；跨租户不可见 | 负向集成 |
+| P13-EXEC-03 | Workflow、Trigger、Enterprise、Worker、Agent 等全部生产 Repository 切换 PostgreSQL | `IN_PROGRESS` |
+| P13-MARKET-01 | 远程 source/publisher/key/package 可在 Web 管理并安装 | API + Playwright |
+| P13-MARKET-02 | 1440/607 无溢出，source/publisher axe serious/critical=0 | Playwright + axe |
+| P13-MARKET-03 | 在线 OSV/离线漏洞库、key-based Sigstore bundle + OCI digest provenance、Web/VS Code Remote UI、持久 SSE 撤回推送；Fulcio/Rekor keyless、Registry attestation 拉取与跨控制面 federation | 部分完成 |
+| P13-OTLP-01 | Rust/Python traces、metrics、logs 到达真实 HTTP receiver，跨进程 W3C traceparent 串联 | Rust/Python OTLP 测试 |
+| P13-OTLP-02 | Collector 故障隔离、导出队列有界、ready/API 不被阻塞 | Collector 停机测试 |
+| P13-OTLP-03 | error/latency/probabilistic tail sampling 有界；三信号删除已知敏感属性；配置有自动门禁 | `check:otel` + Collector 配置 |
+| P13-OTLP-04 | 真实 HA Collector、traceID 一致路由、压测与容量评审 | `BLOCKED_EXTERNAL` |
+| Q-L01 | 干净环境有锁文件、可执行浏览器依赖、CI 与供应链门禁 | `pnpm check`/CI |
+| Q-L02 | 强制杀进程后运行中 Workflow 从检查点恢复 | 独立进程恢复测试 |
+| Q-L03 | 关键页面 serious/critical axe 为 0，首个 Tab 可离开 body | Playwright + axe |
+| Q-L04 | 包下载使用国内镜像；容器镜像使用 DaoCloud 且固定 digest；权威漏洞源作为显式例外 | `pnpm check:mirrors` |
 
 ## 相关文档
 

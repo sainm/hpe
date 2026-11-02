@@ -58,9 +58,12 @@ const signingKeys = {
 
 const activeKey = signingKeys[alg];
 const codes = new Map();
+const refreshTokens = new Map();
 const codeTtlMs = 60_000;
+const refreshTtlMs = 24 * 60 * 60 * 1000;
 let issuer = "";
 let sequence = 0;
+let refreshSequence = 0;
 
 function encode(value) {
   return Buffer.from(JSON.stringify(value)).toString("base64url");
@@ -85,7 +88,7 @@ function signJwt(payload) {
 
 function idToken(nonce) {
   const now = Math.floor(Date.now() / 1000);
-  return signJwt({
+  const claims = {
     iss: issuer,
     aud: audienceClaim,
     sub: subject,
@@ -93,10 +96,25 @@ function idToken(nonce) {
     role,
     email,
     name: "Browser Admin",
-    nonce,
     iat: now,
     exp: now + 300,
-  });
+  };
+  if (nonce) claims.nonce = nonce;
+  return signJwt(claims);
+}
+
+function issueTokenSet(nonce) {
+  refreshSequence += 1;
+  const refreshToken = `mock-refresh-${refreshSequence}`;
+  refreshTokens.set(refreshToken, Date.now() + refreshTtlMs);
+  return {
+    access_token: `mock-access-${refreshSequence}`,
+    token_type: "Bearer",
+    id_token: idToken(nonce),
+    expires_in: 300,
+    refresh_token: refreshToken,
+    refresh_expires_in: refreshTtlMs / 1000,
+  };
 }
 
 function sendJson(res, status, body) {
@@ -158,6 +176,9 @@ function purgeCodes() {
   const now = Date.now();
   for (const [code, flow] of codes) {
     if (flow.expiresAt <= now) codes.delete(code);
+  }
+  for (const [token, expiresAt] of refreshTokens) {
+    if (expiresAt <= now) refreshTokens.delete(token);
   }
 }
 
@@ -249,8 +270,23 @@ async function handleToken(req, res) {
   }
 
   const form = new URLSearchParams(raw);
-  if (form.get("grant_type") !== "authorization_code") {
-    return oauthError(res, 400, "unsupported_grant_type", "grant_type must be authorization_code");
+  const grantType = form.get("grant_type");
+  if (grantType === "refresh_token") {
+    const refreshToken = form.get("refresh_token") || "";
+    const tokenClientId = form.get("client_id") || "";
+    if (!refreshToken || tokenClientId !== clientId) {
+      return oauthError(res, 400, "invalid_grant", "refresh token or client_id is invalid");
+    }
+    const expiresAt = refreshTokens.get(refreshToken);
+    if (!expiresAt || expiresAt <= Date.now()) {
+      refreshTokens.delete(refreshToken);
+      return oauthError(res, 400, "invalid_grant", "refresh token is invalid or already used");
+    }
+    refreshTokens.delete(refreshToken);
+    return sendJson(res, 200, issueTokenSet());
+  }
+  if (grantType !== "authorization_code") {
+    return oauthError(res, 400, "unsupported_grant_type", "grant_type is not supported");
   }
   const code = form.get("code") || "";
   const redirectUri = form.get("redirect_uri") || "";
@@ -283,12 +319,35 @@ async function handleToken(req, res) {
     return oauthError(res, 400, "invalid_grant", "code_verifier does not match code_challenge");
   }
 
-  sendJson(res, 200, {
-    access_token: "mock",
-    token_type: "Bearer",
-    id_token: idToken(flow.nonce),
-    expires_in: 300,
+  sendJson(res, 200, issueTokenSet(flow.nonce));
+}
+
+function handleLogout(res, url) {
+  const params = url.searchParams;
+  const state = params.get("state") || "";
+  const tokenClientId = params.get("client_id") || "";
+  const idTokenHint = params.get("id_token_hint") || "";
+  const redirectUri = params.get("post_logout_redirect_uri") || "";
+  if (!state || state.length > 512) {
+    return oauthError(res, 400, "invalid_request", "state is required");
+  }
+  if (tokenClientId !== clientId) {
+    return oauthError(res, 400, "unauthorized_client", "client_id is not recognized");
+  }
+  if (idTokenHint.split(".").length !== 3) {
+    return oauthError(res, 400, "invalid_request", "id_token_hint is required");
+  }
+  if (!isLoopbackRedirect(redirectUri)) {
+    return oauthError(res, 400, "invalid_request", "post_logout_redirect_uri must be loopback");
+  }
+  const target = new URL(redirectUri);
+  target.searchParams.set("state", state);
+  res.writeHead(302, {
+    location: target.toString(),
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
   });
+  res.end();
 }
 
 function handleRequest(req, res) {
@@ -305,13 +364,14 @@ function handleRequest(req, res) {
       issuer,
       authorization_endpoint: `${issuer}/authorize`,
       token_endpoint: `${issuer}/token`,
+      end_session_endpoint: `${issuer}/logout`,
       jwks_uri: `${issuer}/jwks`,
       response_types_supported: ["code"],
       code_challenge_methods_supported: ["S256"],
       id_token_signing_alg_values_supported: ["EdDSA", "RS256", "ES256"],
       subject_types_supported: ["public"],
-      scopes_supported: ["openid", "email", "profile"],
-      grant_types_supported: ["authorization_code"],
+      scopes_supported: ["openid", "email", "profile", "offline_access"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
       token_endpoint_auth_methods_supported: ["none"],
     });
   }
@@ -329,6 +389,10 @@ function handleRequest(req, res) {
     return handleAuthorize(res, url);
   }
 
+  if (req.method === "GET" && path === "/logout") {
+    return handleLogout(res, url);
+  }
+
   if (req.method === "POST" && path === "/token") {
     return handleToken(req, res);
   }
@@ -343,10 +407,11 @@ function handleRequest(req, res) {
       jwksUri: `${issuer}/jwks`,
       authorizationEndpoint: `${issuer}/authorize`,
       tokenEndpoint: `${issuer}/token`,
+      endSessionEndpoint: `${issuer}/logout`,
     });
   }
 
-  if (path === "/authorize" || path === "/token" || path === "/jwks") {
+  if (path === "/authorize" || path === "/token" || path === "/jwks" || path === "/logout") {
     res.setHeader("allow", path === "/token" ? "POST" : "GET");
     return oauthError(res, 405, "invalid_request", "method not allowed");
   }

@@ -1,8 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import playwright from "file:///Users/sainm/work/demo/BootDoc/node_modules/playwright/index.js";
-
-const { chromium } = playwright;
+import { chromium } from "playwright";
 
 const baseUrl = (process.env.HPA_BASE_URL || "http://127.0.0.1:8787").replace(/\/+$/, "");
 const outDir = process.env.HPA_SHOT_DIR || "docs/assets/phase12";
@@ -118,11 +116,11 @@ async function main() {
   summary.metrics = {
     status: metrics.status,
     contentType: metrics.headers.get("content-type"),
-    hasExecutionCounter: /hpa_workflow_executions_total\{status="succeeded",tenant="local"\} \d+/.test(text),
+    hasExecutionCounter: /hpa_workflow_executions_total\{status="succeeded"\} \d+/.test(text),
     hasNodeHistogram: /hpa_node_seconds_bucket\{type="transform",le="\+Inf"\}/.test(text),
     hasSchedulerTick: text.includes("hpa_scheduler_last_tick_timestamp_seconds"),
     hasRoute: text.includes(`route="/api/executions/{id}"`),
-    workflowGauge: /hpa_workflows_total\{tenant="local"\} \d+/.exec(text)?.[0] ?? null,
+    workflowGauge: /hpa_workflows_total \d+/.exec(text)?.[0] ?? null,
   };
   for (const [key, value] of Object.entries(summary.metrics)) {
     if (typeof value === "boolean" && !value) fail(`metrics missing ${key}`);

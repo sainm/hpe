@@ -22,6 +22,8 @@
 | [0018](0018-expression-engine.md) | 表达式引擎采用 jq/jaq 子集 | 已接受 |
 | [0019](0019-vscode-copilot-integration.md) | VS Code + GitHub Copilot 作为增量集成入口 | 已接受（增量模块） |
 | [0020](0020-permanent-internal-id-hpa.md) | hpa 作为永久内部 ID | 已接受 |
+| [0021](0021-oauth-protocol-boundary.md) | OAuth 扩展由企业 IdP/网关承担 | 已接受（外部网关） |
+| [0022](0022-enterprise-transport-and-secrets.md) | mTLS/PKI/Secret Manager 部署边界 | 已接受（外部环境） |
 
 ## 说明
 

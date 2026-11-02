@@ -3247,6 +3247,8 @@ function OidcSection({ enabled }: { enabled: boolean }) {
   const [authorizationEndpoint, setAuthorizationEndpoint] = useState("");
   const [tokenEndpoint, setTokenEndpoint] = useState("");
   const [redirectUri, setRedirectUri] = useState("");
+  const [endSessionEndpoint, setEndSessionEndpoint] = useState("");
+  const [postLogoutRedirectUri, setPostLogoutRedirectUri] = useState("");
   const [scopes, setScopes] = useState("openid email profile");
   const [adminSubjects, setAdminSubjects] = useState("");
   const [cookieSecure, setCookieSecure] = useState(false);
@@ -3276,6 +3278,8 @@ function OidcSection({ enabled }: { enabled: boolean }) {
     setAuthorizationEndpoint(data.authorizationEndpoint ?? "");
     setTokenEndpoint(data.tokenEndpoint ?? "");
     setRedirectUri(data.redirectUri ?? "");
+    setEndSessionEndpoint(data.endSessionEndpoint ?? "");
+    setPostLogoutRedirectUri(data.postLogoutRedirectUri ?? "");
     setScopes((data.scopes ?? []).join("\n"));
     setAdminSubjects((data.adminSubjects ?? []).join("\n"));
     setCookieSecure(Boolean(data.cookieSecure));
@@ -3286,6 +3290,8 @@ function OidcSection({ enabled }: { enabled: boolean }) {
     mutationFn: () => {
       const resolvedRedirectUri =
         redirectUri.trim() || `${window.location.origin}/auth/oidc/callback`;
+      const resolvedPostLogoutRedirectUri =
+        postLogoutRedirectUri.trim() || `${window.location.origin}/auth/oidc/logout/callback`;
       return api.enterpriseSaveOidc({
         issuer: issuer.trim(),
         audience: audience.trim(),
@@ -3295,6 +3301,8 @@ function OidcSection({ enabled }: { enabled: boolean }) {
         authorizationEndpoint: authorizationEndpoint.trim(),
         tokenEndpoint: tokenEndpoint.trim(),
         redirectUri: resolvedRedirectUri,
+        endSessionEndpoint: endSessionEndpoint.trim(),
+        postLogoutRedirectUri: endSessionEndpoint.trim() ? resolvedPostLogoutRedirectUri : "",
         scopes: splitScopes(scopes),
         adminSubjects: splitLines(adminSubjects),
         cookieSecure,
@@ -3310,6 +3318,8 @@ function OidcSection({ enabled }: { enabled: boolean }) {
       setAuthorizationEndpoint(result.authorizationEndpoint ?? "");
       setTokenEndpoint(result.tokenEndpoint ?? "");
       setRedirectUri(result.redirectUri ?? "");
+      setEndSessionEndpoint(result.endSessionEndpoint ?? "");
+      setPostLogoutRedirectUri(result.postLogoutRedirectUri ?? "");
       setScopes((result.scopes ?? []).join("\n"));
       setAdminSubjects((result.adminSubjects ?? []).join("\n"));
       setCookieSecure(Boolean(result.cookieSecure));
@@ -3427,6 +3437,28 @@ function OidcSection({ enabled }: { enabled: boolean }) {
                 value={redirectUri}
                 onChange={(event) => setRedirectUri(event.target.value)}
                 placeholder={`${window.location.origin}/auth/oidc/callback`}
+              />
+            </Field>
+            <Field
+              label={t("enterprise.oidc.endSessionEndpoint")}
+              hint={t("enterprise.oidc.endSessionEndpointHint")}
+            >
+              <input
+                className={cn(inputClass, "font-mono text-[11px]")}
+                value={endSessionEndpoint}
+                onChange={(event) => setEndSessionEndpoint(event.target.value)}
+                placeholder="https://issuer.example.com/logout"
+              />
+            </Field>
+            <Field
+              label={t("enterprise.oidc.postLogoutRedirectUri")}
+              hint={t("enterprise.oidc.postLogoutRedirectUriHint")}
+            >
+              <input
+                className={cn(inputClass, "font-mono text-[11px]")}
+                value={postLogoutRedirectUri}
+                onChange={(event) => setPostLogoutRedirectUri(event.target.value)}
+                placeholder={`${window.location.origin}/auth/oidc/logout/callback`}
               />
             </Field>
             <Field label={t("enterprise.oidc.scopes")} hint={t("enterprise.oidc.scopesHint")}>

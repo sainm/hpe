@@ -1,15 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signature as Ed25519Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use futures_util::StreamExt;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::{FromRow, Row};
 use tar::{Archive, Builder, Header};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -26,6 +28,217 @@ pub const MANIFEST_FILE: &str = "hpa.plugin.json";
 pub const MAX_PLUGIN_FILES: usize = 500;
 pub const MAX_PLUGIN_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_PLUGIN_FILE_BYTES: usize = 5 * 1024 * 1024;
+pub const OSV_QUERY_URL: &str = "https://api.osv.dev/v1/query";
+
+#[derive(Debug, Clone)]
+pub enum VulnerabilitySource {
+    Disabled,
+    Offline {
+        path: PathBuf,
+        max_age_hours: i64,
+    },
+    Osv {
+        endpoint: String,
+        ecosystem: Option<String>,
+    },
+    Invalid(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum CosignTrust {
+    Key(PathBuf),
+    Keyless {
+        certificate_identity: String,
+        oidc_issuer: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum ProvenanceVerifier {
+    Disabled,
+    Cosign { binary: PathBuf, trust: CosignTrust },
+    Invalid(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ProvenanceConfig {
+    pub required: bool,
+    pub verifier: ProvenanceVerifier,
+}
+
+impl ProvenanceConfig {
+    pub fn from_environment() -> Self {
+        let required = std::env::var("HPA_REQUIRE_PROVENANCE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "required"))
+            .unwrap_or(false);
+        let Some(binary) = std::env::var_os("HPA_COSIGN_BIN").map(PathBuf::from) else {
+            return Self {
+                required,
+                verifier: ProvenanceVerifier::Disabled,
+            };
+        };
+        let public_key = std::env::var_os("HPA_COSIGN_PUBLIC_KEY").map(PathBuf::from);
+        let certificate_identity = std::env::var("HPA_COSIGN_CERTIFICATE_IDENTITY").ok();
+        let oidc_issuer = std::env::var("HPA_COSIGN_OIDC_ISSUER").ok();
+        let trust = match (public_key, certificate_identity, oidc_issuer) {
+            (Some(public_key), None, None) => CosignTrust::Key(public_key),
+            (None, Some(certificate_identity), Some(oidc_issuer))
+                if !certificate_identity.trim().is_empty() && !oidc_issuer.trim().is_empty() =>
+            {
+                CosignTrust::Keyless {
+                    certificate_identity,
+                    oidc_issuer,
+                }
+            }
+            _ => {
+                return Self {
+                    required,
+                    verifier: ProvenanceVerifier::Invalid(
+                        "configure exactly one cosign trust mode: public key, or keyless identity plus OIDC issuer"
+                            .to_string(),
+                    ),
+                };
+            }
+        };
+        Self {
+            required,
+            verifier: ProvenanceVerifier::Cosign { binary, trust },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemotePackageProvenance {
+    kind: String,
+    statement_path: String,
+    statement_sha256: String,
+    bundle_path: String,
+    bundle_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemotePackageOci {
+    repository: String,
+    digest: String,
+}
+
+impl VulnerabilitySource {
+    pub fn from_environment(data_dir: &Path) -> Self {
+        match std::env::var("HPA_VULNERABILITY_SOURCE")
+            .unwrap_or_else(|_| "disabled".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "disabled" => Self::Disabled,
+            "offline" => {
+                let raw = std::env::var("HPA_VULNERABILITY_DB").unwrap_or_default();
+                if raw.trim().is_empty() {
+                    return Self::Invalid(
+                        "HPA_VULNERABILITY_DB is required for offline vulnerability checks"
+                            .to_string(),
+                    );
+                }
+                let path = PathBuf::from(raw);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    data_dir.join(path)
+                };
+                let max_age_hours = std::env::var("HPA_VULNERABILITY_MAX_AGE_HOURS")
+                    .ok()
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(24)
+                    .clamp(1, 720);
+                Self::Offline {
+                    path,
+                    max_age_hours,
+                }
+            }
+            "osv" | "online" => Self::Osv {
+                endpoint: std::env::var("HPA_OSV_URL")
+                    .unwrap_or_else(|_| OSV_QUERY_URL.to_string()),
+                ecosystem: std::env::var("HPA_OSV_ECOSYSTEM")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty()),
+            },
+            other => Self::Invalid(format!("unsupported HPA_VULNERABILITY_SOURCE `{other}`")),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OfflineVulnerabilityDb {
+    schema_version: String,
+    generated_at: String,
+    records: Vec<OfflineAdvisory>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OfflineAdvisory {
+    id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    modified: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    affected: Vec<OfflineAffected>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfflineAffected {
+    package: OfflinePackage,
+    #[serde(default)]
+    ranges: Vec<OfflineRange>,
+    #[serde(default)]
+    versions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfflinePackage {
+    ecosystem: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfflineRange {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    events: Vec<OfflineRangeEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OfflineRangeEvent {
+    #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
+    fixed: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvQueryResponse {
+    #[serde(default)]
+    vulns: Vec<OsvAdvisory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvAdvisory {
+    id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    modified: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+}
 
 #[derive(Debug, Error)]
 pub enum PluginError {
@@ -253,6 +466,86 @@ pub struct TrustedKeyRow {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoteMarketplaceIndex {
+    schema_version: String,
+    source_id: String,
+    sequence: i64,
+    generated_at: String,
+    #[serde(default)]
+    packages: Vec<RemoteMarketplacePackage>,
+    #[serde(default)]
+    withdrawals: Vec<RemoteMarketplaceWithdrawal>,
+    signature: RemoteMarketplaceSignature,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoteMarketplacePackage {
+    plugin_id: String,
+    version: String,
+    path: String,
+    sha256: String,
+    publisher_id: String,
+    signer_key_id: String,
+    review_status: String,
+    published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provenance: Option<RemotePackageProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oci: Option<RemotePackageOci>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoteMarketplaceWithdrawal {
+    plugin_id: String,
+    version: String,
+    reason: String,
+    at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoteMarketplaceSignature {
+    algorithm: String,
+    key_id: String,
+    public_key: String,
+    value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteMarketplacePayload {
+    schema_version: String,
+    source_id: String,
+    sequence: i64,
+    generated_at: String,
+    packages: Vec<RemoteMarketplacePackage>,
+    withdrawals: Vec<RemoteMarketplaceWithdrawal>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct RemoteMarketplacePackageRow {
+    source_id: String,
+    plugin_id: String,
+    version: String,
+    publisher_id: String,
+    signer_key_id: String,
+    package_sha256: String,
+    package_path: String,
+    review_status: String,
+    index_sequence: i64,
+    published_at: Option<String>,
+    withdrawn_at: Option<String>,
+    revocation_reason: Option<String>,
+    provenance_json: Option<String>,
+    oci_json: Option<String>,
+}
+
+type RegisteredKeyMaterial = (String, Option<String>, Option<String>, Option<String>);
+
 #[derive(Debug, Clone, FromRow)]
 pub struct PluginEventRow {
     pub id: String,
@@ -291,6 +584,8 @@ pub struct PluginService {
     pub data_dir: PathBuf,
     pub skills: SkillService,
     pub connectors: ConnectorRuntime,
+    vulnerability_source: VulnerabilitySource,
+    provenance_config: ProvenanceConfig,
 }
 
 impl PluginService {
@@ -300,11 +595,184 @@ impl PluginService {
         skills: SkillService,
         connectors: ConnectorRuntime,
     ) -> Self {
+        let vulnerability_source = VulnerabilitySource::from_environment(&data_dir);
+        let provenance_config = ProvenanceConfig::from_environment();
         Self {
             db,
             data_dir,
             skills,
             connectors,
+            vulnerability_source,
+            provenance_config,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_vulnerability_source(mut self, source: VulnerabilitySource) -> Self {
+        self.vulnerability_source = source;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_provenance_config(mut self, config: ProvenanceConfig) -> Self {
+        self.provenance_config = config;
+        self
+    }
+
+    pub async fn vulnerability_report(
+        &self,
+        plugin_id: &str,
+        version: &str,
+    ) -> Result<Value, PluginError> {
+        validate_identifier(plugin_id, "plugin id")?;
+        let parsed_version = Version::parse(version)
+            .map_err(|error| PluginError::Invalid(format!("invalid plugin version: {error}")))?;
+        match &self.vulnerability_source {
+            VulnerabilitySource::Disabled => Ok(json!({
+                "schemaVersion": "hpa.vulnerability-report/v1",
+                "status": "disabled",
+                "source": "disabled",
+                "checkedAt": now_rfc3339(),
+                "databaseGeneratedAt": null,
+                "package": {"ecosystem": "HPA", "name": plugin_id, "version": version},
+                "query": {"ecosystem": null, "name": plugin_id, "version": version},
+                "vulnerabilities": []
+            })),
+            VulnerabilitySource::Invalid(message) => Err(PluginError::Invalid(message.clone())),
+            VulnerabilitySource::Offline {
+                path,
+                max_age_hours,
+            } => {
+                let metadata = tokio::fs::metadata(path).await?;
+                if metadata.len() > 20 * 1024 * 1024 {
+                    return Err(PluginError::Invalid(
+                        "offline vulnerability database exceeds 20 MiB".to_string(),
+                    ));
+                }
+                let bytes = tokio::fs::read(path).await?;
+                let database: OfflineVulnerabilityDb = serde_json::from_slice(&bytes)?;
+                if database.schema_version != "hpa.vulnerability-db/v1" {
+                    return Err(PluginError::Invalid(
+                        "unsupported offline vulnerability database schema".to_string(),
+                    ));
+                }
+                if database.records.len() > 100_000 {
+                    return Err(PluginError::Invalid(
+                        "offline vulnerability database has too many records".to_string(),
+                    ));
+                }
+                let mut advisory_ids = BTreeSet::new();
+                for advisory in &database.records {
+                    if advisory.id.trim().is_empty()
+                        || advisory.id.len() > 256
+                        || !advisory_ids.insert(advisory.id.as_str())
+                    {
+                        return Err(PluginError::Invalid(
+                            "offline vulnerability database has an invalid or duplicate advisory id"
+                                .to_string(),
+                        ));
+                    }
+                }
+                let generated_at = OffsetDateTime::parse(&database.generated_at, &Rfc3339)
+                    .map_err(|error| {
+                        PluginError::Invalid(format!(
+                            "offline vulnerability database generatedAt is invalid: {error}"
+                        ))
+                    })?;
+                let age = OffsetDateTime::now_utc() - generated_at;
+                if age < -time::Duration::minutes(5) {
+                    return Err(PluginError::Forbidden(
+                        "offline vulnerability database generatedAt is in the future".to_string(),
+                    ));
+                }
+                if age > time::Duration::hours(*max_age_hours) {
+                    return Err(PluginError::Forbidden(format!(
+                        "offline vulnerability database is older than {max_age_hours} hours"
+                    )));
+                }
+                let vulnerabilities = database
+                    .records
+                    .iter()
+                    .filter(|advisory| advisory_affects(advisory, plugin_id, &parsed_version))
+                    .map(offline_advisory_value)
+                    .collect::<Vec<_>>();
+                Ok(vulnerability_report_value(
+                    "offline",
+                    plugin_id,
+                    version,
+                    vulnerabilities,
+                    Some(database.generated_at),
+                    Some("HPA"),
+                ))
+            }
+            VulnerabilitySource::Osv {
+                endpoint,
+                ecosystem,
+            } => {
+                validate_osv_endpoint(endpoint).await?;
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .no_proxy()
+                    .timeout(Duration::from_secs(20))
+                    .build()
+                    .map_err(|error| PluginError::Invalid(error.to_string()))?;
+                let mut package = json!({"name": plugin_id});
+                if let Some(ecosystem) = ecosystem {
+                    package["ecosystem"] = Value::String(ecosystem.clone());
+                }
+                let response = client
+                    .post(endpoint)
+                    .json(&json!({
+                        "package": package,
+                        "version": version
+                    }))
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        PluginError::Conflict(format!("OSV vulnerability query failed: {error}"))
+                    })?;
+                if !response.status().is_success() {
+                    return Err(PluginError::Conflict(format!(
+                        "OSV vulnerability query returned HTTP {}",
+                        response.status()
+                    )));
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|length| length > 2 * 1024 * 1024)
+                {
+                    return Err(PluginError::Invalid(
+                        "OSV vulnerability response exceeds 2 MiB".to_string(),
+                    ));
+                }
+                let bytes = response.bytes().await.map_err(|error| {
+                    PluginError::Conflict(format!("cannot read OSV response: {error}"))
+                })?;
+                if bytes.len() > 2 * 1024 * 1024 {
+                    return Err(PluginError::Invalid(
+                        "OSV vulnerability response exceeds 2 MiB".to_string(),
+                    ));
+                }
+                let body: OsvQueryResponse = serde_json::from_slice(&bytes)?;
+                if body.vulns.len() > 10_000 {
+                    return Err(PluginError::Invalid(
+                        "OSV vulnerability response contains too many records".to_string(),
+                    ));
+                }
+                let vulnerabilities = body
+                    .vulns
+                    .into_iter()
+                    .map(osv_advisory_value)
+                    .collect::<Vec<_>>();
+                Ok(vulnerability_report_value(
+                    "osv",
+                    plugin_id,
+                    version,
+                    vulnerabilities,
+                    None,
+                    ecosystem.as_deref(),
+                ))
+            }
         }
     }
 
@@ -430,6 +898,869 @@ impl PluginService {
                 })
             })
             .collect())
+    }
+
+    pub async fn marketplace_sources(&self) -> Result<Vec<Value>, PluginError> {
+        let rows = sqlx::query(
+            "SELECT id, label, index_uri, enabled, last_sequence, last_refresh_at,
+                    created_at, updated_at
+             FROM marketplace_sources
+             ORDER BY lower(id)",
+        )
+        .fetch_all(&self.db.pool)
+        .await?;
+        let mut sources = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source_id: String = row.get("id");
+            let keys = sqlx::query(
+                "SELECT key_id, label, valid_from, valid_until
+                 FROM marketplace_source_keys
+                 WHERE source_id = ? AND revoked_at IS NULL
+                 ORDER BY created_at DESC",
+            )
+            .bind(&source_id)
+            .fetch_all(&self.db.pool)
+            .await?;
+            let (package_count, approved_count, withdrawn_count): (i64, i64, i64) = sqlx::query_as(
+                "SELECT
+                         count(*),
+                         COALESCE(sum(CASE WHEN review_status = 'approved'
+                                           AND withdrawn_at IS NULL THEN 1 ELSE 0 END), 0),
+                         COALESCE(sum(CASE WHEN withdrawn_at IS NOT NULL THEN 1 ELSE 0 END), 0)
+                     FROM marketplace_remote_packages
+                     WHERE source_id = ?",
+            )
+            .bind(&source_id)
+            .fetch_one(&self.db.pool)
+            .await?;
+            sources.push(json!({
+                "id": source_id,
+                "label": row.get::<String, _>("label"),
+                "indexUri": row.get::<String, _>("index_uri"),
+                "enabled": row.get::<i64, _>("enabled") != 0,
+                "lastSequence": row.get::<i64, _>("last_sequence"),
+                "lastRefreshAt": row.get::<Option<String>, _>("last_refresh_at"),
+                "createdAt": row.get::<String, _>("created_at"),
+                "updatedAt": row.get::<String, _>("updated_at"),
+                "keys": keys.iter().map(|key| json!({
+                    "keyId": key.get::<String, _>("key_id"),
+                    "label": key.get::<String, _>("label"),
+                    "validFrom": key.get::<Option<String>, _>("valid_from"),
+                    "validUntil": key.get::<Option<String>, _>("valid_until"),
+                })).collect::<Vec<_>>(),
+                "packageCount": package_count,
+                "approvedCount": approved_count,
+                "withdrawnCount": withdrawn_count,
+            }));
+        }
+        Ok(sources)
+    }
+
+    pub async fn marketplace_publishers(&self) -> Result<Vec<Value>, PluginError> {
+        let rows = sqlx::query(
+            "SELECT id, name, status, created_at, updated_at
+             FROM plugin_publishers
+             ORDER BY lower(id)",
+        )
+        .fetch_all(&self.db.pool)
+        .await?;
+        let mut publishers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let publisher_id: String = row.get("id");
+            let keys = sqlx::query(
+                "SELECT key_id, label, valid_from, valid_until, revoked_at, created_at
+                 FROM plugin_publisher_keys
+                 WHERE publisher_id = ?
+                 ORDER BY created_at DESC",
+            )
+            .bind(&publisher_id)
+            .fetch_all(&self.db.pool)
+            .await?;
+            publishers.push(json!({
+                "id": publisher_id,
+                "name": row.get::<String, _>("name"),
+                "status": row.get::<String, _>("status"),
+                "createdAt": row.get::<String, _>("created_at"),
+                "updatedAt": row.get::<String, _>("updated_at"),
+                "keys": keys.iter().map(|key| json!({
+                    "keyId": key.get::<String, _>("key_id"),
+                    "label": key.get::<String, _>("label"),
+                    "validFrom": key.get::<Option<String>, _>("valid_from"),
+                    "validUntil": key.get::<Option<String>, _>("valid_until"),
+                    "revokedAt": key.get::<Option<String>, _>("revoked_at"),
+                    "createdAt": key.get::<String, _>("created_at"),
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        Ok(publishers)
+    }
+
+    pub async fn add_publisher(
+        &self,
+        publisher_id: &str,
+        name: &str,
+    ) -> Result<Value, PluginError> {
+        validate_identifier(publisher_id, "publisher id")?;
+        if name.trim().is_empty() {
+            return Err(PluginError::Invalid(
+                "publisher name is required".to_string(),
+            ));
+        }
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO plugin_publishers (id, name, status, created_at, updated_at)
+             VALUES (?, ?, 'active', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                updated_at = excluded.updated_at",
+        )
+        .bind(publisher_id)
+        .bind(name)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(json!({"publisherId": publisher_id, "name": name, "status": "active"}))
+    }
+
+    pub async fn add_publisher_key(
+        &self,
+        publisher_id: &str,
+        key_id: &str,
+        public_key: &str,
+        label: &str,
+        valid_from: Option<&str>,
+        valid_until: Option<&str>,
+    ) -> Result<Value, PluginError> {
+        decode_public_key(public_key)?;
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM plugin_publishers WHERE id = ? AND status = 'active'",
+        )
+        .bind(publisher_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        if exists.is_none() {
+            return Err(PluginError::NotFound(
+                "active publisher not found".to_string(),
+            ));
+        }
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO plugin_publisher_keys
+             (publisher_id, key_id, public_key, label, valid_from, valid_until, revoked_at, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
+             ON CONFLICT(publisher_id, key_id) DO UPDATE SET
+                public_key = excluded.public_key,
+                label = excluded.label,
+                valid_from = excluded.valid_from,
+                valid_until = excluded.valid_until,
+                revoked_at = NULL",
+        )
+        .bind(publisher_id)
+        .bind(key_id)
+        .bind(public_key)
+        .bind(label)
+        .bind(valid_from)
+        .bind(valid_until)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO plugin_trusted_keys (key_id, public_key, label, trust, created_at)
+             VALUES (?, ?, ?, 'verified', ?)
+             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key,
+                label = excluded.label, trust = 'verified'",
+        )
+        .bind(key_id)
+        .bind(public_key)
+        .bind(format!("{publisher_id}: {label}"))
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(json!({
+            "publisherId": publisher_id,
+            "keyId": key_id,
+            "status": "active",
+            "validFrom": valid_from,
+            "validUntil": valid_until,
+        }))
+    }
+
+    pub async fn revoke_publisher_key(
+        &self,
+        publisher_id: &str,
+        key_id: &str,
+    ) -> Result<Value, PluginError> {
+        let revoked = sqlx::query(
+            "UPDATE plugin_publisher_keys SET revoked_at = ?
+             WHERE publisher_id = ? AND key_id = ? AND revoked_at IS NULL",
+        )
+        .bind(now_rfc3339())
+        .bind(publisher_id)
+        .bind(key_id)
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        if !revoked {
+            return Err(PluginError::NotFound(
+                "active publisher key not found".to_string(),
+            ));
+        }
+        Ok(json!({"publisherId": publisher_id, "keyId": key_id, "revoked": true}))
+    }
+
+    pub async fn add_marketplace_source(
+        &self,
+        source_id: &str,
+        label: &str,
+        index_uri: &str,
+        key_id: &str,
+        public_key: &str,
+        key_label: &str,
+    ) -> Result<Value, PluginError> {
+        validate_identifier(source_id, "marketplace source id")?;
+        validate_remote_index_uri(index_uri)?;
+        decode_public_key(public_key)?;
+        let now = now_rfc3339();
+        sqlx::query(
+            "INSERT INTO marketplace_sources
+             (id, label, index_uri, enabled, last_sequence, last_refresh_at, created_at, updated_at)
+             VALUES (?, ?, ?, 1, 0, NULL, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET label = excluded.label,
+                index_uri = excluded.index_uri, enabled = 1, updated_at = excluded.updated_at",
+        )
+        .bind(source_id)
+        .bind(label)
+        .bind(index_uri)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO marketplace_source_keys
+             (source_id, key_id, public_key, label, valid_from, valid_until, revoked_at, created_at)
+             VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)
+             ON CONFLICT(source_id, key_id) DO UPDATE SET
+                public_key = excluded.public_key,
+                label = excluded.label,
+                revoked_at = NULL",
+        )
+        .bind(source_id)
+        .bind(key_id)
+        .bind(public_key)
+        .bind(key_label)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(json!({
+            "sourceId": source_id,
+            "indexUri": index_uri,
+            "keyId": key_id,
+            "status": "active"
+        }))
+    }
+
+    pub async fn rotate_marketplace_source_key(
+        &self,
+        source_id: &str,
+        key_id: &str,
+        public_key: &str,
+        label: &str,
+    ) -> Result<Value, PluginError> {
+        decode_public_key(public_key)?;
+        let now = now_rfc3339();
+        sqlx::query(
+            "UPDATE marketplace_source_keys SET revoked_at = ?
+             WHERE source_id = ? AND revoked_at IS NULL",
+        )
+        .bind(&now)
+        .bind(source_id)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO marketplace_source_keys
+             (source_id, key_id, public_key, label, valid_from, valid_until, revoked_at, created_at)
+             VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
+        )
+        .bind(source_id)
+        .bind(key_id)
+        .bind(public_key)
+        .bind(label)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(json!({"sourceId": source_id, "keyId": key_id, "rotatedAt": now}))
+    }
+
+    pub async fn refresh_marketplace_source(&self, source_id: &str) -> Result<Value, PluginError> {
+        let source: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT index_uri, label, last_sequence FROM marketplace_sources
+             WHERE id = ? AND enabled = 1",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let Some((index_uri, _, last_sequence)) = source else {
+            return Err(PluginError::NotFound(
+                "enabled marketplace source not found".to_string(),
+            ));
+        };
+        let bytes = fetch_remote_bytes(Path::new(""), &index_uri).await?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(PluginError::Invalid(
+                "marketplace index exceeds 2 MiB".to_string(),
+            ));
+        }
+        let index: RemoteMarketplaceIndex = serde_json::from_slice(&bytes)?;
+        if index.schema_version != "hpa.marketplace.index/v1" {
+            return Err(PluginError::Invalid(
+                "unsupported marketplace index schema".to_string(),
+            ));
+        }
+        if index.source_id != source_id {
+            return Err(PluginError::Signature(
+                "marketplace index sourceId does not match the configured source".to_string(),
+            ));
+        }
+        if index.sequence < last_sequence {
+            return Err(PluginError::Conflict(
+                "marketplace index sequence rollback detected".to_string(),
+            ));
+        }
+        self.verify_marketplace_index(source_id, &index).await?;
+
+        let base = remote_index_base(&index_uri);
+        let mut package_keys = BTreeSet::new();
+        let mut accepted = 0usize;
+        for package in &index.packages {
+            validate_identifier(&package.plugin_id, "plugin id")?;
+            Version::parse(&package.version).map_err(|error| {
+                PluginError::Invalid(format!("invalid plugin version: {error}"))
+            })?;
+            if !matches!(package.review_status.as_str(), "approved" | "rejected") {
+                return Err(PluginError::Invalid(
+                    "remote package reviewStatus must be approved or rejected".to_string(),
+                ));
+            }
+            if package.sha256.len() != 64
+                || !package
+                    .sha256
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(PluginError::Invalid(
+                    "remote package sha256 is invalid".to_string(),
+                ));
+            }
+            let package_bytes = fetch_remote_bytes(Path::new(&base), &package.path).await?;
+            let actual_hash = format!("{:x}", Sha256::digest(&package_bytes));
+            if actual_hash != package.sha256.to_ascii_lowercase() {
+                return Err(PluginError::Signature(
+                    "remote package hash does not match the signed index".to_string(),
+                ));
+            }
+            self.verify_remote_package(package, &package_bytes).await?;
+            let cache = self
+                .data_dir
+                .join("marketplace")
+                .join("sources")
+                .join(source_id)
+                .join("packages")
+                .join(&package.plugin_id)
+                .join(format!("{}.hplugin", package.version));
+            if let Some(parent) = cache.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            self.verify_remote_provenance(package, &base, &cache)
+                .await?;
+            let temporary = cache.with_extension("hplugin.tmp");
+            tokio::fs::write(&temporary, &package_bytes).await?;
+            tokio::fs::rename(&temporary, &cache).await?;
+            sqlx::query(
+                "INSERT INTO marketplace_remote_packages
+                 (source_id, plugin_id, version, publisher_id, signer_key_id, package_sha256,
+                  package_path, review_status, index_sequence, published_at, withdrawn_at,
+                  revocation_reason, provenance_json, oci_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                 ON CONFLICT(source_id, plugin_id, version) DO UPDATE SET
+                    publisher_id = excluded.publisher_id,
+                    signer_key_id = excluded.signer_key_id,
+                    package_sha256 = excluded.package_sha256,
+                    package_path = excluded.package_path,
+                    review_status = excluded.review_status,
+                    index_sequence = excluded.index_sequence,
+                    published_at = excluded.published_at,
+                    withdrawn_at = NULL,
+                    revocation_reason = NULL,
+                    provenance_json = excluded.provenance_json,
+                    oci_json = excluded.oci_json",
+            )
+            .bind(source_id)
+            .bind(&package.plugin_id)
+            .bind(&package.version)
+            .bind(&package.publisher_id)
+            .bind(&package.signer_key_id)
+            .bind(&package.sha256)
+            .bind(cache.to_string_lossy().to_string())
+            .bind(&package.review_status)
+            .bind(index.sequence)
+            .bind(&package.published_at)
+            .bind(
+                package
+                    .provenance
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .bind(
+                package
+                    .oci
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+            )
+            .execute(&self.db.pool)
+            .await?;
+            package_keys.insert((package.plugin_id.clone(), package.version.clone()));
+            accepted += 1;
+        }
+
+        for withdrawal in &index.withdrawals {
+            sqlx::query(
+                "UPDATE marketplace_remote_packages
+                 SET withdrawn_at = ?, revocation_reason = ?
+                 WHERE source_id = ? AND plugin_id = ? AND version = ?",
+            )
+            .bind(&withdrawal.at)
+            .bind(&withdrawal.reason)
+            .bind(source_id)
+            .bind(&withdrawal.plugin_id)
+            .bind(&withdrawal.version)
+            .execute(&self.db.pool)
+            .await?;
+            let installed: Option<String> =
+                sqlx::query_scalar("SELECT installed_version FROM plugins WHERE id = ?")
+                    .bind(&withdrawal.plugin_id)
+                    .fetch_optional(&self.db.pool)
+                    .await?
+                    .flatten();
+            if installed.as_deref() == Some(withdrawal.version.as_str()) {
+                let _ = self.disable(&withdrawal.plugin_id).await;
+            }
+            self.event(
+                Some(&withdrawal.plugin_id),
+                Some(&withdrawal.version),
+                "marketplace.remote_withdrawn",
+                json!({"sourceId": source_id, "reason": withdrawal.reason, "at": withdrawal.at}),
+            )
+            .await?;
+        }
+
+        let existing: Vec<(String, String)> = sqlx::query_as(
+            "SELECT plugin_id, version FROM marketplace_remote_packages
+             WHERE source_id = ? AND withdrawn_at IS NULL",
+        )
+        .bind(source_id)
+        .fetch_all(&self.db.pool)
+        .await?;
+        for (plugin_id, version) in existing {
+            if !package_keys.contains(&(plugin_id.clone(), version.clone())) {
+                sqlx::query(
+                    "UPDATE marketplace_remote_packages
+                     SET withdrawn_at = ?, revocation_reason = 'removed-from-index'
+                     WHERE source_id = ? AND plugin_id = ? AND version = ?",
+                )
+                .bind(now_rfc3339())
+                .bind(source_id)
+                .bind(&plugin_id)
+                .bind(&version)
+                .execute(&self.db.pool)
+                .await?;
+            }
+        }
+        sqlx::query(
+            "UPDATE marketplace_sources
+             SET last_sequence = ?, last_refresh_at = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(index.sequence)
+        .bind(now_rfc3339())
+        .bind(now_rfc3339())
+        .bind(source_id)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(json!({
+            "sourceId": source_id,
+            "sequence": index.sequence,
+            "packages": accepted,
+            "withdrawals": index.withdrawals.len()
+        }))
+    }
+
+    pub async fn remote_marketplace_packages(
+        &self,
+        source_id: Option<&str>,
+    ) -> Result<Vec<Value>, PluginError> {
+        let rows = if let Some(source_id) = source_id {
+            sqlx::query_as::<_, RemoteMarketplacePackageRow>(
+                "SELECT * FROM marketplace_remote_packages
+                 WHERE source_id = ? ORDER BY plugin_id, version DESC",
+            )
+            .bind(source_id)
+            .fetch_all(&self.db.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, RemoteMarketplacePackageRow>(
+                "SELECT * FROM marketplace_remote_packages
+                 ORDER BY source_id, plugin_id, version DESC",
+            )
+            .fetch_all(&self.db.pool)
+            .await?
+        };
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "sourceId": row.source_id,
+                    "pluginId": row.plugin_id,
+                    "version": row.version,
+                    "publisherId": row.publisher_id,
+                    "signerKeyId": row.signer_key_id,
+                    "packageSha256": row.package_sha256,
+                    "reviewStatus": row.review_status,
+                    "sequence": row.index_sequence,
+                    "publishedAt": row.published_at,
+                    "withdrawnAt": row.withdrawn_at,
+                    "revocationReason": row.revocation_reason,
+                    "provenance": row.provenance_json.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                    "oci": row.oci_json.and_then(|value| serde_json::from_str::<Value>(&value).ok()),
+                })
+            })
+            .collect())
+    }
+
+    pub async fn install_remote_package(
+        &self,
+        source_id: &str,
+        plugin_id: &str,
+        version: &str,
+    ) -> Result<Value, PluginError> {
+        let package = sqlx::query_as::<_, RemoteMarketplacePackageRow>(
+            "SELECT * FROM marketplace_remote_packages
+             WHERE source_id = ? AND plugin_id = ? AND version = ?",
+        )
+        .bind(source_id)
+        .bind(plugin_id)
+        .bind(version)
+        .fetch_optional(&self.db.pool)
+        .await?
+        .ok_or_else(|| PluginError::NotFound("remote package not found".to_string()))?;
+        if package.review_status != "approved" || package.withdrawn_at.is_some() {
+            return Err(PluginError::Forbidden(
+                "remote package is not approved or was withdrawn".to_string(),
+            ));
+        }
+        let bytes = tokio::fs::read(&package.package_path).await?;
+        let actual = format!("{:x}", Sha256::digest(&bytes));
+        if actual != package.package_sha256 {
+            return Err(PluginError::Signature(
+                "cached remote package hash changed".to_string(),
+            ));
+        }
+        let index_package = RemoteMarketplacePackage {
+            plugin_id: plugin_id.to_string(),
+            version: version.to_string(),
+            path: String::new(),
+            sha256: package.package_sha256.clone(),
+            publisher_id: package.publisher_id.clone(),
+            signer_key_id: package.signer_key_id.clone(),
+            review_status: package.review_status.clone(),
+            published_at: package.published_at.clone(),
+            provenance: package
+                .provenance_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            oci: package
+                .oci_json
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+        };
+        self.verify_cached_provenance(&index_package, Path::new(&package.package_path))
+            .await?;
+        self.verify_remote_package(&index_package, &bytes).await?;
+        let bundle = self
+            .load_source(
+                Path::new(&package.package_path),
+                BundleOptions {
+                    allow_unsigned: false,
+                    allow_untrusted: true,
+                    require_signature: true,
+                },
+            )
+            .await?;
+        self.install_bundle(bundle, &format!("remote:{source_id}"))
+            .await
+    }
+
+    async fn verify_marketplace_index(
+        &self,
+        source_id: &str,
+        index: &RemoteMarketplaceIndex,
+    ) -> Result<(), PluginError> {
+        if index.signature.algorithm != "ed25519" {
+            return Err(PluginError::Signature(
+                "marketplace index must use Ed25519".to_string(),
+            ));
+        }
+        let registered: Option<RegisteredKeyMaterial> = sqlx::query_as(
+            "SELECT public_key, valid_from, valid_until, revoked_at
+                 FROM marketplace_source_keys WHERE source_id = ? AND key_id = ?",
+        )
+        .bind(source_id)
+        .bind(&index.signature.key_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let Some((public_key, valid_from, valid_until, revoked_at)) = registered else {
+            return Err(PluginError::Signature(
+                "marketplace index key is not registered for this source".to_string(),
+            ));
+        };
+        if revoked_at.is_some()
+            || public_key != index.signature.public_key
+            || !time_window_active(valid_from.as_deref(), valid_until.as_deref())
+        {
+            return Err(PluginError::Signature(
+                "marketplace source key is revoked, expired, or mismatched".to_string(),
+            ));
+        }
+        let payload = RemoteMarketplacePayload {
+            schema_version: index.schema_version.clone(),
+            source_id: index.source_id.clone(),
+            sequence: index.sequence,
+            generated_at: index.generated_at.clone(),
+            packages: index.packages.clone(),
+            withdrawals: index.withdrawals.clone(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        verify_ed25519(&public_key, &payload_bytes, &index.signature.value)
+    }
+
+    async fn verify_remote_package(
+        &self,
+        package: &RemoteMarketplacePackage,
+        bytes: &[u8],
+    ) -> Result<(), PluginError> {
+        let files = read_archive_files(bytes)?;
+        let manifest_bytes = files
+            .get(MANIFEST_FILE)
+            .ok_or_else(|| PluginError::Invalid("remote package has no manifest".to_string()))?;
+        let manifest: PluginManifest = serde_json::from_slice(manifest_bytes)?;
+        validate_manifest_structure(&manifest)?;
+        if manifest.id != package.plugin_id || manifest.version != package.version {
+            return Err(PluginError::Signature(
+                "remote package identity does not match the signed index".to_string(),
+            ));
+        }
+        let publisher = manifest
+            .publisher
+            .as_ref()
+            .ok_or_else(|| PluginError::Signature("remote package has no publisher".to_string()))?;
+        let publisher_active: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM plugin_publishers WHERE id = ? AND status = 'active'",
+        )
+        .bind(&package.publisher_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        if publisher.id != package.publisher_id || publisher_active.is_none() {
+            return Err(PluginError::Signature(
+                "remote package publisher is unknown or suspended".to_string(),
+            ));
+        }
+        let registration: Option<RegisteredKeyMaterial> = sqlx::query_as(
+            "SELECT public_key, valid_from, valid_until, revoked_at
+                 FROM plugin_publisher_keys WHERE publisher_id = ? AND key_id = ?",
+        )
+        .bind(&package.publisher_id)
+        .bind(&package.signer_key_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let Some((public_key, valid_from, valid_until, revoked_at)) = registration else {
+            return Err(PluginError::Signature(
+                "remote package signer is not registered for the publisher".to_string(),
+            ));
+        };
+        if revoked_at.is_some()
+            || !time_window_active(valid_from.as_deref(), valid_until.as_deref())
+        {
+            return Err(PluginError::Signature(
+                "remote package signer is revoked or expired".to_string(),
+            ));
+        }
+        let content_hash = compute_content_hash(&files)?;
+        let signature = manifest
+            .signature
+            .as_ref()
+            .ok_or_else(|| PluginError::Signature("remote package must be signed".to_string()))?;
+        if signature.key_id != package.signer_key_id || signature.public_key != public_key {
+            return Err(PluginError::Signature(
+                "remote package signer does not match publisher key registry".to_string(),
+            ));
+        }
+        let canonical = canonical_manifest(&manifest)?;
+        verify_signature(signature, &manifest, &content_hash, &canonical)?;
+        if !hpa_skill::allowed_license(&manifest.license) {
+            return Err(PluginError::License(format!(
+                "remote package license `{}` is not allowed",
+                manifest.license
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify_remote_provenance(
+        &self,
+        package: &RemoteMarketplacePackage,
+        base: &str,
+        cache: &Path,
+    ) -> Result<(), PluginError> {
+        let Some(provenance) = &package.provenance else {
+            if self.provenance_config.required || package.oci.is_some() {
+                return Err(PluginError::Forbidden(
+                    "remote package requires signed provenance".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        if provenance.kind != "cosign-v1" {
+            return Err(PluginError::Signature(format!(
+                "unsupported provenance kind `{}`",
+                provenance.kind
+            )));
+        }
+        let statement = fetch_remote_bytes(Path::new(base), &provenance.statement_path).await?;
+        let bundle = fetch_remote_bytes(Path::new(base), &provenance.bundle_path).await?;
+        verify_provenance_hashes(
+            &statement,
+            &bundle,
+            &provenance.statement_sha256,
+            &provenance.bundle_sha256,
+        )?;
+        validate_provenance_statement(&statement, &package.sha256, package.oci.as_ref())?;
+        self.verify_cosign_files(&statement, &bundle).await?;
+        let statement_cache = cache.with_extension("provenance.json");
+        let bundle_cache = cache.with_extension("provenance.bundle.json");
+        tokio::fs::write(&statement_cache, statement).await?;
+        tokio::fs::write(&bundle_cache, bundle).await?;
+        Ok(())
+    }
+
+    async fn verify_cached_provenance(
+        &self,
+        package: &RemoteMarketplacePackage,
+        package_path: &Path,
+    ) -> Result<(), PluginError> {
+        let Some(provenance) = &package.provenance else {
+            if self.provenance_config.required || package.oci.is_some() {
+                return Err(PluginError::Forbidden(
+                    "remote package requires signed provenance".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        let statement_path = package_path.with_extension("provenance.json");
+        let bundle_path = package_path.with_extension("provenance.bundle.json");
+        let statement = tokio::fs::read(&statement_path).await?;
+        let bundle = tokio::fs::read(&bundle_path).await?;
+        verify_provenance_hashes(
+            &statement,
+            &bundle,
+            &provenance.statement_sha256,
+            &provenance.bundle_sha256,
+        )?;
+        validate_provenance_statement(&statement, &package.sha256, package.oci.as_ref())?;
+        self.verify_cosign_files(&statement, &bundle).await
+    }
+
+    async fn verify_cosign_files(
+        &self,
+        statement: &[u8],
+        bundle: &[u8],
+    ) -> Result<(), PluginError> {
+        let (binary, trust) = match &self.provenance_config.verifier {
+            ProvenanceVerifier::Disabled => {
+                return Err(PluginError::Forbidden(
+                    "cosign provenance verifier is not configured".to_string(),
+                ));
+            }
+            ProvenanceVerifier::Invalid(message) => {
+                return Err(PluginError::Invalid(message.clone()));
+            }
+            ProvenanceVerifier::Cosign { binary, trust } => (binary, trust),
+        };
+        if !binary.is_absolute() || !binary.is_file() {
+            return Err(PluginError::Invalid(
+                "HPA_COSIGN_BIN must be an absolute file path".to_string(),
+            ));
+        }
+        let directory = self.data_dir.join("tmp").join("cosign");
+        tokio::fs::create_dir_all(&directory).await?;
+        let id = Uuid::now_v7();
+        let statement_path = directory.join(format!("{id}.statement.json"));
+        let bundle_path = directory.join(format!("{id}.bundle.json"));
+        tokio::fs::write(&statement_path, statement).await?;
+        tokio::fs::write(&bundle_path, bundle).await?;
+        let mut command = tokio::process::Command::new(binary);
+        command.arg("verify-blob").arg("--bundle").arg(&bundle_path);
+        match trust {
+            CosignTrust::Key(public_key) => {
+                if !public_key.is_absolute() || !public_key.is_file() {
+                    let _ = tokio::fs::remove_file(&statement_path).await;
+                    let _ = tokio::fs::remove_file(&bundle_path).await;
+                    return Err(PluginError::Invalid(
+                        "HPA_COSIGN_PUBLIC_KEY must be an absolute file path".to_string(),
+                    ));
+                }
+                command
+                    .arg("--key")
+                    .arg(public_key)
+                    .arg("--insecure-ignore-tlog=true");
+            }
+            CosignTrust::Keyless {
+                certificate_identity,
+                oidc_issuer,
+            } => {
+                command
+                    .arg("--certificate-identity")
+                    .arg(certificate_identity)
+                    .arg("--certificate-oidc-issuer")
+                    .arg(oidc_issuer);
+            }
+        }
+        command
+            .arg(&statement_path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let result = tokio::time::timeout(Duration::from_secs(20), command.output()).await;
+        let _ = tokio::fs::remove_file(&statement_path).await;
+        let _ = tokio::fs::remove_file(&bundle_path).await;
+        match result {
+            Ok(Ok(output)) if output.status.success() => Ok(()),
+            Ok(Ok(output)) => Err(PluginError::Signature(format!(
+                "cosign provenance verification failed: {}",
+                String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(1024)])
+            ))),
+            Ok(Err(error)) => Err(PluginError::Signature(format!(
+                "cannot execute cosign: {error}"
+            ))),
+            Err(_) => Err(PluginError::Signature(
+                "cosign provenance verification timed out".to_string(),
+            )),
+        }
     }
 
     pub async fn sign_directory(&self, path: &Path) -> Result<Value, PluginError> {
@@ -943,6 +2274,25 @@ impl PluginService {
         source: &str,
     ) -> Result<Value, PluginError> {
         let manifest = &bundle.manifest;
+        let vulnerability = self
+            .vulnerability_report(&manifest.id, &manifest.version)
+            .await?;
+        if vulnerability["status"] == "vulnerable" {
+            let ids = vulnerability["vulnerabilities"]
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item["id"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return Err(PluginError::Forbidden(format!(
+                "plugin `{}@{}` is blocked by vulnerabilities: {ids}",
+                manifest.id, manifest.version
+            )));
+        }
         let plugin: Option<PluginRow> = sqlx::query_as(
             "SELECT id, name, latest_version, status, installed_version, previous_version,
                     trust, license, created_at, updated_at
@@ -1864,18 +3214,36 @@ impl PluginService {
         kind: &str,
         detail: Value,
     ) -> Result<(), PluginError> {
+        let id = format!("plevent_{}", Uuid::now_v7());
+        let at = now_rfc3339();
+        let detail_json = serde_json::to_string(&detail)?;
+        let mut transaction = self.db.pool.begin().await?;
         sqlx::query(
             "INSERT INTO plugin_events (id, at, plugin_id, version, kind, detail_json)
              VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(format!("plevent_{}", Uuid::now_v7()))
-        .bind(now_rfc3339())
+        .bind(&id)
+        .bind(&at)
         .bind(plugin_id)
         .bind(version)
         .bind(kind)
-        .bind(serde_json::to_string(&detail)?)
-        .execute(&self.db.pool)
+        .bind(&detail_json)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query(
+            "INSERT INTO marketplace_event_stream
+             (id, at, plugin_id, version, kind, detail_json)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&at)
+        .bind(plugin_id)
+        .bind(version)
+        .bind(kind)
+        .bind(&detail_json)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -2072,7 +3440,7 @@ fn validate_manifest_structure(manifest: &PluginManifest) -> Result<(), PluginEr
     for permission in &manifest.permissions {
         if !matches!(
             permission.kind.as_str(),
-            "network" | "filesystem" | "commands" | "credential"
+            "network" | "filesystem" | "database" | "commands" | "credential"
         ) {
             issues.push(format!("unsupported permission `{}`", permission.kind));
         }
@@ -2116,8 +3484,17 @@ fn validate_capability_permissions(
     plugin: &PluginManifest,
     connector: &ConnectorManifest,
 ) -> Result<(), PluginError> {
-    let needs_network = connector.kind == connector::ConnectorKind::Http;
-    let needs_filesystem = connector.kind == connector::ConnectorKind::File;
+    let needs_network = matches!(
+        connector.kind,
+        connector::ConnectorKind::Http
+            | connector::ConnectorKind::Mq
+            | connector::ConnectorKind::S3
+    );
+    let needs_filesystem = matches!(
+        connector.kind,
+        connector::ConnectorKind::File | connector::ConnectorKind::Git
+    );
+    let needs_database = connector.kind == connector::ConnectorKind::Database;
     if needs_network
         && !plugin
             .permissions
@@ -2140,9 +3517,21 @@ fn validate_capability_permissions(
             connector.id
         )));
     }
+    if needs_database
+        && !plugin
+            .permissions
+            .iter()
+            .any(|permission| permission.kind == "database")
+    {
+        return Err(PluginError::Invalid(format!(
+            "plugin must declare database permission for connector `{}`",
+            connector.id
+        )));
+    }
     if !connector.permissions.iter().any(|permission| {
         (needs_network && permission.kind == "network")
             || (needs_filesystem && permission.kind == "filesystem")
+            || (needs_database && permission.kind == "database")
     }) {
         return Err(PluginError::Invalid(format!(
             "connector `{}` must declare its own matching permission",
@@ -2150,6 +3539,515 @@ fn validate_capability_permissions(
         )));
     }
     Ok(())
+}
+
+fn advisory_affects(advisory: &OfflineAdvisory, plugin_id: &str, version: &Version) -> bool {
+    advisory.affected.iter().any(|affected| {
+        if !affected.package.ecosystem.eq_ignore_ascii_case("HPA")
+            || affected.package.name != plugin_id
+        {
+            return false;
+        }
+        if affected.versions.iter().any(|candidate| {
+            Version::parse(candidate)
+                .map(|candidate| candidate == *version)
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+        affected.ranges.iter().any(|range| {
+            if range.kind != "SEMVER" {
+                return false;
+            }
+            let mut affected_version = false;
+            for event in &range.events {
+                if let Some(introduced) = &event.introduced {
+                    let introduced = if introduced == "0" {
+                        Some(Version::new(0, 0, 0))
+                    } else {
+                        Version::parse(introduced).ok()
+                    };
+                    if introduced.is_some_and(|introduced| *version >= introduced) {
+                        affected_version = true;
+                    }
+                }
+                if let Some(fixed) = &event.fixed
+                    && Version::parse(fixed).is_ok_and(|fixed| *version >= fixed)
+                {
+                    affected_version = false;
+                }
+            }
+            affected_version
+        })
+    })
+}
+
+fn offline_advisory_value(advisory: &OfflineAdvisory) -> Value {
+    json!({
+        "id": advisory.id,
+        "summary": advisory.summary.clone(),
+        "modified": advisory.modified.clone(),
+        "aliases": advisory.aliases.clone()
+    })
+}
+
+fn osv_advisory_value(advisory: OsvAdvisory) -> Value {
+    json!({
+        "id": advisory.id,
+        "summary": advisory.summary,
+        "modified": advisory.modified,
+        "aliases": advisory.aliases
+    })
+}
+
+fn vulnerability_report_value(
+    source: &str,
+    plugin_id: &str,
+    version: &str,
+    vulnerabilities: Vec<Value>,
+    database_generated_at: Option<String>,
+    query_ecosystem: Option<&str>,
+) -> Value {
+    json!({
+        "schemaVersion": "hpa.vulnerability-report/v1",
+        "status": if vulnerabilities.is_empty() { "clean" } else { "vulnerable" },
+        "source": source,
+        "checkedAt": now_rfc3339(),
+        "databaseGeneratedAt": database_generated_at,
+        "package": {"ecosystem": "HPA", "name": plugin_id, "version": version},
+        "query": {
+            "ecosystem": query_ecosystem,
+            "name": plugin_id,
+            "version": version
+        },
+        "vulnerabilities": vulnerabilities
+    })
+}
+
+async fn validate_osv_endpoint(raw_url: &str) -> Result<(), PluginError> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|error| PluginError::Invalid(format!("invalid OSV URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.username() != "" || url.password().is_some()
+    {
+        return Err(PluginError::Forbidden(
+            "OSV URL must be HTTP(S) without userinfo".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| PluginError::Invalid("OSV URL has no host".to_string()))?;
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if url.scheme() == "http" && !loopback {
+        return Err(PluginError::Forbidden(
+            "OSV must use HTTPS unless it is loopback".to_string(),
+        ));
+    }
+    if !loopback {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let mut resolved = false;
+        for address in tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| PluginError::Invalid(format!("cannot resolve OSV host: {error}")))?
+        {
+            resolved = true;
+            let blocked = match address.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    ip.is_loopback()
+                        || ip.is_private()
+                        || ip.is_link_local()
+                        || ip.is_unspecified()
+                        || ip.is_documentation()
+                }
+                std::net::IpAddr::V6(ip) => {
+                    ip.is_loopback()
+                        || ip.is_unique_local()
+                        || ip.is_unicast_link_local()
+                        || ip.is_unspecified()
+                        || ip.is_multicast()
+                }
+            };
+            if blocked {
+                return Err(PluginError::Forbidden(
+                    "OSV host resolves to a private or blocked address".to_string(),
+                ));
+            }
+        }
+        if !resolved {
+            return Err(PluginError::Invalid(
+                "OSV host did not resolve to an address".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identifier(value: &str, label: &str) -> Result<(), PluginError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        return Err(PluginError::Invalid(format!("{label} is invalid")));
+    }
+    Ok(())
+}
+
+fn verify_provenance_hashes(
+    statement: &[u8],
+    bundle: &[u8],
+    statement_sha256: &str,
+    bundle_sha256: &str,
+) -> Result<(), PluginError> {
+    if statement.len() > 4 * 1024 * 1024 || bundle.len() > 4 * 1024 * 1024 {
+        return Err(PluginError::Invalid(
+            "provenance statement or bundle exceeds 4 MiB".to_string(),
+        ));
+    }
+    for (name, bytes, expected) in [
+        ("statement", statement, statement_sha256),
+        ("bundle", bundle, bundle_sha256),
+    ] {
+        if expected.len() != 64
+            || !expected
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            || format!("{:x}", Sha256::digest(bytes)) != expected.to_ascii_lowercase()
+        {
+            return Err(PluginError::Signature(format!(
+                "provenance {name} hash does not match the signed index"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_provenance_statement(
+    statement: &[u8],
+    package_sha256: &str,
+    oci: Option<&RemotePackageOci>,
+) -> Result<(), PluginError> {
+    let value: Value = serde_json::from_slice(statement)?;
+    if !matches!(
+        value.get("_type").and_then(Value::as_str),
+        Some("https://in-toto.io/Statement/v1") | Some("https://in-toto.io/Statement/v0.1")
+    ) {
+        return Err(PluginError::Signature(
+            "provenance statement type is not supported".to_string(),
+        ));
+    }
+    if !value
+        .get("predicateType")
+        .and_then(Value::as_str)
+        .is_some_and(|value| {
+            value == "https://slsa.dev/provenance/v1"
+                || value == "https://slsa.dev/provenance/v0.2"
+                || value == "https://hpa.dev/provenance/plugin/v1"
+        })
+    {
+        return Err(PluginError::Signature(
+            "provenance predicateType is not supported".to_string(),
+        ));
+    }
+    let subjects = value
+        .get("subject")
+        .and_then(Value::as_array)
+        .ok_or_else(|| PluginError::Signature("provenance has no subject".to_string()))?;
+    let package_bound = subjects.iter().any(|subject| {
+        subject
+            .pointer("/digest/sha256")
+            .and_then(Value::as_str)
+            .is_some_and(|digest| digest.eq_ignore_ascii_case(package_sha256))
+    });
+    if !package_bound {
+        return Err(PluginError::Signature(
+            "provenance subject does not bind the package sha256".to_string(),
+        ));
+    }
+    if let Some(oci) = oci {
+        if !valid_oci_repository(&oci.repository) || !valid_sha256_digest(&oci.digest) {
+            return Err(PluginError::Signature(
+                "OCI provenance repository or digest is invalid".to_string(),
+            ));
+        }
+        let oci_bound = subjects.iter().any(|subject| {
+            subject
+                .pointer("/digest/sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    oci.digest
+                        .strip_prefix("sha256:")
+                        .is_some_and(|expected| digest.eq_ignore_ascii_case(expected))
+                })
+        });
+        if !oci_bound {
+            return Err(PluginError::Signature(
+                "provenance subject does not bind the OCI manifest digest".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+    })
+}
+
+fn valid_oci_repository(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.contains("://")
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '.' | '/' | '_' | '-')
+        })
+}
+
+fn validate_remote_index_uri(uri: &str) -> Result<(), PluginError> {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        let url = reqwest::Url::parse(uri)
+            .map_err(|error| PluginError::Invalid(format!("invalid marketplace URL: {error}")))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(PluginError::Forbidden(
+                "marketplace URL must not contain userinfo".to_string(),
+            ));
+        }
+        if url.scheme() == "http"
+            && !url
+                .host_str()
+                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+        {
+            return Err(PluginError::Forbidden(
+                "remote marketplace must use HTTPS unless it is loopback".to_string(),
+            ));
+        }
+        Ok(())
+    } else if uri.trim().is_empty() || uri.contains('\0') {
+        Err(PluginError::Invalid(
+            "marketplace index URI is invalid".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn fetch_remote_bytes(base: &Path, reference: &str) -> Result<Vec<u8>, PluginError> {
+    if base.as_os_str().is_empty() {
+        if reference.starts_with("http://") || reference.starts_with("https://") {
+            return fetch_http_bytes(reference, None).await;
+        }
+        let target = std::fs::canonicalize(reference).map_err(|error| {
+            PluginError::NotFound(format!("marketplace index not found: {error}"))
+        })?;
+        if !target.is_file() {
+            return Err(PluginError::Invalid(
+                "marketplace index is not a file".to_string(),
+            ));
+        }
+        let bytes = std::fs::read(target)?;
+        if bytes.len() > 2 * 1024 * 1024 {
+            return Err(PluginError::Invalid(
+                "marketplace index exceeds 2 MiB".to_string(),
+            ));
+        }
+        return Ok(bytes);
+    }
+    if let Some(base) = base.to_str()
+        && (base.starts_with("http://") || base.starts_with("https://"))
+    {
+        let base_url = reqwest::Url::parse(base)
+            .map_err(|error| PluginError::Invalid(format!("invalid marketplace URL: {error}")))?;
+        let url = base_url
+            .join(reference)
+            .map_err(|error| PluginError::Invalid(format!("invalid package URL: {error}")))?;
+        if url.scheme() != base_url.scheme()
+            || url.host_str() != base_url.host_str()
+            || url.port_or_known_default() != base_url.port_or_known_default()
+        {
+            return Err(PluginError::Forbidden(
+                "marketplace package URL must stay on the index origin".to_string(),
+            ));
+        }
+        return fetch_http_bytes(url.as_str(), Some(&base_url)).await;
+    }
+    let root = std::fs::canonicalize(base).map_err(|error| {
+        PluginError::Invalid(format!("cannot open offline marketplace mirror: {error}"))
+    })?;
+    let path = Path::new(reference);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(PluginError::Forbidden(
+            "marketplace package path escapes the index directory".to_string(),
+        ));
+    }
+    let target = std::fs::canonicalize(root.join(path)).map_err(|error| {
+        PluginError::NotFound(format!("marketplace package not found: {error}"))
+    })?;
+    if !target.starts_with(&root) || !target.is_file() {
+        return Err(PluginError::Forbidden(
+            "marketplace package path escapes the index directory".to_string(),
+        ));
+    }
+    let bytes = std::fs::read(&target)?;
+    if bytes.len() > MAX_PLUGIN_BYTES {
+        return Err(PluginError::Invalid(
+            "marketplace package exceeds 20 MiB".to_string(),
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn fetch_http_bytes(
+    raw_url: &str,
+    expected_origin: Option<&reqwest::Url>,
+) -> Result<Vec<u8>, PluginError> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|error| PluginError::Invalid(format!("invalid marketplace URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(PluginError::Forbidden(
+            "marketplace URL must be HTTP(S) without userinfo".to_string(),
+        ));
+    }
+    if url.scheme() == "http"
+        && !url
+            .host_str()
+            .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"))
+    {
+        return Err(PluginError::Forbidden(
+            "remote marketplace must use HTTPS".to_string(),
+        ));
+    }
+    if let Some(expected) = expected_origin
+        && (url.scheme() != expected.scheme()
+            || url.host_str() != expected.host_str()
+            || url.port_or_known_default() != expected.port_or_known_default())
+    {
+        return Err(PluginError::Forbidden(
+            "marketplace package URL changed origin".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| PluginError::Invalid("marketplace URL has no host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        for address in tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| {
+                PluginError::Invalid(format!("cannot resolve marketplace host: {error}"))
+            })?
+        {
+            let blocked = match address.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    ip.is_loopback()
+                        || ip.is_private()
+                        || ip.is_link_local()
+                        || ip.is_unspecified()
+                        || ip.is_documentation()
+                }
+                std::net::IpAddr::V6(ip) => {
+                    ip.is_unique_local()
+                        || ip.is_unicast_link_local()
+                        || ip.is_unspecified()
+                        || ip.is_multicast()
+                }
+            };
+            if blocked {
+                return Err(PluginError::Forbidden(
+                    "marketplace host resolves to a private or blocked address".to_string(),
+                ));
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|error| PluginError::Invalid(error.to_string()))?;
+    let response =
+        client.get(url).send().await.map_err(|error| {
+            PluginError::Invalid(format!("marketplace download failed: {error}"))
+        })?;
+    if !response.status().is_success() {
+        return Err(PluginError::Invalid(format!(
+            "marketplace download returned HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_PLUGIN_BYTES as u64)
+    {
+        return Err(PluginError::Invalid(
+            "marketplace response exceeds 20 MiB".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream
+        .next()
+        .await
+        .transpose()
+        .map_err(|error| PluginError::Invalid(format!("marketplace read failed: {error}")))?
+    {
+        if bytes.len() + chunk.len() > MAX_PLUGIN_BYTES {
+            return Err(PluginError::Invalid(
+                "marketplace response exceeds 20 MiB".to_string(),
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn remote_index_base(uri: &str) -> String {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_string();
+    }
+    Path::new(uri)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_string_lossy()
+        .to_string()
+}
+
+fn time_window_active(valid_from: Option<&str>, valid_until: Option<&str>) -> bool {
+    let now = OffsetDateTime::now_utc();
+    let from_ok = valid_from
+        .is_none_or(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok_and(|value| value <= now));
+    let until_ok = valid_until
+        .is_none_or(|value| OffsetDateTime::parse(value, &Rfc3339).is_ok_and(|value| value >= now));
+    from_ok && until_ok
+}
+
+fn verify_ed25519(public_key: &str, payload: &[u8], signature: &str) -> Result<(), PluginError> {
+    let public = VerifyingKey::from_bytes(&decode_public_key(public_key)?)
+        .map_err(|error| PluginError::Signature(format!("invalid Ed25519 public key: {error}")))?;
+    let signature = BASE64
+        .decode(signature)
+        .map_err(|error| PluginError::Signature(format!("invalid Ed25519 signature: {error}")))?;
+    let signature: [u8; 64] = signature
+        .try_into()
+        .map_err(|_| PluginError::Signature("Ed25519 signature must be 64 bytes".to_string()))?;
+    public
+        .verify(payload, &Ed25519Signature::from_bytes(&signature))
+        .map_err(|_| PluginError::Signature("Ed25519 signature verification failed".to_string()))
 }
 
 fn canonical_manifest(manifest: &PluginManifest) -> Result<String, PluginError> {
@@ -2540,6 +4438,7 @@ fn now_rfc3339() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn manifest_paths_and_hashes_are_deterministic() {
@@ -2572,5 +4471,248 @@ mod tests {
     fn mcp_server_ids_are_stable() {
         assert_eq!(plugin_server_id("plugin_a", "echo"), "plugin_plugin_a_echo");
         assert_eq!(plugin_server_id("plugin.a", "echo"), "plugin_plugin_a_echo");
+    }
+
+    #[tokio::test]
+    async fn offline_vulnerability_database_blocks_install() {
+        let data_dir = std::env::temp_dir().join(format!("hpa-vuln-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let db = Db::open(&data_dir.join("hpa.db")).await.expect("db");
+        let database_path = data_dir.join("vulnerabilities.json");
+        std::fs::write(
+            &database_path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": "hpa.vulnerability-db/v1",
+                "generatedAt": now_rfc3339(),
+                "records": [{
+                    "id": "HPA-TEST-2026-0001",
+                    "summary": "Controlled vulnerable plugin range",
+                    "modified": "2026-11-02T00:00:00Z",
+                    "affected": [{
+                        "package": {"ecosystem": "HPA", "name": "plugin_test"},
+                        "ranges": [{
+                            "type": "SEMVER",
+                            "events": [{"introduced": "1.0.0"}, {"fixed": "1.1.0"}]
+                        }]
+                    }]
+                }]
+            }))
+            .expect("vulnerability db"),
+        )
+        .expect("write vulnerability db");
+        let service = PluginService::new(
+            db.clone(),
+            data_dir.clone(),
+            SkillService::new(db.clone(), data_dir.clone()),
+            ConnectorRuntime::new(db.clone()),
+        )
+        .with_vulnerability_source(VulnerabilitySource::Offline {
+            path: database_path,
+            max_age_hours: 24,
+        });
+        let report = service
+            .vulnerability_report("plugin_test", "1.0.0")
+            .await
+            .expect("vulnerability report");
+        assert_eq!(report["status"], "vulnerable");
+        assert_eq!(report["vulnerabilities"][0]["id"], "HPA-TEST-2026-0001");
+
+        let files = BTreeMap::from([(
+            MANIFEST_FILE.to_string(),
+            br#"{"schemaVersion":"hpa.plugin/v1","id":"plugin_test","name":"Test","version":"1.0.0","license":"Apache-2.0","compatibility":{"hpa":">=0.1.0 <1.0.0"}}"#
+                .to_vec(),
+        )]);
+        let manifest: PluginManifest =
+            serde_json::from_slice(&files[MANIFEST_FILE]).expect("manifest");
+        let bundle = PluginBundle {
+            manifest,
+            content_hash: compute_content_hash(&files).expect("hash"),
+            files,
+            trust: "verified".to_string(),
+        };
+        let error = service
+            .install_bundle(bundle, "test")
+            .await
+            .expect_err("vulnerable install must fail");
+        assert!(error.to_string().contains("HPA-TEST-2026-0001"), "{error}");
+
+        std::fs::write(
+            service.data_dir.join("vulnerabilities.json"),
+            serde_json::to_vec(&json!({
+                "schemaVersion": "hpa.vulnerability-db/v1",
+                "generatedAt": "2020-01-01T00:00:00Z",
+                "records": []
+            }))
+            .expect("stale vulnerability db"),
+        )
+        .expect("write stale vulnerability db");
+        let stale = service
+            .vulnerability_report("plugin_test", "1.0.0")
+            .await
+            .expect_err("stale offline database must fail");
+        assert!(matches!(stale, PluginError::Forbidden(_)), "{stale}");
+    }
+
+    #[tokio::test]
+    async fn osv_query_returns_vulnerabilities() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("OSV listener");
+        let address = listener.local_addr().expect("OSV address");
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("OSV connection");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let body = json!({
+                "vulns": [{
+                    "id": "HPA-OSV-2026-0001",
+                    "summary": "Controlled online advisory",
+                    "modified": "2026-11-02T00:00:00Z"
+                }]
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).expect("OSV response");
+        });
+
+        let data_dir = std::env::temp_dir().join(format!("hpa-osv-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let db = Db::open(&data_dir.join("hpa.db")).await.expect("db");
+        let service = PluginService::new(
+            db.clone(),
+            data_dir.clone(),
+            SkillService::new(db.clone(), data_dir.clone()),
+            ConnectorRuntime::new(db.clone()),
+        )
+        .with_vulnerability_source(VulnerabilitySource::Osv {
+            endpoint: format!("http://{address}/v1/query"),
+            ecosystem: None,
+        });
+        let report = service
+            .vulnerability_report("plugin_online", "1.0.0")
+            .await
+            .expect("OSV report");
+        assert_eq!(report["status"], "vulnerable");
+        assert_eq!(report["source"], "osv");
+        assert_eq!(report["vulnerabilities"][0]["id"], "HPA-OSV-2026-0001");
+    }
+
+    #[tokio::test]
+    async fn cosign_provenance_verifies_statement_and_oci_digest() {
+        let Ok(cosign) = std::env::var("HPA_COSIGN_BIN") else {
+            eprintln!("skipped: HPA_COSIGN_BIN is not set");
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!("hpa-cosign-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&directory).expect("cosign dir");
+        let key_prefix = directory.join("cosign");
+        let generated = Command::new(&cosign)
+            .args(["generate-key-pair", "--output-key-prefix"])
+            .arg(&key_prefix)
+            .env("COSIGN_PASSWORD", "test-password")
+            .output()
+            .expect("generate cosign key");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let public_key = key_prefix.with_extension("pub");
+        let private_key = key_prefix.with_extension("key");
+        let statement_path = directory.join("statement.json");
+        let bundle_path = directory.join("statement.bundle.json");
+        let package_digest = format!("{:x}", Sha256::digest(b"package"));
+        let oci_digest = format!("sha256:{:x}", Sha256::digest(b"oci-manifest"));
+        let statement_bytes = serde_json::to_vec(&json!({
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [
+                {"name": "plugin_test", "digest": {"sha256": package_digest.clone()}},
+                {"name": "registry.example/hpa/plugin_test", "digest": {"sha256": oci_digest.trim_start_matches("sha256:").to_string()}}
+            ],
+            "predicateType": "https://hpa.dev/provenance/plugin/v1",
+            "predicate": {"builder": {"id": "https://builder.example/hpa"}}
+        }))
+        .expect("statement");
+        std::fs::write(&statement_path, &statement_bytes).expect("write statement");
+        let signed = Command::new(&cosign)
+            .args([
+                "sign-blob",
+                "--yes",
+                "--tlog-upload=false",
+                "--key",
+                private_key.to_str().expect("private key"),
+                "--bundle",
+                bundle_path.to_str().expect("bundle"),
+                statement_path.to_str().expect("statement"),
+            ])
+            .env("COSIGN_PASSWORD", "test-password")
+            .output()
+            .expect("sign statement");
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+        let bundle = std::fs::read(&bundle_path).expect("bundle bytes");
+        validate_provenance_statement(
+            &statement_bytes,
+            &package_digest,
+            Some(&RemotePackageOci {
+                repository: "registry.example/hpa/plugin_test".to_string(),
+                digest: oci_digest,
+            }),
+        )
+        .expect("valid statement");
+        let data_dir = directory.join("data");
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let db = Db::open(&data_dir.join("hpa.db")).await.expect("db");
+        let service = PluginService::new(
+            db.clone(),
+            data_dir.clone(),
+            SkillService::new(db.clone(), data_dir.clone()),
+            ConnectorRuntime::new(db.clone()),
+        )
+        .with_provenance_config(ProvenanceConfig {
+            required: true,
+            verifier: ProvenanceVerifier::Cosign {
+                binary: PathBuf::from(cosign),
+                trust: CosignTrust::Key(public_key),
+            },
+        });
+        service
+            .verify_cosign_files(&statement_bytes, &bundle)
+            .await
+            .expect("cosign verifies");
+        let missing = service
+            .verify_remote_provenance(
+                &RemoteMarketplacePackage {
+                    plugin_id: "plugin_test".to_string(),
+                    version: "1.0.0".to_string(),
+                    path: "package.hplugin".to_string(),
+                    sha256: package_digest,
+                    publisher_id: "publisher_test".to_string(),
+                    signer_key_id: "key_test".to_string(),
+                    review_status: "approved".to_string(),
+                    published_at: None,
+                    provenance: None,
+                    oci: None,
+                },
+                "",
+                &directory.join("cache.hplugin"),
+            )
+            .await
+            .expect_err("required provenance must be present");
+        assert!(matches!(missing, PluginError::Forbidden(_)), "{missing}");
+        let mut tampered = statement_bytes;
+        tampered.push(b' ');
+        let error = service
+            .verify_cosign_files(&tampered, &bundle)
+            .await
+            .expect_err("tampered statement must fail");
+        assert!(matches!(error, PluginError::Signature(_)), "{error}");
     }
 }

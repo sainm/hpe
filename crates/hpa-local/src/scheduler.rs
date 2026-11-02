@@ -8,19 +8,72 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
 use hpa_core::runtime::{new_state, start_event};
-use hpa_core::trigger::{MisfirePolicy, ScheduleSpec, TriggerSpec, next_fire_at, parse_trigger};
+use hpa_core::trigger::{
+    EventSpec, MisfirePolicy, ScheduleSpec, TriggerSpec, next_fire_at, parse_trigger,
+};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::db::{Db, DbError, ExecutionRow, TriggerFireRow, TriggerSeed, TriggerStateRow};
 use crate::driver::RuntimeManager;
 use crate::metrics::metrics;
+use hpa_local::distributed_runtime::{SchedulerLease, SchedulerLeaseStore};
 
 /// A tick that runs more than this late treats the slot as missed for `skip`.
 const GRACE_MS: i64 = 60_000;
 const MAX_DUE_PER_TICK: i64 = 32;
 const MAX_ROUNDS: u32 = 50;
 const DEFAULT_TICK_MS: u64 = 1_000;
+const DEFAULT_LEASE_TTL_SECONDS: i32 = 15;
+const DEFAULT_LEASE_KEY: &str = "hpa:scheduler";
+
+#[derive(Clone)]
+pub(crate) struct SchedulerCoordination {
+    store: SchedulerLeaseStore,
+    lease_key: String,
+    ttl_seconds: i32,
+}
+
+impl SchedulerCoordination {
+    pub(crate) fn postgres(pool: sqlx::postgres::PgPool, holder_id: impl Into<String>) -> Self {
+        let ttl_seconds = std::env::var("HPA_SCHEDULER_LEASE_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<i32>().ok())
+            .filter(|value| (1..=3600).contains(value))
+            .unwrap_or(DEFAULT_LEASE_TTL_SECONDS);
+        let lease_key = std::env::var("HPA_SCHEDULER_LEASE_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_LEASE_KEY.to_string());
+        Self {
+            store: SchedulerLeaseStore::new(pool, holder_id),
+            lease_key,
+            ttl_seconds,
+        }
+    }
+}
+
+pub(crate) struct SchedulerRuntime {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl SchedulerRuntime {
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum TriggerError {
@@ -35,6 +88,8 @@ pub enum TriggerError {
     Unsupported { trigger_id: String, kind: String },
     #[error("duplicate event `{event_id}`")]
     Duplicate { event_id: String },
+    #[error("no enabled event trigger subscribes to topic `{topic}`")]
+    NoSubscribers { topic: String },
     #[error("trigger configuration is invalid: {0}")]
     Invalid(String),
     #[error("workflow version `{version}` of `{workflow_id}` is not published")]
@@ -130,11 +185,11 @@ pub async fn sync_published(
                 enabled: spec.enabled,
                 next_fire_at: None,
             }),
-            Ok(TriggerSpec::Event) => seeds.push(TriggerSeed {
+            Ok(TriggerSpec::Event(spec)) => seeds.push(TriggerSeed {
                 trigger_id: trigger.id.clone(),
                 kind: "event".to_string(),
                 config_json,
-                enabled: false,
+                enabled: spec.enabled,
                 next_fire_at: None,
             }),
             Ok(TriggerSpec::Mcp) => seeds.push(TriggerSeed {
@@ -173,6 +228,24 @@ fn schedule_of(row: &TriggerStateRow) -> Result<ScheduleSpec, TriggerError> {
     };
     match parse_trigger(&trigger) {
         Ok(TriggerSpec::Schedule(spec)) => Ok(*spec),
+        Ok(_) => Err(TriggerError::Unsupported {
+            trigger_id: row.trigger_id.clone(),
+            kind: row.kind.clone(),
+        }),
+        Err(message) => Err(TriggerError::Invalid(message)),
+    }
+}
+
+fn event_of(row: &TriggerStateRow) -> Result<EventSpec, TriggerError> {
+    let config: Value = serde_json::from_str(&row.config_json)
+        .map_err(|error| TriggerError::Invalid(error.to_string()))?;
+    let trigger = hpa_core::ir::Trigger {
+        id: row.trigger_id.clone(),
+        trigger_type: hpa_core::ir::TriggerType::Event,
+        config,
+    };
+    match parse_trigger(&trigger) {
+        Ok(TriggerSpec::Event(spec)) => Ok(spec),
         Ok(_) => Err(TriggerError::Unsupported {
             trigger_id: row.trigger_id.clone(),
             kind: row.kind.clone(),
@@ -297,13 +370,24 @@ async fn fire_row(
     row: &TriggerStateRow,
     request: &FireRequest,
 ) -> Result<Option<FireOutcome>, TriggerError> {
+    if let Some(event_id) = request.event_id.as_deref()
+        && host
+            .db
+            .trigger_event_delivered(&request.trigger_id, event_id)
+            .await?
+    {
+        return Err(TriggerError::Duplicate {
+            event_id: event_id.to_string(),
+        });
+    }
     let Some(version) = row.workflow_version.clone() else {
         return Err(TriggerError::VersionMissing {
             workflow_id: row.workflow_id.clone(),
             version: "<none>".to_string(),
         });
     };
-    let mut outcome = start_published(host, &request.workflow_id, &version, request).await?;
+    let (mut outcome, execution_row, start_event) =
+        prepare_published(host, &request.workflow_id, &version, request).await?;
     outcome.kind = row.kind.clone();
     let fire = TriggerFireRow {
         id: format!("fire_{}", Uuid::now_v7()),
@@ -323,7 +407,10 @@ async fn fire_row(
             .to_string(),
         ),
     };
-    let recorded = host.db.record_trigger_fire(&fire).await?;
+    let recorded = host
+        .db
+        .insert_execution_with_trigger(&execution_row, &start_event, &fire)
+        .await?;
     if !recorded {
         metrics().inc(
             "hpa_trigger_fires_total",
@@ -333,6 +420,7 @@ async fn fire_row(
             event_id: request.event_id.clone().unwrap_or_default(),
         });
     }
+    host.runtime.trigger(outcome.execution_id.clone());
     metrics().inc(
         "hpa_trigger_fires_total",
         &[("kind", row.kind.as_str()), ("result", "started")],
@@ -349,20 +437,33 @@ async fn fire_row(
     Ok(Some(outcome))
 }
 
-async fn start_published(
+async fn prepare_published(
     host: &TriggerHost,
     workflow_id: &str,
     version: &str,
     request: &FireRequest,
-) -> Result<FireOutcome, TriggerError> {
-    let row = host
-        .db
-        .get_version(workflow_id, version)
-        .await?
-        .ok_or_else(|| TriggerError::VersionMissing {
-            workflow_id: workflow_id.to_string(),
-            version: version.to_string(),
-        })?;
+) -> Result<(FireOutcome, ExecutionRow, hpa_core::runtime::ExecutionEvent), TriggerError> {
+    let row = match host.db.get_version(workflow_id, version).await? {
+        Some(row) => row,
+        None => {
+            let available = host
+                .db
+                .list_versions(workflow_id)
+                .await
+                .map(|rows| rows.into_iter().map(|row| row.version).collect::<Vec<_>>())
+                .unwrap_or_default();
+            tracing::error!(
+                workflow_id,
+                version,
+                available = ?available,
+                "trigger references a missing published workflow version"
+            );
+            return Err(TriggerError::VersionMissing {
+                workflow_id: workflow_id.to_string(),
+                version: version.to_string(),
+            });
+        }
+    };
     let workflow: Workflow = serde_json::from_str(&row.ir_json)
         .map_err(|error| TriggerError::Invalid(format!("workflow is not valid IR: {error}")))?;
     let compilation = compile_workflow(&workflow).map_err(|issues| {
@@ -397,15 +498,17 @@ async fn start_published(
         started_at: execution.started_at.clone(),
         updated_at: execution.updated_at.clone(),
     };
-    host.db.insert_execution(&execution_row, &event).await?;
-    host.runtime.trigger(execution.id.clone());
-    Ok(FireOutcome {
-        execution_id: execution.id.clone(),
-        workflow_id: execution.workflow_id.clone(),
-        workflow_version: execution.workflow_version.clone(),
-        trigger_id: request.trigger_id.clone(),
-        kind: String::new(),
-    })
+    Ok((
+        FireOutcome {
+            execution_id: execution.id.clone(),
+            workflow_id: execution.workflow_id.clone(),
+            workflow_version: execution.workflow_version.clone(),
+            trigger_id: request.trigger_id.clone(),
+            kind: String::new(),
+        },
+        execution_row,
+        event,
+    ))
 }
 
 /// Fire a webhook or manually triggered workflow immediately.
@@ -426,7 +529,7 @@ pub async fn fire_now(
             trigger_id: request.trigger_id.clone(),
         });
     }
-    if !matches!(row.kind.as_str(), "webhook" | "schedule") {
+    if !matches!(row.kind.as_str(), "webhook" | "schedule" | "event") {
         return Err(TriggerError::Unsupported {
             trigger_id: request.trigger_id.clone(),
             kind: row.kind.clone(),
@@ -435,6 +538,80 @@ pub async fn fire_now(
     fire_row(host, &row, &request)
         .await?
         .ok_or_else(|| TriggerError::Runtime("execution was not created".to_string()))
+}
+
+pub async fn fire_event(
+    host: &TriggerHost,
+    topic: &str,
+    payload: Value,
+    event_id: Option<String>,
+) -> Result<(String, Vec<FireOutcome>), TriggerError> {
+    hpa_core::trigger::validate_event_topic(topic).map_err(TriggerError::Invalid)?;
+    let event_id = event_id.unwrap_or_else(|| format!("evt_{}", Uuid::now_v7()));
+    let rows = host.db.list_triggers().await?;
+    let mut subscriptions = Vec::new();
+    for row in rows {
+        if row.kind != "event" || row.enabled == 0 {
+            continue;
+        }
+        let spec = event_of(&row)?;
+        if spec.topic == topic {
+            subscriptions.push(row);
+        }
+    }
+    if subscriptions.is_empty() {
+        return Err(TriggerError::NoSubscribers {
+            topic: topic.to_string(),
+        });
+    }
+    let mut pending = Vec::with_capacity(subscriptions.len());
+    for row in subscriptions {
+        if !host
+            .db
+            .trigger_event_delivered(&row.trigger_id, &event_id)
+            .await?
+        {
+            pending.push(row);
+        }
+    }
+    if pending.is_empty() {
+        return Err(TriggerError::Duplicate {
+            event_id: event_id.clone(),
+        });
+    }
+    let mut outcomes = Vec::with_capacity(pending.len());
+    for row in pending {
+        let outcome = fire_now(
+            host,
+            FireRequest {
+                workflow_id: row.workflow_id.clone(),
+                trigger_id: row.trigger_id.clone(),
+                input: payload.clone(),
+                event_id: Some(event_id.clone()),
+                scheduled_at: None,
+                origin: format!("event:{topic}"),
+            },
+        )
+        .await?;
+        outcomes.push(outcome);
+    }
+    Ok((event_id, outcomes))
+}
+
+pub async fn ensure_event_subscribers(host: &TriggerHost, topic: &str) -> Result<(), TriggerError> {
+    hpa_core::trigger::validate_event_topic(topic).map_err(TriggerError::Invalid)?;
+    let rows = host.db.list_triggers().await?;
+    for row in rows {
+        if row.kind != "event" || row.enabled == 0 {
+            continue;
+        }
+        if event_of(&row)?.topic == topic {
+            return Ok(());
+        }
+    }
+    Err(TriggerError::NoSubscribers {
+        topic: topic.to_string(),
+    })
 }
 
 /// Enables or disables a trigger. Enabling a schedule recomputes the next slot.
@@ -452,12 +629,6 @@ pub async fn set_enabled(
             workflow_id: workflow_id.to_string(),
             trigger_id: trigger_id.to_string(),
         })?;
-    if row.kind == "event" {
-        return Err(TriggerError::Unsupported {
-            trigger_id: trigger_id.to_string(),
-            kind: row.kind.clone(),
-        });
-    }
     let next = if enabled && row.kind == "schedule" {
         let spec = schedule_of(&row)?;
         next_fire_at(&spec, now_ms().div_euclid(1000)).map(|value| value * 1000)
@@ -484,8 +655,12 @@ pub async fn set_enabled(
 }
 
 /// Background loop. Each pass walks every active tenant's runtime.
-pub fn spawn(enterprise: crate::enterprise::EnterpriseState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+pub(crate) fn spawn(
+    enterprise: crate::enterprise::EnterpriseState,
+    coordination: Option<SchedulerCoordination>,
+) -> SchedulerRuntime {
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
         let interval = std::env::var("HPA_SCHEDULER_TICK_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -493,9 +668,52 @@ pub fn spawn(enterprise: crate::enterprise::EnterpriseState) -> tokio::task::Joi
             .unwrap_or(DEFAULT_TICK_MS);
         let mut ticker = tokio::time::interval(Duration::from_millis(interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut current_lease: Option<SchedulerLease> = None;
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = &mut stop_rx => break,
+                _ = ticker.tick() => {}
+            }
             let now = now_ms();
+            if let Some(coordination) = coordination.as_ref() {
+                let mut renewed = false;
+                if let Some(lease) = current_lease.as_ref() {
+                    match coordination
+                        .store
+                        .renew(
+                            &coordination.lease_key,
+                            lease.fencing_token,
+                            coordination.ttl_seconds,
+                        )
+                        .await
+                    {
+                        Ok(value) => renewed = value,
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot renew scheduler leadership lease");
+                        }
+                    }
+                }
+                if !renewed {
+                    current_lease = match coordination
+                        .store
+                        .acquire(&coordination.lease_key, coordination.ttl_seconds)
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            metrics().set("hpa_scheduler_leader", &[], 0.0);
+                            tracing::warn!(%error, "cannot acquire scheduler leadership lease");
+                            continue;
+                        }
+                    };
+                }
+                let leader = current_lease.is_some();
+                metrics().set("hpa_scheduler_leader", &[], if leader { 1.0 } else { 0.0 });
+                metrics().mark_scheduler_tick(now);
+                if !leader {
+                    continue;
+                }
+            }
             let tenants = match enterprise.active_tenants().await {
                 Ok(tenants) => tenants,
                 Err(error) => {
@@ -504,6 +722,35 @@ pub fn spawn(enterprise: crate::enterprise::EnterpriseState) -> tokio::task::Joi
                 }
             };
             for tenant in tenants {
+                if let (Some(coordination), Some(lease)) =
+                    (coordination.as_ref(), current_lease.as_ref())
+                {
+                    match coordination
+                        .store
+                        .renew(
+                            &coordination.lease_key,
+                            lease.fencing_token,
+                            coordination.ttl_seconds,
+                        )
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            current_lease = None;
+                            metrics().set("hpa_scheduler_leader", &[], 0.0);
+                            tracing::warn!(
+                                "scheduler leadership lease was lost before tenant tick"
+                            );
+                            break;
+                        }
+                        Err(error) => {
+                            current_lease = None;
+                            metrics().set("hpa_scheduler_leader", &[], 0.0);
+                            tracing::warn!(%error, "scheduler leadership renewal failed before tenant tick");
+                            break;
+                        }
+                    }
+                }
                 let state = match enterprise.tenant_api_state(&tenant).await {
                     Ok(state) => state,
                     Err(error) => {
@@ -533,7 +780,21 @@ pub fn spawn(enterprise: crate::enterprise::EnterpriseState) -> tokio::task::Joi
                 }
             }
         }
-    })
+        if let (Some(coordination), Some(lease)) = (coordination.as_ref(), current_lease.as_ref()) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                coordination
+                    .store
+                    .release(&coordination.lease_key, lease.fencing_token),
+            )
+            .await;
+        }
+        metrics().set("hpa_scheduler_leader", &[], 0.0);
+    });
+    SchedulerRuntime {
+        stop: Some(stop_tx),
+        task,
+    }
 }
 
 #[cfg(test)]
@@ -651,7 +912,7 @@ mod tests {
             rfc3339_from_ms(next)
         );
         let event = rows.iter().find(|row| row.trigger_id == "bus").unwrap();
-        assert_eq!(event.enabled, 0, "event triggers stay disabled");
+        assert_eq!(event.enabled, 1, "event triggers subscribe by default");
         let _ = std::fs::remove_file(path);
     }
 
@@ -802,6 +1063,83 @@ mod tests {
         )
         .await;
         assert!(matches!(disabled, Err(TriggerError::Disabled { .. })));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn partial_event_fanout_retries_only_missing_subscribers() {
+        let (host, path) = host("partial-event").await;
+        let workflow = publish(
+            &host,
+            json!([
+                {"id": "bus-a", "type": "event", "config": {"topic": "orders.created"}},
+                {"id": "bus-b", "type": "event", "config": {"topic": "orders.created"}}
+            ]),
+        )
+        .await;
+        sync_published(&host, &workflow, "1.0.0")
+            .await
+            .expect("sync");
+        let payload = json!({"orderId": "order-1"});
+        fire_now(
+            &host,
+            FireRequest {
+                workflow_id: "wf_sched".to_string(),
+                trigger_id: "bus-a".to_string(),
+                input: payload.clone(),
+                event_id: Some("evt-partial".to_string()),
+                scheduled_at: None,
+                origin: "event:orders.created".to_string(),
+            },
+        )
+        .await
+        .expect("pre-deliver first subscriber");
+        assert!(
+            host.db
+                .trigger_event_delivered("bus-a", "evt-partial")
+                .await
+                .expect("first delivery")
+        );
+        assert!(
+            !host
+                .db
+                .trigger_event_delivered("bus-b", "evt-partial")
+                .await
+                .expect("second delivery")
+        );
+
+        let (_, outcomes) = fire_event(
+            &host,
+            "orders.created",
+            payload.clone(),
+            Some("evt-partial".to_string()),
+        )
+        .await
+        .expect("retry partial fanout");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].trigger_id, "bus-b");
+        assert!(
+            host.db
+                .trigger_event_delivered("bus-a", "evt-partial")
+                .await
+                .expect("first delivery remains")
+        );
+        assert!(
+            host.db
+                .trigger_event_delivered("bus-b", "evt-partial")
+                .await
+                .expect("second delivery completed")
+        );
+        assert!(matches!(
+            fire_event(
+                &host,
+                "orders.created",
+                payload,
+                Some("evt-partial".to_string())
+            )
+            .await,
+            Err(TriggerError::Duplicate { .. })
+        ));
         let _ = std::fs::remove_file(path);
     }
 }

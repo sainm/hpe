@@ -1,0 +1,48 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "HTTP request rate",
+      "targets": [
+        { "expr": "sum by (route, status) (rate(hpa_http_requests_total[5m]))", "legendFormat": "{{route}} {{status}}" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Workflow execution p95",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(hpa_workflow_execution_seconds_bucket[10m])))", "legendFormat": "p95" }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "type": "stat",
+      "title": "Running / waiting",
+      "targets": [
+        { "expr": "hpa_executions_running", "legendFormat": "running" },
+        { "expr": "hpa_executions_waiting_approval", "legendFormat": "waiting" }
+      ],
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 8 }
+    },
+    {
+      "type": "logs",
+      "title": "Recent HPA logs (Loki)",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "targets": [{ "expr": "{service_name=\"hpa-local\"}" }],
+      "gridPos": { "h": 8, "w": 16, "x": 8, "y": 8 }
+    }
+  ],
+  "schemaVersion": 41,
+  "style": "dark",
+  "tags": ["hpa", "workflow", "agent", "mcp"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "HPA Production SLO",
+  "uid": "hpa-production-slo",
+  "version": 1
+}

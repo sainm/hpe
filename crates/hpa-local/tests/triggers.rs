@@ -62,7 +62,8 @@ fn workflow_ir() -> Value {
         ],
         "triggers": [
             {"id": "nightly", "type": "schedule", "config": {"cron": "0 9 * * *", "timezone": "+08:00"}},
-            {"id": "hook", "type": "webhook", "config": {"secret": SECRET}}
+            {"id": "hook", "type": "webhook", "config": {"secret": SECRET}},
+            {"id": "invoice-created", "type": "event", "config": {"topic": "invoice.created"}}
         ]
     })
 }
@@ -183,7 +184,7 @@ async fn triggers_fire_from_webhooks_and_the_api() {
         .await
         .expect("triggers json");
     let triggers = list["triggers"].as_array().expect("triggers array");
-    assert_eq!(triggers.len(), 2);
+    assert_eq!(triggers.len(), 3);
     let schedule = triggers
         .iter()
         .find(|row| row["triggerId"] == json!("nightly"))
@@ -203,6 +204,33 @@ async fn triggers_fire_from_webhooks_and_the_api() {
         hook_url.ends_with("/hooks/local/wf_triggers/hook"),
         "unexpected hook url {hook_url}"
     );
+    let event = triggers
+        .iter()
+        .find(|row| row["triggerId"] == json!("invoice-created"))
+        .expect("event trigger");
+    assert_eq!(event["kind"], json!("event"));
+    assert_eq!(event["enabled"], json!(true));
+
+    let event_response = server
+        .client
+        .post(server.url("/api/events/invoice.created"))
+        .header("x-hpa-event-id", "event-invoice-1")
+        .json(&json!({"invoiceId": "inv_1", "amount": 42}))
+        .send()
+        .await
+        .expect("publish event");
+    assert_eq!(event_response.status(), 202);
+    let event_body: Value = event_response.json().await.expect("event json");
+    assert_eq!(event_body["executions"].as_array().unwrap().len(), 1);
+    let duplicate_event = server
+        .client
+        .post(server.url("/api/events/invoice.created"))
+        .header("x-hpa-event-id", "event-invoice-1")
+        .json(&json!({"invoiceId": "inv_1"}))
+        .send()
+        .await
+        .expect("duplicate event");
+    assert_eq!(duplicate_event.status(), 409);
 
     // Valid delivery starts an execution.
     let body = br#"{"hello":"world"}"#;
@@ -294,6 +322,23 @@ async fn triggers_fire_from_webhooks_and_the_api() {
         .expect("enable");
     assert_eq!(enabled.status(), 200);
 
+    let event_disabled = server
+        .client
+        .post(server.url("/api/triggers/wf_triggers/invoice-created/disable"))
+        .send()
+        .await
+        .expect("disable event");
+    assert_eq!(event_disabled.status(), 200);
+    let no_subscriber = server
+        .client
+        .post(server.url("/api/events/invoice.created"))
+        .header("x-hpa-event-id", "event-invoice-disabled")
+        .json(&json!({"invoiceId": "inv_2"}))
+        .send()
+        .await
+        .expect("disabled event");
+    assert_eq!(no_subscriber.status(), 404);
+
     // Manual fire through the API.
     let fired = server
         .client
@@ -317,7 +362,7 @@ async fn triggers_fire_from_webhooks_and_the_api() {
         .await
         .expect("fires json");
     assert!(
-        fires["fires"].as_array().map(Vec::len).unwrap_or_default() >= 3,
+        fires["fires"].as_array().map(Vec::len).unwrap_or_default() >= 4,
         "each accepted delivery is recorded"
     );
 }
@@ -363,5 +408,24 @@ async fn invalid_trigger_configuration_fails_validation() {
         body["error"]["details"]
             .to_string()
             .contains("TRIGGER_ID_DUPLICATE")
+    );
+
+    let mut invalid_event = workflow_ir();
+    invalid_event["triggers"] = json!([
+        {"id": "bad-event", "type": "event", "config": {"topic": "contains spaces"}}
+    ]);
+    let response = server
+        .client
+        .post(server.url("/api/workflows"))
+        .json(&json!({"ir": invalid_event}))
+        .send()
+        .await
+        .expect("create invalid event");
+    assert_eq!(response.status(), 422);
+    let body: Value = response.json().await.expect("invalid event json");
+    assert!(
+        body["error"]["details"]
+            .to_string()
+            .contains("TRIGGER_INVALID")
     );
 }

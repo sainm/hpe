@@ -16,6 +16,14 @@ coverage/
 .vscode-test/
 *.vsix
 
+# Python service environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Local runtime data, logs and secrets
 /.hpa
 *.log

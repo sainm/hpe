@@ -4,7 +4,7 @@
 
 ## 1. 端点
 
-- HTTP：`POST http://127.0.0.1:8787/mcp`；流式 GET/SSE 未实现，返回 405。`DELETE /mcp` 关闭 legacy 会话。
+- HTTP：`POST http://127.0.0.1:8787/mcp`；legacy 会话可建立鉴权 GET SSE，modern 使用请求作用域 `subscriptions/listen` SSE。`DELETE /mcp` 关闭 legacy 会话。
 - stdio：`hpa mcp serve`。首次运行生成 `~/.hpa/mcp/stdio.capability`（权限 0600）；可用 `HPA_MCP_TOKEN` 替代。
 - 资源元数据：`GET /.well-known/oauth-protected-resource`；401 响应带 `WWW-Authenticate: Bearer resource_metadata=...`。
 - 管理 API/UI：`/api/mcp/*` 与 `/mcp-center` 仅绑定 loopback，不加登录；MCP endpoint 本身必须携带 PAT/能力令牌。
@@ -17,7 +17,7 @@
 | 会话 | 无状态，每个请求独立 `_meta` | `MCP-Session-Id`，进程内 1 小时 TTL |
 | Header | `MCP-Protocol-Version`、`Mcp-Method`、`Mcp-Name` | 仅 session |
 | 结果 | `resultType: complete`；MRTR 返回 `input_required` + `inputRequests` + `requestState` | 无 `resultType` |
-| 取消/订阅/tasks | 未实现 | 未实现 |
+| 取消/订阅/tasks | `subscriptions/listen` 目录通知；`tasks/get`；等待审批任务可取消 | JSON-RPC 取消通知可用；GET SSE 为进程内长连接 |
 
 `tools/list`、`resources/list`、`prompts/list` 返回 `cacheScope: private` 与 `ttlMs`。`tools/call`、`resources/read`、`prompts/get` 校验 `Mcp-Name`。
 
@@ -60,9 +60,35 @@ X-HPA-Tool-Name-Style: slug
 - Codex：`codex mcp add ... --bearer-token-env-var HPA_MCP_TOKEN` 后 `codex debug prompt-input` 连接服务端，审计记录 `initialize` 与 `tools/list`。
 - 只读工具调用由 hpa MCP Client 在同一 Gateway 上完成（`workflow.list` 与 Skill 脚本）；外部模型会话未自动执行，避免未授权的模型/凭证消耗。
 
+### 6.1 官方 conformance
+
+固定使用 npmmirror 下载的 `@modelcontextprotocol/conformance@0.1.16`：
+
+```bash
+cargo build -p hpa-local
+pnpm test:mcp-conformance
+```
+
+脚本建立临时 Runtime、PAT，并通过只监听 loopback 的认证代理运行官方 server 场景。当前 2025-11-25 核心矩阵 9/9 场景 PASS：
+
+- `server-initialize`
+- `ping`
+- `logging-set-level`
+- `tools-list`
+- `tools-call-simple-text`
+- `tools-call-error`
+- `resources-list`
+- `prompts-list`
+- `dns-rebinding-protection`
+
+`HPA_MCP_CONFORMANCE=1` 只用于该临时进程，额外注册 `test_simple_text`、`test_error_handling` 并接受 logging level；未设置时测试工具不会出现在工具目录。结果保存在 `target/mcp-conformance/<timestamp>/`，每个场景都有 `checks.json`。
+
+官方包尚无 2026-07-28 server 场景，因此 modern `server/discover`、MRTR、`subscriptions/listen` 和 tasks 仍由仓库协议测试与双进程测试覆盖，不能把 9/9 结果解释为两个规范版本完整 conformance。
+
 ## 7. 已知边界
 
-- 未实现 OAuth 授权服务器/PKCE/DCR、GET/SSE、subscriptions、tasks、多租户隔离。
-- legacy 会话只存在内存；重启后需要重新 initialize。
+- OAuth AS/PKCE/DCR 已由 Phase 10 提供；设置 `HPA_POSTGRES_MCP=1` 后 session/subscription/task 持久化，notification 支持跨节点轮询、慢消费者断开和 sequence 重放。未启用时仍为单进程内存路径。
+- legacy 会话在 PostgreSQL 模式可跨重启保留；未启用 PostgreSQL 时只存在内存，重启后需要重新 initialize。
+- 官方 conformance 包当前只覆盖到 2025-11-25；2026-07-28 无官方 server 场景可比对。
 - 管理 API 依赖 loopback；生产需增加本地登录/CSRF 防护。
-- 外部客户端真实模型会话中的工具调用尚未自动验证。
+- 外部客户端真实模型会话中的工具调用尚未在本机自动验证。

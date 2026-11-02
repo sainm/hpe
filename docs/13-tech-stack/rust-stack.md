@@ -31,7 +31,7 @@
 | JSON Schema validation | jsonschema | 0.60.2 | MIT | Draft 2020-12；IR/工具 schema |
 | DB | sqlx | 0.9.0 | MIT/Apache | Async；Postgres + SQLite；迁移；compile-time queries |
 | gRPC | tonic + tonic-prost | 0.14.9 | MIT | 流式/超时/TLS；prost 0.14.4 |
-| Observability | tracing + tracing-opentelemetry + opentelemetry + opentelemetry-otlp | 0.1.44 / 0.34.0 / 0.33.1 / 0.33.1 | MIT/Apache | tracing ↔ OTel 兼容配对 |
+| Observability | tracing + tracing-opentelemetry + opentelemetry-appender-tracing + opentelemetry-otlp | 0.1.44 / 0.34.0 / 0.33.1 / 0.33.1 | MIT/Apache | tracing ↔ OTel traces/metrics/logs 兼容配对 |
 | WASM | wasmtime + wasmtime-wasi | 50.0.1 | Apache-2.0 WITH LLVM-exception | WASI p2/p3、组件、epoch/fuel/resource limiter |
 | MCP | rmcp | 3.8.0 | Apache-2.0（过渡） | 官方 Rust SDK；2026-07-28 + 2025-11-25 |
 | HTTP client | reqwest + rustls | 0.13.5 / 0.23.46 | MIT/Apache | 纯 Rust TLS；连接池 |

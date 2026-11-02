@@ -4,7 +4,10 @@ import type {
   AgentSummary,
   Artifact,
   ExecutionSummary,
+  MarketplacePublisher,
+  MarketplaceSource,
   PluginSummary,
+  RemoteMarketplacePackage,
   SkillSummary,
   WorkflowSummary,
 } from "../runtime/types";
@@ -17,6 +20,9 @@ export interface HpaTreeItem extends vscode.TreeItem {
   record?: InstalledSkillRecord;
   agent?: AgentSummary;
   plugin?: PluginSummary;
+  marketplaceSource?: MarketplaceSource;
+  marketplacePublisher?: MarketplacePublisher;
+  remotePackage?: RemoteMarketplacePackage;
   children?: HpaTreeItem[];
 }
 

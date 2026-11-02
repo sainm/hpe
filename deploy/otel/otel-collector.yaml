@@ -1,0 +1,99 @@
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        max_request_body_size: 4194304
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 384
+    spike_limit_mib: 96
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+  tail_sampling:
+    decision_wait: 10s
+    num_traces: 100000
+    expected_new_traces_per_sec: 100
+    policies:
+      - name: errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: slow
+        type: latency
+        latency:
+          threshold_ms: 5000
+      - name: baseline
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+  attributes/sanitize:
+    actions:
+      - key: authorization
+        action: delete
+      - key: http.request.header.authorization
+        action: delete
+      - key: cookie
+        action: delete
+      - key: set-cookie
+        action: delete
+      - key: api_key
+        action: delete
+      - key: api.key
+        action: delete
+      - key: bearer_token
+        action: delete
+      - key: model.api_key
+        action: delete
+      - key: db.statement
+        action: delete
+      - key: checkpoint
+        action: delete
+  resource:
+    attributes:
+      - key: deployment.environment.name
+        value: production
+        action: upsert
+
+exporters:
+  otlphttp/tempo:
+    endpoint: http://tempo:4318
+    tls:
+      insecure: true
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+    tls:
+      insecure: true
+  prometheus:
+    endpoint: 0.0.0.0:9464
+    resource_to_telemetry_conversion:
+      enabled: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        [memory_limiter, attributes/sanitize, resource, tail_sampling, batch]
+      exporters: [otlphttp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/sanitize, resource, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/sanitize, resource, batch]
+      exporters: [otlphttp/loki]
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: normal

@@ -1,13 +1,17 @@
 use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use reqwest::Url;
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::enterprise_ops::{OidcPrincipal, OpsError, OpsService};
 
@@ -17,6 +21,11 @@ const DEFAULT_SCOPES: &str = "openid email profile";
 const DEFAULT_SESSION_TTL: i64 = 28_800;
 const MIN_SESSION_TTL: i64 = 300;
 const MAX_SESSION_TTL: i64 = 604_800;
+const MAX_ACCESS_TOKEN_TTL: i64 = 2_592_000;
+const MAX_REFRESH_TOKEN_TTL: i64 = 31_536_000;
+const KEY_DIRECTORY: &str = "keys";
+const KEY_FILE: &str = "browser-auth.key";
+const SECRET_ENVELOPE_VERSION: &str = "v1";
 
 #[derive(Clone)]
 pub struct BrowserAuth {
@@ -36,6 +45,8 @@ pub struct SessionPrincipal {
     pub role: String,
     pub platform_admin: bool,
     pub expires_at: i64,
+    pub access_token_expires_at: Option<i64>,
+    pub refresh_available: bool,
 }
 
 pub struct LoginStart {
@@ -48,6 +59,19 @@ pub struct LoginResult {
     pub redirect: String,
 }
 
+#[allow(dead_code)]
+pub struct RefreshResult {
+    pub principal: SessionPrincipal,
+    pub cookie: String,
+}
+
+#[allow(dead_code)]
+pub struct LogoutResult {
+    pub revoked: bool,
+    pub cookie: String,
+    pub logout_url: Option<String>,
+}
+
 #[derive(Debug)]
 pub enum BrowserAuthError {
     Invalid(String),
@@ -56,6 +80,8 @@ pub enum BrowserAuthError {
     Upstream(String),
     Db(sqlx::Error),
     Json(serde_json::Error),
+    Io(std::io::Error),
+    Crypto(String),
 }
 
 impl fmt::Display for BrowserAuthError {
@@ -69,6 +95,8 @@ impl fmt::Display for BrowserAuthError {
             Self::Upstream(message) => write!(formatter, "browser auth upstream error: {message}"),
             Self::Db(error) => write!(formatter, "browser auth database error: {error}"),
             Self::Json(error) => write!(formatter, "browser auth json error: {error}"),
+            Self::Io(error) => write!(formatter, "browser auth I/O error: {error}"),
+            Self::Crypto(error) => write!(formatter, "browser auth crypto error: {error}"),
         }
     }
 }
@@ -78,6 +106,7 @@ impl std::error::Error for BrowserAuthError {
         match self {
             Self::Db(error) => Some(error),
             Self::Json(error) => Some(error),
+            Self::Io(error) => Some(error),
             _ => None,
         }
     }
@@ -95,6 +124,12 @@ impl From<serde_json::Error> for BrowserAuthError {
     }
 }
 
+impl From<std::io::Error> for BrowserAuthError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
 #[derive(Clone)]
 pub struct BrowserConfig {
     pub client_id: String,
@@ -105,6 +140,8 @@ pub struct BrowserConfig {
     pub admin_subjects: Vec<String>,
     pub cookie_secure: bool,
     pub session_ttl_seconds: i64,
+    pub end_session_endpoint: Option<String>,
+    pub post_logout_redirect_uri: Option<String>,
 }
 
 impl BrowserConfig {
@@ -114,6 +151,8 @@ impl BrowserConfig {
         let authorization_endpoint = text("authorizationEndpoint");
         let token_endpoint = text("tokenEndpoint");
         let redirect_uri = text("redirectUri");
+        let end_session_endpoint = text("endSessionEndpoint");
+        let post_logout_redirect_uri = text("postLogoutRedirectUri");
         if text("issuer").is_empty()
             || text("audience").is_empty()
             || text("jwksUrl").is_empty()
@@ -159,6 +198,10 @@ impl BrowserConfig {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             session_ttl_seconds,
+            end_session_endpoint: (!end_session_endpoint.is_empty())
+                .then(|| end_session_endpoint.to_string()),
+            post_logout_redirect_uri: (!post_logout_redirect_uri.is_empty())
+                .then(|| post_logout_redirect_uri.to_string()),
         })
     }
 }
@@ -180,6 +223,35 @@ struct CreatedSession {
     token: String,
     csrf_token: String,
     expires_at: i64,
+    access_token_expires_at: Option<i64>,
+    refresh_available: bool,
+}
+
+struct TokenGrant {
+    id_token: Option<String>,
+    refresh_token: Option<String>,
+    access_token_expires_at: i64,
+    refresh_token_expires_at: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, sqlx::FromRow)]
+struct StoredSession {
+    id: String,
+    csrf_token: String,
+    tenant_id: String,
+    subject: String,
+    email: Option<String>,
+    display_name: Option<String>,
+    role: String,
+    platform_admin: i64,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+    refresh_token_ciphertext: Option<String>,
+    refresh_token_version: i64,
+    refresh_token_expires_at: Option<i64>,
+    id_token_ciphertext: Option<String>,
+    access_token_expires_at: Option<i64>,
 }
 
 impl BrowserAuth {
@@ -214,7 +286,57 @@ impl BrowserAuth {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 revoked_at INTEGER,
-                last_seen_at INTEGER
+                last_seen_at INTEGER,
+                refresh_token_ciphertext TEXT,
+                refresh_token_version INTEGER NOT NULL DEFAULT 0,
+                refresh_token_expires_at INTEGER,
+                id_token_ciphertext TEXT,
+                access_token_expires_at INTEGER,
+                last_refresh_at INTEGER
+            )",
+        )
+        .execute(&self.control)
+        .await?;
+        let columns: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_table_info('enterprise_sessions')")
+                .fetch_all(&self.control)
+                .await?;
+        let additions = [
+            (
+                "refresh_token_ciphertext",
+                "ALTER TABLE enterprise_sessions ADD COLUMN refresh_token_ciphertext TEXT",
+            ),
+            (
+                "refresh_token_version",
+                "ALTER TABLE enterprise_sessions ADD COLUMN refresh_token_version INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "refresh_token_expires_at",
+                "ALTER TABLE enterprise_sessions ADD COLUMN refresh_token_expires_at INTEGER",
+            ),
+            (
+                "id_token_ciphertext",
+                "ALTER TABLE enterprise_sessions ADD COLUMN id_token_ciphertext TEXT",
+            ),
+            (
+                "access_token_expires_at",
+                "ALTER TABLE enterprise_sessions ADD COLUMN access_token_expires_at INTEGER",
+            ),
+            (
+                "last_refresh_at",
+                "ALTER TABLE enterprise_sessions ADD COLUMN last_refresh_at INTEGER",
+            ),
+        ];
+        for (name, statement) in additions {
+            if !columns.iter().any(|column| column == name) {
+                sqlx::query(statement).execute(&self.control).await?;
+            }
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS enterprise_logout_flows (
+                state_hash TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
             )",
         )
         .execute(&self.control)
@@ -225,6 +347,7 @@ impl BrowserAuth {
         )
         .execute(&self.control)
         .await?;
+        self.encryption_key()?;
         Ok(())
     }
 
@@ -294,12 +417,7 @@ impl BrowserAuth {
             .config()
             .await?
             .ok_or_else(|| BrowserAuthError::Invalid("sso_unavailable".to_string()))?;
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
+        let client = upstream_client()?;
         let form = [
             ("grant_type", "authorization_code"),
             ("code", code),
@@ -326,13 +444,10 @@ impl BrowserAuth {
             .json()
             .await
             .map_err(|error| BrowserAuthError::Upstream(error.to_string()))?;
-        let id_token = document
-            .get("id_token")
-            .and_then(Value::as_str)
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| {
-                BrowserAuthError::Upstream("token response has no id_token".to_string())
-            })?;
+        let grant = parse_token_grant(&document, now_ms())?;
+        let id_token = grant.id_token.as_deref().ok_or_else(|| {
+            BrowserAuthError::Upstream("token response has no id_token".to_string())
+        })?;
         let principal: OidcPrincipal = self
             .ops
             .verify_id_token(id_token, &flow.nonce)
@@ -374,6 +489,7 @@ impl BrowserAuth {
                 &role,
                 platform_admin,
                 config.session_ttl_seconds,
+                grant,
             )
             .await?;
         let cookie = session_cookie(
@@ -392,93 +508,301 @@ impl BrowserAuth {
                 role,
                 platform_admin,
                 expires_at: session.expires_at,
+                access_token_expires_at: session.access_token_expires_at,
+                refresh_available: session.refresh_available,
             },
             cookie,
             redirect,
         })
     }
 
-    #[allow(clippy::type_complexity)]
     pub async fn session(
         &self,
         cookie_header: Option<&str>,
     ) -> Result<Option<SessionPrincipal>, BrowserAuthError> {
-        let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
-            return Ok(None);
-        };
-        let token_hash = sha256_hex(token.as_bytes());
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-            i64,
-            i64,
-            Option<i64>,
-        )> = sqlx::query_as(
-            "SELECT id, csrf_token, tenant_id, subject, email, display_name, role,
-                    platform_admin, expires_at, revoked_at
-             FROM enterprise_sessions WHERE token_hash = ?",
-        )
-        .bind(&token_hash)
-        .fetch_optional(&self.control)
-        .await?;
-        let Some((
-            session_id,
-            csrf_token,
-            tenant_id,
-            subject,
-            email,
-            display_name,
-            stored_role,
-            platform_admin,
-            expires_at,
-            revoked_at,
-        )) = row
-        else {
+        let Some(stored) = self.stored_session(cookie_header).await? else {
             return Ok(None);
         };
         let now = now_ms();
-        if revoked_at.is_some() || expires_at <= now {
+        if stored.revoked_at.is_some() || stored.expires_at <= now {
             return Ok(None);
         }
-        self.ensure_active_tenant(&tenant_id).await?;
+        self.ensure_active_tenant(&stored.tenant_id).await?;
         let member = self
-            .find_member(&tenant_id, &subject, email.as_deref())
+            .find_member(&stored.tenant_id, &stored.subject, stored.email.as_deref())
             .await?;
         let role = match member {
             Some(member) if member.status != "active" => {
                 return Err(BrowserAuthError::Forbidden("member_disabled".to_string()));
             }
             Some(member) => member.role,
-            None => stored_role,
+            None => stored.role.clone(),
         };
         let _ = sqlx::query("UPDATE enterprise_sessions SET last_seen_at = ? WHERE id = ?")
             .bind(now)
-            .bind(&session_id)
+            .bind(&stored.id)
             .execute(&self.control)
             .await;
-        Ok(Some(SessionPrincipal {
-            session_id,
-            csrf_token,
-            tenant_id,
-            subject,
-            email,
-            display_name,
-            role,
-            platform_admin: platform_admin != 0,
-            expires_at,
-        }))
+        Ok(Some(principal_from_stored(stored, role)))
     }
 
-    pub async fn logout(&self, cookie_header: Option<&str>) -> Result<bool, BrowserAuthError> {
+    #[allow(dead_code)]
+    pub async fn refresh(
+        &self,
+        cookie_header: Option<&str>,
+    ) -> Result<RefreshResult, BrowserAuthError> {
+        let token = cookie_value(cookie_header, SESSION_COOKIE)
+            .ok_or_else(|| BrowserAuthError::Invalid("session_required".to_string()))?;
+        let token_hash = sha256_hex(token.as_bytes());
+        let stored = self
+            .stored_session_by_hash(&token_hash)
+            .await?
+            .ok_or_else(|| BrowserAuthError::Invalid("session_invalid".to_string()))?;
+        let now = now_ms();
+        if stored.revoked_at.is_some() || stored.expires_at <= now {
+            return Err(BrowserAuthError::Invalid("session_invalid".to_string()));
+        }
+        self.ensure_active_tenant(&stored.tenant_id).await?;
+        let member = self
+            .find_member(&stored.tenant_id, &stored.subject, stored.email.as_deref())
+            .await?;
+        let current_role = match member {
+            Some(member) if member.status != "active" => {
+                return Err(BrowserAuthError::Forbidden("member_disabled".to_string()));
+            }
+            Some(member) => member.role,
+            None => stored.role.clone(),
+        };
+        let config = self
+            .config()
+            .await?
+            .ok_or_else(|| BrowserAuthError::Invalid("sso_unavailable".to_string()))?;
+        let ciphertext = stored
+            .refresh_token_ciphertext
+            .as_deref()
+            .ok_or_else(|| BrowserAuthError::Invalid("refresh_unavailable".to_string()))?;
+        if stored.refresh_token_version <= 0 {
+            return Err(BrowserAuthError::Invalid("refresh_unavailable".to_string()));
+        }
+        if stored
+            .refresh_token_expires_at
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            self.revoke_session_id(&stored.id).await?;
+            return Err(BrowserAuthError::Forbidden(
+                "session_refresh_expired".to_string(),
+            ));
+        }
+        let refresh_token =
+            match self.decrypt_secret(ciphertext, &format!("refresh-token:{}", stored.id)) {
+                Ok(token) => Zeroizing::new(token),
+                Err(_) => {
+                    self.revoke_session_id(&stored.id).await?;
+                    return Err(BrowserAuthError::Forbidden(
+                        "session_refresh_failed".to_string(),
+                    ));
+                }
+            };
+        let client = upstream_client()?;
+        let response = match client
+            .post(&config.token_endpoint)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token.as_str()),
+                ("client_id", config.client_id.as_str()),
+            ])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                self.revoke_session_id(&stored.id).await?;
+                return Err(BrowserAuthError::Forbidden(
+                    "session_refresh_failed".to_string(),
+                ));
+            }
+        };
+        if !response.status().is_success() {
+            self.revoke_session_id(&stored.id).await?;
+            return Err(BrowserAuthError::Forbidden(
+                "session_refresh_failed".to_string(),
+            ));
+        }
+        let document: Value = match response.json().await {
+            Ok(document) => document,
+            Err(_) => {
+                self.revoke_session_id(&stored.id).await?;
+                return Err(BrowserAuthError::Forbidden(
+                    "session_refresh_failed".to_string(),
+                ));
+            }
+        };
+        let grant = match parse_token_grant(&document, now) {
+            Ok(grant) => grant,
+            Err(_) => {
+                self.revoke_session_id(&stored.id).await?;
+                return Err(BrowserAuthError::Forbidden(
+                    "session_refresh_failed".to_string(),
+                ));
+            }
+        };
+        if let Some(id_token) = grant.id_token.as_deref() {
+            let principal = match self.ops.verify_oidc_token(id_token).await {
+                Ok(principal) => principal,
+                Err(_) => {
+                    self.revoke_session_id(&stored.id).await?;
+                    return Err(BrowserAuthError::Forbidden(
+                        "session_refresh_failed".to_string(),
+                    ));
+                }
+            };
+            if principal.tenant_id != stored.tenant_id || principal.subject != stored.subject {
+                self.revoke_session_id(&stored.id).await?;
+                return Err(BrowserAuthError::Forbidden(
+                    "session_refresh_identity_changed".to_string(),
+                ));
+            }
+        }
+        self.ensure_active_tenant(&stored.tenant_id).await?;
+        let member = self
+            .find_member(&stored.tenant_id, &stored.subject, stored.email.as_deref())
+            .await?;
+        let role = match member {
+            Some(member) if member.status != "active" => {
+                self.revoke_session_id(&stored.id).await?;
+                return Err(BrowserAuthError::Forbidden("member_disabled".to_string()));
+            }
+            Some(member) => member.role,
+            None => current_role,
+        };
+        let refreshed_at = now_ms();
+        let session_expires_at = refreshed_at
+            .saturating_add(config.session_ttl_seconds.saturating_mul(1000))
+            .min(
+                grant
+                    .refresh_token_expires_at
+                    .or(stored.refresh_token_expires_at)
+                    .unwrap_or(i64::MAX),
+            );
+        if session_expires_at <= refreshed_at {
+            self.revoke_session_id(&stored.id).await?;
+            return Err(BrowserAuthError::Forbidden(
+                "session_refresh_expired".to_string(),
+            ));
+        }
+        let new_token = random_token()?;
+        let new_token_hash = sha256_hex(new_token.as_bytes());
+        let refresh_ciphertext = match grant.refresh_token.as_deref() {
+            Some(refresh_token) => {
+                match self.encrypt_secret(refresh_token, &format!("refresh-token:{}", stored.id)) {
+                    Ok(ciphertext) => ciphertext,
+                    Err(_) => {
+                        self.revoke_session_id(&stored.id).await?;
+                        return Err(BrowserAuthError::Forbidden(
+                            "session_refresh_failed".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => ciphertext.to_string(),
+        };
+        let refresh_expires_at = grant
+            .refresh_token_expires_at
+            .or(stored.refresh_token_expires_at);
+        let id_token_ciphertext = match grant.id_token.as_deref() {
+            Some(id_token) => {
+                match self.encrypt_secret(id_token, &format!("id-token:{}", stored.id)) {
+                    Ok(ciphertext) => Some(ciphertext),
+                    Err(_) => {
+                        self.revoke_session_id(&stored.id).await?;
+                        return Err(BrowserAuthError::Forbidden(
+                            "session_refresh_failed".to_string(),
+                        ));
+                    }
+                }
+            }
+            None => stored.id_token_ciphertext.clone(),
+        };
+        let updated = sqlx::query(
+            "UPDATE enterprise_sessions
+             SET token_hash = ?, refresh_token_ciphertext = ?,
+                 refresh_token_version = refresh_token_version + 1,
+                 refresh_token_expires_at = ?, id_token_ciphertext = ?,
+                 access_token_expires_at = ?, expires_at = ?,
+                 last_refresh_at = ?, last_seen_at = ?
+             WHERE id = ? AND token_hash = ? AND refresh_token_version = ?
+               AND revoked_at IS NULL",
+        )
+        .bind(&new_token_hash)
+        .bind(&refresh_ciphertext)
+        .bind(refresh_expires_at)
+        .bind(&id_token_ciphertext)
+        .bind(grant.access_token_expires_at)
+        .bind(session_expires_at)
+        .bind(refreshed_at)
+        .bind(refreshed_at)
+        .bind(&stored.id)
+        .bind(&token_hash)
+        .bind(stored.refresh_token_version)
+        .execute(&self.control)
+        .await?;
+        if updated.rows_affected() != 1 {
+            self.revoke_session_id(&stored.id).await?;
+            return Err(BrowserAuthError::Forbidden(
+                "session_refresh_replay".to_string(),
+            ));
+        }
+        let ttl_seconds = ((session_expires_at - refreshed_at) / 1000).max(1);
+        let mut principal = principal_from_stored(stored, role);
+        principal.expires_at = session_expires_at;
+        principal.access_token_expires_at = Some(grant.access_token_expires_at);
+        principal.refresh_available =
+            refresh_expires_at.is_none_or(|expires_at| expires_at > refreshed_at);
+        Ok(RefreshResult {
+            cookie: session_cookie(&new_token, ttl_seconds, config.cookie_secure),
+            principal,
+        })
+    }
+
+    pub async fn logout(
+        &self,
+        cookie_header: Option<&str>,
+    ) -> Result<LogoutResult, BrowserAuthError> {
+        let config = self.config().await?.unwrap_or_else(|| BrowserConfig {
+            client_id: String::new(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            redirect_uri: String::new(),
+            scopes: String::new(),
+            admin_subjects: Vec::new(),
+            cookie_secure: false,
+            session_ttl_seconds: DEFAULT_SESSION_TTL,
+            end_session_endpoint: None,
+            post_logout_redirect_uri: None,
+        });
+        let clear_cookie = clear_cookie(config.cookie_secure);
         let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
-            return Ok(false);
+            return Ok(LogoutResult {
+                revoked: false,
+                cookie: clear_cookie,
+                logout_url: None,
+            });
         };
         let token_hash = sha256_hex(token.as_bytes());
+        let stored = self.stored_session_by_hash(&token_hash).await?;
+        let id_token = stored
+            .as_ref()
+            .and_then(|session| session.id_token_ciphertext.as_deref())
+            .and_then(|ciphertext| {
+                stored.as_ref().and_then(|session| {
+                    self.decrypt_secret(ciphertext, &format!("id-token:{}", session.id))
+                        .ok()
+                })
+            });
         let revoked = sqlx::query(
             "UPDATE enterprise_sessions SET revoked_at = ?
              WHERE token_hash = ? AND revoked_at IS NULL",
@@ -487,7 +811,57 @@ impl BrowserAuth {
         .bind(&token_hash)
         .execute(&self.control)
         .await?;
-        Ok(revoked.rows_affected() > 0)
+        let logout_url = match (
+            stored.as_ref(),
+            id_token,
+            config.end_session_endpoint.as_deref(),
+            config.post_logout_redirect_uri.as_deref(),
+        ) {
+            (Some(_session), Some(id_token), Some(endpoint), Some(redirect_uri)) => self
+                .logout_url(&config.client_id, endpoint, redirect_uri, &id_token)
+                .await
+                .ok(),
+            _ => None,
+        };
+        Ok(LogoutResult {
+            revoked: revoked.rows_affected() > 0,
+            cookie: clear_cookie,
+            logout_url,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub async fn consume_logout_state(&self, state: &str) -> Result<(), BrowserAuthError> {
+        if state.trim().is_empty() {
+            return Err(BrowserAuthError::Invalid(
+                "logout_state_invalid".to_string(),
+            ));
+        }
+        let state_hash = sha256_hex(state.as_bytes());
+        let expires_at: Option<i64> = sqlx::query_scalar(
+            "DELETE FROM enterprise_logout_flows WHERE state_hash = ?
+             RETURNING expires_at",
+        )
+        .bind(&state_hash)
+        .fetch_optional(&self.control)
+        .await?;
+        if expires_at.is_none_or(|expires_at| expires_at <= now_ms()) {
+            return Err(BrowserAuthError::Invalid(
+                "logout_state_invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn clear_session_cookie(&self) -> String {
+        let secure = self
+            .config()
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.cookie_secure);
+        clear_cookie(secure)
     }
 
     #[allow(dead_code)]
@@ -510,7 +884,6 @@ impl BrowserAuth {
         Ok(csrf_header == principal.csrf_token)
     }
 
-    #[cfg(test)]
     pub async fn revoke_tenant_sessions(&self, tenant_id: &str) -> Result<usize, BrowserAuthError> {
         let revoked = sqlx::query(
             "UPDATE enterprise_sessions SET revoked_at = ?
@@ -521,6 +894,180 @@ impl BrowserAuth {
         .execute(&self.control)
         .await?;
         Ok(revoked.rows_affected() as usize)
+    }
+
+    async fn stored_session(
+        &self,
+        cookie_header: Option<&str>,
+    ) -> Result<Option<StoredSession>, BrowserAuthError> {
+        let Some(token) = cookie_value(cookie_header, SESSION_COOKIE) else {
+            return Ok(None);
+        };
+        self.stored_session_by_hash(&sha256_hex(token.as_bytes()))
+            .await
+    }
+
+    async fn stored_session_by_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<StoredSession>, BrowserAuthError> {
+        Ok(sqlx::query_as(
+            "SELECT id, csrf_token, tenant_id, subject, email, display_name, role,
+                    platform_admin, expires_at, revoked_at,
+                    refresh_token_ciphertext, refresh_token_version,
+                    refresh_token_expires_at, id_token_ciphertext,
+                    access_token_expires_at
+             FROM enterprise_sessions WHERE token_hash = ?",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.control)
+        .await?)
+    }
+
+    #[allow(dead_code)]
+    async fn revoke_session_id(&self, session_id: &str) -> Result<(), BrowserAuthError> {
+        sqlx::query(
+            "UPDATE enterprise_sessions SET revoked_at = ?
+             WHERE id = ? AND revoked_at IS NULL",
+        )
+        .bind(now_ms())
+        .bind(session_id)
+        .execute(&self.control)
+        .await?;
+        Ok(())
+    }
+
+    async fn logout_url(
+        &self,
+        client_id: &str,
+        endpoint: &str,
+        redirect_uri: &str,
+        id_token: &str,
+    ) -> Result<String, BrowserAuthError> {
+        let state = random_token()?;
+        let state_hash = sha256_hex(state.as_bytes());
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO enterprise_logout_flows (state_hash, created_at, expires_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind(&state_hash)
+        .bind(now)
+        .bind(now.saturating_add(FLOW_TTL_MS))
+        .execute(&self.control)
+        .await?;
+        let mut url = Url::parse(endpoint)
+            .map_err(|_| BrowserAuthError::Invalid("logout_endpoint_invalid".to_string()))?;
+        url.set_fragment(None);
+        url.query_pairs_mut()
+            .append_pair("id_token_hint", id_token)
+            .append_pair("client_id", client_id)
+            .append_pair("post_logout_redirect_uri", redirect_uri)
+            .append_pair("state", &state);
+        Ok(url.to_string())
+    }
+
+    fn encryption_key(&self) -> Result<Zeroizing<Vec<u8>>, BrowserAuthError> {
+        let directory = self.ops.data_dir.join(KEY_DIRECTORY);
+        fs::create_dir_all(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let path = directory.join(KEY_FILE);
+        if let Ok(metadata) = fs::symlink_metadata(&path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(BrowserAuthError::Crypto(
+                "browser auth key must not be a symbolic link".to_string(),
+            ));
+        }
+        match File::open(&path) {
+            Ok(file) => read_encryption_key(file, &path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut bytes = [0u8; 32];
+                getrandom::getrandom(&mut bytes)
+                    .map_err(|error| BrowserAuthError::Crypto(error.to_string()))?;
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                match options.open(&path) {
+                    Ok(mut file) => {
+                        file.write_all(&bytes)?;
+                        file.sync_all()?;
+                        Ok(Zeroizing::new(bytes.to_vec()))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        read_encryption_key(File::open(&path)?, &path)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn encrypt_secret(&self, plaintext: &str, context: &str) -> Result<String, BrowserAuthError> {
+        let key = self.encryption_key()?;
+        let unbound = UnboundKey::new(&AES_256_GCM, &key)
+            .map_err(|_| BrowserAuthError::Crypto("invalid encryption key".to_string()))?;
+        let key = LessSafeKey::new(unbound);
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::getrandom(&mut nonce_bytes)
+            .map_err(|error| BrowserAuthError::Crypto(error.to_string()))?;
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut ciphertext = plaintext.as_bytes().to_vec();
+        key.seal_in_place_append_tag(nonce, Aad::from(context.as_bytes()), &mut ciphertext)
+            .map_err(|_| BrowserAuthError::Crypto("token encryption failed".to_string()))?;
+        Ok(format!(
+            "{SECRET_ENVELOPE_VERSION}:{}:{}",
+            URL_SAFE_NO_PAD.encode(nonce_bytes),
+            URL_SAFE_NO_PAD.encode(ciphertext)
+        ))
+    }
+
+    fn decrypt_secret(&self, envelope: &str, context: &str) -> Result<String, BrowserAuthError> {
+        let mut parts = envelope.split(':');
+        if parts.next() != Some(SECRET_ENVELOPE_VERSION) {
+            return Err(BrowserAuthError::Crypto(
+                "unsupported token envelope".to_string(),
+            ));
+        }
+        let nonce = parts
+            .next()
+            .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+            .filter(|value| value.len() == 12)
+            .ok_or_else(|| BrowserAuthError::Crypto("invalid token nonce".to_string()))?;
+        let mut ciphertext = parts
+            .next()
+            .and_then(|value| URL_SAFE_NO_PAD.decode(value).ok())
+            .ok_or_else(|| BrowserAuthError::Crypto("invalid token ciphertext".to_string()))?;
+        if parts.next().is_some() {
+            return Err(BrowserAuthError::Crypto(
+                "invalid token envelope".to_string(),
+            ));
+        }
+        let key = self.encryption_key()?;
+        let unbound = UnboundKey::new(&AES_256_GCM, &key)
+            .map_err(|_| BrowserAuthError::Crypto("invalid encryption key".to_string()))?;
+        let key = LessSafeKey::new(unbound);
+        let nonce_bytes: [u8; 12] = nonce
+            .try_into()
+            .map_err(|_| BrowserAuthError::Crypto("invalid token nonce".to_string()))?;
+        let plaintext = key
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::from(context.as_bytes()),
+                &mut ciphertext,
+            )
+            .map_err(|_| BrowserAuthError::Crypto("token authentication failed".to_string()))?;
+        String::from_utf8(plaintext.to_vec())
+            .map_err(|_| BrowserAuthError::Crypto("decrypted token is not UTF-8".to_string()))
     }
 
     async fn config(&self) -> Result<Option<BrowserConfig>, BrowserAuthError> {
@@ -613,18 +1160,35 @@ impl BrowserAuth {
         role: &str,
         platform_admin: bool,
         ttl_seconds: i64,
+        grant: TokenGrant,
     ) -> Result<CreatedSession, BrowserAuthError> {
         let token = random_token()?;
         let csrf_token = random_token()?;
         let token_hash = sha256_hex(token.as_bytes());
         let id = format!("sess_{}", Uuid::now_v7());
         let now = now_ms();
-        let expires_at = now + ttl_seconds.max(1) * 1000;
+        let expires_at = now
+            .saturating_add(ttl_seconds.max(1).saturating_mul(1000))
+            .min(grant.refresh_token_expires_at.unwrap_or(i64::MAX));
+        let refresh_token_ciphertext = grant
+            .refresh_token
+            .as_deref()
+            .map(|token| self.encrypt_secret(token, &format!("refresh-token:{id}")))
+            .transpose()?;
+        let refresh_token_version = i64::from(refresh_token_ciphertext.is_some());
+        let id_token_ciphertext = grant
+            .id_token
+            .as_deref()
+            .map(|token| self.encrypt_secret(token, &format!("id-token:{id}")))
+            .transpose()?;
         sqlx::query(
             "INSERT INTO enterprise_sessions
              (id, token_hash, csrf_token, tenant_id, subject, email, display_name, role,
-              platform_admin, created_at, expires_at, revoked_at, last_seen_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+              platform_admin, created_at, expires_at, revoked_at, last_seen_at,
+              refresh_token_ciphertext, refresh_token_version,
+              refresh_token_expires_at, id_token_ciphertext,
+              access_token_expires_at, last_refresh_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, NULL)",
         )
         .bind(&id)
         .bind(&token_hash)
@@ -638,6 +1202,11 @@ impl BrowserAuth {
         .bind(now)
         .bind(expires_at)
         .bind(now)
+        .bind(&refresh_token_ciphertext)
+        .bind(refresh_token_version)
+        .bind(grant.refresh_token_expires_at)
+        .bind(&id_token_ciphertext)
+        .bind(grant.access_token_expires_at)
         .execute(&self.control)
         .await?;
         Ok(CreatedSession {
@@ -645,7 +1214,127 @@ impl BrowserAuth {
             token,
             csrf_token,
             expires_at,
+            access_token_expires_at: Some(grant.access_token_expires_at),
+            refresh_available: refresh_token_ciphertext.is_some(),
         })
+    }
+}
+
+fn read_encryption_key(
+    mut file: File,
+    path: &std::path::Path,
+) -> Result<Zeroizing<Vec<u8>>, BrowserAuthError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    let metadata = file.metadata()?;
+    if metadata.len() != 32 {
+        return Err(BrowserAuthError::Crypto(format!(
+            "browser auth key must contain exactly 32 bytes: {}",
+            path.display()
+        )));
+    }
+    let mut key = Zeroizing::new(vec![0u8; 32]);
+    file.read_exact(&mut key)?;
+    Ok(key)
+}
+
+fn upstream_client() -> Result<reqwest::Client, BrowserAuthError> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| BrowserAuthError::Upstream(error.to_string()))
+}
+
+fn parse_token_grant(document: &Value, now: i64) -> Result<TokenGrant, BrowserAuthError> {
+    let access_token = document
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            BrowserAuthError::Upstream("token response has no access_token".to_string())
+        })?;
+    if access_token.len() > 65_536 {
+        return Err(BrowserAuthError::Upstream(
+            "token response access_token is too large".to_string(),
+        ));
+    }
+    if let Some(token_type) = document.get("token_type").and_then(Value::as_str)
+        && !token_type.eq_ignore_ascii_case("bearer")
+    {
+        return Err(BrowserAuthError::Upstream(
+            "token response token_type is not Bearer".to_string(),
+        ));
+    }
+    let expires_in = document
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .filter(|value| (1..=MAX_ACCESS_TOKEN_TTL).contains(value))
+        .ok_or_else(|| {
+            BrowserAuthError::Upstream(
+                "token response expires_in must be a positive integer".to_string(),
+            )
+        })?;
+    let refresh_expires_in = document
+        .get("refresh_expires_in")
+        .map(|value| {
+            value
+                .as_i64()
+                .filter(|value| (1..=MAX_REFRESH_TOKEN_TTL).contains(value))
+                .ok_or_else(|| {
+                    BrowserAuthError::Upstream(
+                        "token response refresh_expires_in is invalid".to_string(),
+                    )
+                })
+        })
+        .transpose()?;
+    let id_token = optional_nonempty_string(document, "id_token")?;
+    let refresh_token = optional_nonempty_string(document, "refresh_token")?;
+    Ok(TokenGrant {
+        id_token,
+        refresh_token,
+        access_token_expires_at: now.saturating_add(expires_in.saturating_mul(1000)),
+        refresh_token_expires_at: refresh_expires_in
+            .map(|seconds| now.saturating_add(seconds.saturating_mul(1000))),
+    })
+}
+
+fn optional_nonempty_string(
+    document: &Value,
+    field: &str,
+) -> Result<Option<String>, BrowserAuthError> {
+    match document.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 65_536 => {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(BrowserAuthError::Upstream(format!(
+            "token response {field} is invalid"
+        ))),
+    }
+}
+
+fn principal_from_stored(stored: StoredSession, role: String) -> SessionPrincipal {
+    SessionPrincipal {
+        session_id: stored.id,
+        csrf_token: stored.csrf_token,
+        tenant_id: stored.tenant_id,
+        subject: stored.subject,
+        email: stored.email,
+        display_name: stored.display_name,
+        role,
+        platform_admin: stored.platform_admin != 0,
+        expires_at: stored.expires_at,
+        access_token_expires_at: stored.access_token_expires_at,
+        refresh_available: stored.refresh_token_ciphertext.is_some()
+            && stored.refresh_token_version > 0
+            && stored
+                .refresh_token_expires_at
+                .is_none_or(|expires_at| expires_at > now_ms()),
     }
 }
 
@@ -802,6 +1491,8 @@ mod tests {
                 vec!["admin@example.com".to_string()],
                 false,
                 3600,
+                "",
+                "",
             )
             .await
             .unwrap();
@@ -831,7 +1522,14 @@ mod tests {
                 let body = if request.starts_with("GET /jwks") {
                     jwks.clone()
                 } else {
-                    json!({"id_token": id_token}).to_string()
+                    json!({
+                        "access_token": "access-token",
+                        "token_type": "Bearer",
+                        "expires_in": 600,
+                        "refresh_token": "refresh-token",
+                        "id_token": id_token
+                    })
+                    .to_string()
                 };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -864,6 +1562,82 @@ mod tests {
         assert!(validate_redirect(Some("https://evil.example")).is_err());
         assert!(validate_redirect(Some("/\\evil.example")).is_err());
         assert!(validate_redirect(Some("/ok\nSet-Cookie: x")).is_err());
+    }
+
+    fn test_grant() -> TokenGrant {
+        TokenGrant {
+            id_token: None,
+            refresh_token: None,
+            access_token_expires_at: now_ms() + 600_000,
+            refresh_token_expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_tokens_are_encrypted_and_authenticated_at_rest() {
+        let auth = test_auth().await;
+        let grant = TokenGrant {
+            id_token: Some("sensitive-id-token".to_string()),
+            refresh_token: Some("sensitive-refresh-token".to_string()),
+            access_token_expires_at: now_ms() + 600_000,
+            refresh_token_expires_at: Some(now_ms() + 86_400_000),
+        };
+        let session = auth
+            .insert_session(
+                "acme",
+                "sub-crypto",
+                Some("crypto@example.com"),
+                Some("Crypto User"),
+                "developer",
+                false,
+                3600,
+                grant,
+            )
+            .await
+            .unwrap();
+        let (refresh_ciphertext, id_ciphertext): (String, String) = sqlx::query_as(
+            "SELECT refresh_token_ciphertext, id_token_ciphertext
+             FROM enterprise_sessions WHERE id = ?",
+        )
+        .bind(&session.id)
+        .fetch_one(&auth.control)
+        .await
+        .unwrap();
+        assert_ne!(refresh_ciphertext, "sensitive-refresh-token");
+        assert_ne!(id_ciphertext, "sensitive-id-token");
+        assert!(!refresh_ciphertext.contains("sensitive-refresh-token"));
+        assert_eq!(
+            auth.decrypt_secret(
+                &refresh_ciphertext,
+                &format!("refresh-token:{}", session.id)
+            )
+            .unwrap(),
+            "sensitive-refresh-token"
+        );
+        assert!(
+            auth.decrypt_secret(&id_ciphertext, &format!("refresh-token:{}", session.id))
+                .is_err()
+        );
+        let (prefix, ciphertext) = refresh_ciphertext.rsplit_once(':').unwrap();
+        let mut tampered = ciphertext.as_bytes().to_vec();
+        tampered[0] = if tampered[0] == b'A' { b'B' } else { b'A' };
+        assert!(
+            auth.decrypt_secret(
+                &format!("{prefix}:{}", String::from_utf8(tampered).unwrap()),
+                &format!("refresh-token:{}", session.id)
+            )
+            .is_err()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(auth.ops.data_dir.join(KEY_DIRECTORY).join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[tokio::test]
@@ -919,6 +1693,7 @@ mod tests {
                 "developer",
                 false,
                 3600,
+                test_grant(),
             )
             .await
             .unwrap();
@@ -953,22 +1728,40 @@ mod tests {
         assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
 
         let created = auth
-            .insert_session("acme", "sub-2", None, None, "viewer", false, 3600)
+            .insert_session(
+                "acme",
+                "sub-2",
+                None,
+                None,
+                "viewer",
+                false,
+                3600,
+                test_grant(),
+            )
             .await
             .unwrap();
         let cookie = format!("{SESSION_COOKIE}={}", created.token);
         assert_eq!(auth.revoke_tenant_sessions("acme").await.unwrap(), 2);
         assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
-        assert!(!auth.logout(Some(&cookie)).await.unwrap());
+        assert!(!auth.logout(Some(&cookie)).await.unwrap().revoked);
 
         let created = auth
-            .insert_session("acme", "sub-3", None, None, "viewer", false, 3600)
+            .insert_session(
+                "acme",
+                "sub-3",
+                None,
+                None,
+                "viewer",
+                false,
+                3600,
+                test_grant(),
+            )
             .await
             .unwrap();
         let cookie = format!("{SESSION_COOKIE}={}", created.token);
-        assert!(auth.logout(Some(&cookie)).await.unwrap());
+        assert!(auth.logout(Some(&cookie)).await.unwrap().revoked);
         assert!(auth.session(Some(&cookie)).await.unwrap().is_none());
-        assert!(!auth.logout(None).await.unwrap());
+        assert!(!auth.logout(None).await.unwrap().revoked);
     }
 
     #[tokio::test]
@@ -992,6 +1785,7 @@ mod tests {
                 "developer",
                 false,
                 3600,
+                test_grant(),
             )
             .await
             .unwrap();
@@ -1074,6 +1868,8 @@ mod tests {
                 vec!["user@example.com".to_string()],
                 true,
                 3600,
+                "",
+                "",
             )
             .await
             .unwrap();
@@ -1102,6 +1898,8 @@ mod tests {
         assert!(result.cookie.contains("SameSite=Lax"));
         assert!(result.cookie.contains("Path=/"));
         assert!(result.cookie.contains("; Secure"));
+        assert!(result.principal.refresh_available);
+        assert!(result.principal.access_token_expires_at.is_some());
         let principal = auth.session(Some(&result.cookie)).await.unwrap().unwrap();
         assert_eq!(principal.subject, "sub-1");
         assert!(auth.complete_login("code-1", state).await.is_err());

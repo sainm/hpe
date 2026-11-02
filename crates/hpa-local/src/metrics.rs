@@ -3,7 +3,7 @@
 //! Everything here is process-local: one `hpa serve` process owns its counters.
 //! Multi-node deployments aggregate at the scraper, not inside the runtime.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
+use opentelemetry::KeyValue;
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Gauge, Histogram as OtelHistogram};
+use opentelemetry::trace::FutureExt as _;
+use tracing::Instrument;
 
 /// Latency buckets in seconds, shared by every histogram.
 const BUCKETS: [f64; 13] = [
@@ -33,10 +38,17 @@ impl Default for Histogram {
     }
 }
 
+enum OtelInstrument {
+    Counter(Counter<f64>),
+    Gauge(Gauge<f64>),
+    Histogram(OtelHistogram<f64>),
+}
+
 pub struct Metrics {
     counters: Mutex<BTreeMap<(String, String), f64>>,
     gauges: Mutex<BTreeMap<(String, String), f64>>,
     histograms: Mutex<BTreeMap<(String, String), Histogram>>,
+    otel_instruments: Mutex<HashMap<String, OtelInstrument>>,
     last_tick_ms: AtomicI64,
     started_at: i64,
 }
@@ -52,6 +64,7 @@ impl Metrics {
             counters: Mutex::new(BTreeMap::new()),
             gauges: Mutex::new(BTreeMap::new()),
             histograms: Mutex::new(BTreeMap::new()),
+            otel_instruments: Mutex::new(HashMap::new()),
             last_tick_ms: AtomicI64::new(0),
             started_at: now_ms(),
         }
@@ -63,27 +76,38 @@ impl Metrics {
 
     pub fn inc_by(&self, name: &str, labels: &[(&str, &str)], value: f64) {
         let key = (name.to_string(), label_key(labels));
-        let mut counters = self.counters.lock().expect("metrics counters");
-        *counters.entry(key).or_insert(0.0) += value;
+        {
+            let mut counters = self.counters.lock().expect("metrics counters");
+            *counters.entry(key).or_insert(0.0) += value;
+        }
+        self.otel_counter(name).add(value, &otel_attributes(labels));
     }
 
     pub fn set(&self, name: &str, labels: &[(&str, &str)], value: f64) {
         let key = (name.to_string(), label_key(labels));
-        let mut gauges = self.gauges.lock().expect("metrics gauges");
-        gauges.insert(key, value);
+        {
+            let mut gauges = self.gauges.lock().expect("metrics gauges");
+            gauges.insert(key, value);
+        }
+        self.otel_gauge(name)
+            .record(value, &otel_attributes(labels));
     }
 
     pub fn observe(&self, name: &str, labels: &[(&str, &str)], value: f64) {
         let key = (name.to_string(), label_key(labels));
-        let mut histograms = self.histograms.lock().expect("metrics histograms");
-        let histogram = histograms.entry(key).or_default();
-        histogram.sum += value;
-        histogram.count += 1;
-        for (index, bound) in BUCKETS.iter().enumerate() {
-            if value <= *bound {
-                histogram.counts[index] += 1;
+        {
+            let mut histograms = self.histograms.lock().expect("metrics histograms");
+            let histogram = histograms.entry(key).or_default();
+            histogram.sum += value;
+            histogram.count += 1;
+            for (index, bound) in BUCKETS.iter().enumerate() {
+                if value <= *bound {
+                    histogram.counts[index] += 1;
+                }
             }
         }
+        self.otel_histogram(name)
+            .record(value, &otel_attributes(labels));
     }
 
     pub fn mark_scheduler_tick(&self, at_ms: i64) {
@@ -160,6 +184,65 @@ impl Metrics {
         }
         out
     }
+
+    fn otel_counter(&self, name: &str) -> Counter<f64> {
+        let mut instruments = self.otel_instruments.lock().expect("OTel instruments");
+        match instruments.entry(name.to_string()).or_insert_with(|| {
+            OtelInstrument::Counter(
+                otel_meter()
+                    .f64_counter(name.to_string())
+                    .with_description(help_for(name).unwrap_or("HPA metric"))
+                    .build(),
+            )
+        }) {
+            OtelInstrument::Counter(counter) => counter.clone(),
+            _ => unreachable!("metric `{name}` changed OTel instrument kind"),
+        }
+    }
+
+    fn otel_gauge(&self, name: &str) -> Gauge<f64> {
+        let mut instruments = self.otel_instruments.lock().expect("OTel instruments");
+        match instruments.entry(name.to_string()).or_insert_with(|| {
+            OtelInstrument::Gauge(
+                otel_meter()
+                    .f64_gauge(name.to_string())
+                    .with_description(help_for(name).unwrap_or("HPA metric"))
+                    .build(),
+            )
+        }) {
+            OtelInstrument::Gauge(gauge) => gauge.clone(),
+            _ => unreachable!("metric `{name}` changed OTel instrument kind"),
+        }
+    }
+
+    fn otel_histogram(&self, name: &str) -> OtelHistogram<f64> {
+        let mut instruments = self.otel_instruments.lock().expect("OTel instruments");
+        match instruments.entry(name.to_string()).or_insert_with(|| {
+            let unit = if name.ends_with("_seconds") { "s" } else { "1" };
+            OtelInstrument::Histogram(
+                otel_meter()
+                    .f64_histogram(name.to_string())
+                    .with_description(help_for(name).unwrap_or("HPA metric"))
+                    .with_unit(unit)
+                    .with_boundaries(BUCKETS.to_vec())
+                    .build(),
+            )
+        }) {
+            OtelInstrument::Histogram(histogram) => histogram.clone(),
+            _ => unreachable!("metric `{name}` changed OTel instrument kind"),
+        }
+    }
+}
+
+fn otel_meter() -> opentelemetry::metrics::Meter {
+    global::meter_provider().meter("hpa-runtime")
+}
+
+fn otel_attributes(labels: &[(&str, &str)]) -> Vec<KeyValue> {
+    labels
+        .iter()
+        .map(|(key, value)| KeyValue::new((*key).to_string(), (*value).to_string()))
+        .collect()
 }
 
 fn render_samples(out: &mut String, samples: &BTreeMap<(String, String), f64>, kind: &str) {
@@ -237,6 +320,7 @@ fn help_for(name: &str) -> Option<&'static str> {
         "hpa_node_seconds" => "Node step latency in seconds, by node type",
         "hpa_scheduler_tick_seconds" => "Duration of one scheduler pass",
         "hpa_scheduler_ticks_total" => "Scheduler passes executed",
+        "hpa_scheduler_leader" => "Whether this node currently owns scheduler leadership",
         "hpa_scheduler_last_tick_timestamp_seconds" => "Unix time of the last scheduler pass",
         "hpa_scheduler_fires_total" => "Executions started by the scheduler",
         "hpa_trigger_fires_total" => "Trigger fires, by kind and result",
@@ -281,7 +365,29 @@ pub async fn track_http(request: Request, next: Next) -> Response {
         None => "unmatched".to_string(),
     };
     let method = request.method().as_str().to_string();
-    let response = next.run(request).await;
+    let response = if hpa_local::telemetry::enabled() {
+        let parent = hpa_local::telemetry::extract_context(request.headers());
+        let method_attribute = method.clone();
+        let route_attribute = route.clone();
+        let path_attribute = path.clone();
+        async move {
+            let span = tracing::info_span!(
+                "http.server",
+                otel.kind = "server",
+                http.request.method = %method_attribute,
+                url.path = %path_attribute,
+                http.route = %route_attribute,
+                http.response.status_code = tracing::field::Empty
+            );
+            let response = next.run(request).instrument(span.clone()).await;
+            span.record("http.response.status_code", response.status().as_u16());
+            response
+        }
+        .with_context(parent)
+        .await
+    } else {
+        next.run(request).await
+    };
     let status = response.status().as_u16().to_string();
     metrics().inc(
         "hpa_http_requests_total",
@@ -315,14 +421,14 @@ mod tests {
             &[("status", "succeeded")],
             2.0,
         );
-        metrics.set("hpa_executions_running", &[("tenant", "local")], 3.0);
+        metrics.set("hpa_executions_running", &[], 3.0);
         metrics.observe("hpa_http_request_seconds", &[("route", "/api/x")], 0.02);
         let text = metrics.render();
 
         assert!(text.contains("# TYPE hpa_workflow_executions_total counter"));
         assert!(text.contains("hpa_workflow_executions_total{status=\"succeeded\"} 3"));
         assert!(text.contains("# TYPE hpa_executions_running gauge"));
-        assert!(text.contains("hpa_executions_running{tenant=\"local\"} 3"));
+        assert!(text.contains("hpa_executions_running 3"));
         assert!(text.contains("# TYPE hpa_http_request_seconds histogram"));
         assert!(text.contains("hpa_http_request_seconds_bucket{route=\"/api/x\",le=\"0.005\"} 0"));
         assert!(text.contains("hpa_http_request_seconds_bucket{route=\"/api/x\",le=\"0.025\"} 1"));

@@ -48,11 +48,16 @@ pub struct WebhookSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSpec {
+    pub topic: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TriggerSpec {
     Schedule(Box<ScheduleSpec>),
     Webhook(WebhookSpec),
-    /// Accepted by the validator but not wired to any event bus yet.
-    Event,
+    Event(EventSpec),
     /// Invoked through the MCP `workflow.execute` tool; no separate runtime.
     Mcp,
 }
@@ -80,6 +85,15 @@ struct WebhookConfig {
     secret: Option<String>,
     #[serde(default)]
     slug: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventConfig {
+    #[serde(default)]
+    topic: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
 }
@@ -140,9 +154,32 @@ pub fn parse_trigger(trigger: &Trigger) -> Result<TriggerSpec, String> {
                 enabled: config.enabled.unwrap_or(true),
             }))
         }
-        TriggerType::Event => Ok(TriggerSpec::Event),
+        TriggerType::Event => {
+            let config: EventConfig = serde_json::from_value(trigger.config.clone())
+                .map_err(|error| format!("event config is invalid: {error}"))?;
+            let topic = config.topic.unwrap_or_else(|| trigger.id.clone());
+            validate_event_topic(&topic)?;
+            Ok(TriggerSpec::Event(EventSpec {
+                topic,
+                enabled: config.enabled.unwrap_or(true),
+            }))
+        }
         TriggerType::Mcp => Ok(TriggerSpec::Mcp),
     }
+}
+
+pub fn validate_event_topic(topic: &str) -> Result<(), String> {
+    if topic.is_empty()
+        || topic.len() > 128
+        || !topic
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(
+            "event topic must match [A-Za-z0-9._:-]{1,128} and must not be empty".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn is_slug(text: &str) -> bool {

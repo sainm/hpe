@@ -1,5 +1,7 @@
 # Agent Runtime
 
+> 状态说明：本文同时描述目标运行时和当前实现。已交付 Rust deterministic/OpenAI-compatible planner，以及显式 `planner.kind = "python"` 的 Python 3.13/LangGraph Worker、Rust ToolService、预算/审批/取消、SQLite checkpoint 和 LiteLLM 适配器。当前传输是 JSONL+HTTP，不是目标 gRPC；未配置 Worker 时 deterministic/OpenAI 路径保持可用。实际边界见 [Python Worker](python-worker.md) 与 [local-agent-platform.md](local-agent-platform.md)。
+
 > 实现方式：可选 Python AI Worker 使用 LangGraph（`langgraph` 1.2.x）作为状态图内核，封装在 gRPC `AgentWorker` 契约后；Rust Core 负责调度/权限/预算/审批/工具/事件，TS 负责 Agent Designer/管理。
 
 ## 1. 状态图
@@ -130,7 +132,7 @@ interface AgentState {
 - Local：Python AI Worker（可选）+ LangGraph + SQLite checkpointer + 本地/云模型；无 Python 时 Agent 禁用。
 - Worker：Python AI Worker + LangGraph + Postgres checkpointer；gRPC 流式事件；审批服务端。
 - 同一 AgentVersion/状态 schema；差异在存储/调度；Python 不直接访问 Control Plane DB。
-- Python Agent Worker（可选）：LangGraph Python；通过统一 AgentRuntime 契约接入；Phase 4 评估。
+- Python Agent Worker（可选）：LangGraph Python 独立进程已通过 Rust `AiWorkerProcess` start/resume/cancel 契约接入显式 `python` planner；工具调用回 Rust ToolService，审批、风险与幂等由 Rust 最终裁决。
 
 ## 11. 可观测
 

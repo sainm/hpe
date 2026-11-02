@@ -46,8 +46,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const logout = useCallback(async () => {
+    let logoutUrl: string | null | undefined;
     try {
-      await api.authLogout();
+      const result = await api.authLogout();
+      logoutUrl = result.logoutUrl;
     } catch {
       setCsrfToken(null);
     } finally {
@@ -63,6 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             }
           : null,
       );
+      if (logoutUrl) window.location.assign(logoutUrl);
     }
   }, []);
 
@@ -87,6 +90,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     });
     return () => setUnauthorizedHandler(null);
   }, []);
+
+  useEffect(() => {
+    if (!session?.authenticated || !session.refreshAvailable) return;
+    const refreshAt = session.accessTokenExpiresAt ?? session.expiresAt;
+    if (!refreshAt) return;
+    const delay = Math.max(0, Math.min(refreshAt - Date.now() - 60_000, 2_147_483_647));
+    const timer = window.setTimeout(() => {
+      void api
+        .authRefresh()
+        .then((next) => {
+          setSession((current) =>
+            current?.authenticated
+              ? {
+                  ...current,
+                  expiresAt: next.expiresAt,
+                  accessTokenExpiresAt: next.accessTokenExpiresAt,
+                  refreshAvailable: next.refreshAvailable,
+                }
+              : current,
+          );
+        })
+        .catch(() => refreshSession());
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [session, refreshSession]);
 
   const value = useMemo<AuthContextValue>(
     () => ({

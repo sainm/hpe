@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -13,13 +14,16 @@ use hpa_core::runtime::{
     ExecutionEvent, ExecutionState, ExecutionStatus, StepStatus, cancel_execution, start_event,
     step,
 };
+use opentelemetry::trace::FutureExt as _;
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
+
+use crate::worker_outbox::WorkerOutbox;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -38,6 +42,7 @@ pub struct WorkerDaemonConfig {
     pub capabilities: Vec<String>,
     pub heartbeat_interval: Duration,
     pub poll_interval: Duration,
+    pub outbox_path: PathBuf,
 }
 
 impl Default for WorkerDaemonConfig {
@@ -49,6 +54,7 @@ impl Default for WorkerDaemonConfig {
             capabilities: vec!["workflow".to_string()],
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             poll_interval: DEFAULT_POLL_INTERVAL,
+            outbox_path: PathBuf::new(),
         }
     }
 }
@@ -70,6 +76,7 @@ enum ApiError {
     LeaseLost { message: String },
     Unauthorized { message: String },
     Rejected { message: String },
+    Storage { message: String },
 }
 
 impl ApiError {
@@ -84,7 +91,8 @@ impl fmt::Display for ApiError {
             Self::Retryable { message }
             | Self::LeaseLost { message }
             | Self::Unauthorized { message }
-            | Self::Rejected { message } => formatter.write_str(message),
+            | Self::Rejected { message }
+            | Self::Storage { message } => formatter.write_str(message),
         }
     }
 }
@@ -178,6 +186,123 @@ struct WorkerClient {
     max_concurrency: usize,
 }
 
+#[derive(Clone)]
+struct DurableReporter {
+    client: Arc<WorkerClient>,
+    outbox: Arc<WorkerOutbox>,
+    gate: Arc<Mutex<()>>,
+}
+
+impl DurableReporter {
+    fn new(client: Arc<WorkerClient>, outbox: Arc<WorkerOutbox>) -> Self {
+        Self {
+            client,
+            outbox,
+            gate: Arc::new(Mutex::new(())),
+        }
+    }
+
+    async fn report<B>(&self, job_id: &str, action: &str, report: &B) -> Result<(), ApiError>
+    where
+        B: Serialize,
+    {
+        let value = serde_json::to_value(report).map_err(|error| ApiError::Storage {
+            message: format!("cannot serialize {action} report: {error}"),
+        })?;
+        let lease_id = value
+            .get("leaseId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::Storage {
+                message: format!("{action} report has no leaseId"),
+            })?;
+        self.outbox
+            .enqueue(job_id, lease_id, action, &value)
+            .await
+            .map_err(|message| ApiError::Storage { message })?;
+        self.flush_pending().await
+    }
+
+    async fn flush_pending(&self) -> Result<(), ApiError> {
+        let _gate = self.gate.lock().await;
+        self.flush_locked().await
+    }
+
+    async fn flush_locked(&self) -> Result<(), ApiError> {
+        loop {
+            let entry = self
+                .outbox
+                .next()
+                .await
+                .map_err(|message| ApiError::Storage { message })?;
+            let Some(entry) = entry else {
+                return Ok(());
+            };
+            if entry.attempts > 0 {
+                debug!(
+                    job_id = %entry.job_id,
+                    action = %entry.action,
+                    attempts = entry.attempts,
+                    "retrying durable worker report"
+                );
+            }
+            let payload: Value = match serde_json::from_str(&entry.payload_json) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warn!(
+                        job_id = %entry.job_id,
+                        action = %entry.action,
+                        error = %error,
+                        "discarding corrupt durable worker report"
+                    );
+                    self.outbox
+                        .remove(entry.id)
+                        .await
+                        .map_err(|message| ApiError::Storage { message })?;
+                    continue;
+                }
+            };
+            match self
+                .client
+                .job_report(&entry.job_id, &entry.action, &payload)
+                .await
+            {
+                Ok(()) => {
+                    self.outbox
+                        .remove(entry.id)
+                        .await
+                        .map_err(|message| ApiError::Storage { message })?;
+                }
+                Err(ApiError::Retryable { message }) => {
+                    self.outbox
+                        .record_failure(entry.id, &message)
+                        .await
+                        .map_err(|message| ApiError::Storage { message })?;
+                    return Err(ApiError::Retryable { message });
+                }
+                Err(error @ ApiError::LeaseLost { .. })
+                | Err(error @ ApiError::Unauthorized { .. })
+                | Err(error @ ApiError::Rejected { .. }) => {
+                    let discarded = self
+                        .outbox
+                        .discard_lease(&entry.lease_id)
+                        .await
+                        .map_err(|message| ApiError::Storage { message })?;
+                    warn!(
+                        job_id = %entry.job_id,
+                        lease_id = %entry.lease_id,
+                        action = %entry.action,
+                        discarded,
+                        error = %error,
+                        "discarding worker reports for a rejected lease"
+                    );
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 impl WorkerClient {
     fn endpoint(&self, segments: &[&str]) -> Url {
         let mut url = self.base.clone();
@@ -195,16 +320,35 @@ impl WorkerClient {
         B: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(&self.token)
-            .json(body)
-            .send()
+        let parent = hpa_local::telemetry::current_context();
+        let url_attribute = url.to_string();
+        let response = async move {
+            let span = tracing::info_span!(
+                "http.client",
+                otel.kind = "client",
+                http.request.method = "POST",
+                url.full = %url_attribute,
+                http.response.status_code = tracing::field::Empty
+            );
+            let response_span = span.clone();
+            async move {
+                let mut trace_headers = axum::http::HeaderMap::new();
+                hpa_local::telemetry::inject_current_context(&mut trace_headers);
+                let mut request = self.http.post(url).bearer_auth(&self.token).json(body);
+                for (name, value) in &trace_headers {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.map_err(|error| ApiError::Retryable {
+                    message: format!("request failed: {error}"),
+                })?;
+                response_span.record("http.response.status_code", response.status().as_u16());
+                Ok::<_, ApiError>(response)
+            }
+            .instrument(span.clone())
             .await
-            .map_err(|error| ApiError::Retryable {
-                message: format!("request failed: {error}"),
-            })?;
+        }
+        .with_context(parent)
+        .await?;
         let status = response.status();
         let body = response.text().await.map_err(|error| ApiError::Retryable {
             message: format!("cannot read response body: {error}"),
@@ -301,6 +445,9 @@ impl WorkerClient {
 
 pub async fn run_worker(config: WorkerDaemonConfig) -> Result<(), Box<dyn std::error::Error>> {
     let base = validate_control_url(&config.control_url).map_err(WorkerError)?;
+    if config.outbox_path.as_os_str().is_empty() {
+        return Err(WorkerError("worker outbox path is required".to_string()).into());
+    }
     let http = Client::builder()
         .no_proxy()
         .redirect(Policy::none())
@@ -318,13 +465,29 @@ pub async fn run_worker(config: WorkerDaemonConfig) -> Result<(), Box<dyn std::e
         capabilities: config.capabilities,
         max_concurrency,
     });
+    let outbox = Arc::new(
+        WorkerOutbox::open(&config.outbox_path)
+            .await
+            .map_err(WorkerError)?,
+    );
+    let reporter = DurableReporter::new(client.clone(), outbox.clone());
     let active: CancelMap = Arc::new(Mutex::new(HashMap::new()));
+    let pending_reports = outbox.pending_count().await.map_err(WorkerError)?;
 
     info!(
         control_url = %base,
         max_concurrency = max_concurrency,
+        outbox = %outbox.path().display(),
+        pending_reports,
         "worker daemon starting"
     );
+
+    match reporter.flush_pending().await {
+        Ok(()) => {}
+        Err(error) => {
+            warn!(error = %error, "pending worker reports could not be drained; leasing is paused");
+        }
+    }
 
     if let Err(error) = send_heartbeat(&client, &active).await {
         warn!(error = %error, "worker initial heartbeat failed; continuing with backoff");
@@ -356,6 +519,21 @@ pub async fn run_worker(config: WorkerDaemonConfig) -> Result<(), Box<dyn std::e
 
     let mut lease_retry = 0usize;
     loop {
+        match reporter.flush_pending().await {
+            Ok(()) => {}
+            Err(error) => {
+                let delay = retry_delay(lease_retry.saturating_add(1));
+                lease_retry = lease_retry.saturating_add(1);
+                warn!(
+                    retry = lease_retry,
+                    delay_ms = delay.as_millis(),
+                    error = %error,
+                    "worker outbox is not empty; leasing is paused"
+                );
+                tokio::time::sleep(delay.min(poll_interval.saturating_mul(5))).await;
+                continue;
+            }
+        }
         let active_jobs = active_job_ids(&active).await.len();
         let slots = max_concurrency.saturating_sub(active_jobs);
         if slots > 0 {
@@ -408,10 +586,10 @@ pub async fn run_worker(config: WorkerDaemonConfig) -> Result<(), Box<dyn std::e
                             attempt = ?job.attempt,
                             "worker leased job"
                         );
-                        let job_client = client.clone();
+                        let job_reporter = reporter.clone();
                         let job_active = active.clone();
                         tokio::spawn(async move {
-                            run_job_task(job_client, job_active, job, flag).await;
+                            run_job_task(job_reporter, job_active, job, flag).await;
                         });
                     }
                 }
@@ -550,14 +728,14 @@ async fn apply_cancel_jobs(active: &CancelMap, jobs: Option<Vec<String>>) {
 }
 
 async fn run_job_task(
-    client: Arc<WorkerClient>,
+    reporter: DurableReporter,
     active: CancelMap,
     job: WorkerJob,
     cancel: Arc<AtomicBool>,
 ) {
     let job_id = job.job_id.clone();
     let execution_id = job.execution_id.clone();
-    execute_job(&client, &job, &cancel).await;
+    execute_job(&reporter, &job, &cancel).await;
     active.lock().await.remove(&job_id);
     debug!(
         job_id = %job_id,
@@ -566,7 +744,7 @@ async fn run_job_task(
     );
 }
 
-async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool) {
+async fn execute_job(reporter: &DurableReporter, job: &WorkerJob, cancel: &AtomicBool) {
     let job_id = job.job_id.as_str();
     let execution_id = job.execution_id.as_str();
 
@@ -579,7 +757,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
             "worker job runtime version does not match"
         );
         complete_failed(
-            client,
+            reporter,
             job,
             job.state.clone(),
             "runtime-version-mismatch".to_string(),
@@ -598,7 +776,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
                 error = %message,
                 "worker job workflow could not be parsed"
             );
-            complete_failed(client, job, job.state.clone(), message).await;
+            complete_failed(reporter, job, job.state.clone(), message).await;
             return;
         }
     };
@@ -613,7 +791,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
                 error = %message,
                 "worker job state could not be parsed"
             );
-            complete_failed(client, job, job.state.clone(), message).await;
+            complete_failed(reporter, job, job.state.clone(), message).await;
             return;
         }
     };
@@ -629,7 +807,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
             error = %message,
             "worker job state id does not match execution"
         );
-        complete_failed(client, job, serialize_state(&state, &job.state), message).await;
+        complete_failed(reporter, job, serialize_state(&state, &job.state), message).await;
         return;
     }
 
@@ -650,7 +828,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
                 error = %message,
                 "worker job workflow is invalid"
             );
-            complete_failed(client, job, serialize_state(&state, &job.state), message).await;
+            complete_failed(reporter, job, serialize_state(&state, &job.state), message).await;
             return;
         }
     };
@@ -664,7 +842,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
         state: serialize_state(&state, &job.state),
         events: pending_events.clone(),
     };
-    if let Err(error) = client.job_report(&job.job_id, "start", &start_report).await {
+    if let Err(error) = reporter.report(&job.job_id, "start", &start_report).await {
         log_report_failure(job, "start", None, &error);
         return;
     }
@@ -698,7 +876,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
                 state: serialize_state(&state, &job.state),
                 events: std::mem::take(&mut pending_events),
             };
-            if let Err(error) = client.job_report(&job.job_id, "events", &report).await {
+            if let Err(error) = reporter.report(&job.job_id, "events", &report).await {
                 log_report_failure(job, "events", Some(state.status), &error);
                 return;
             }
@@ -731,7 +909,7 @@ async fn execute_job(client: &WorkerClient, job: &WorkerJob, cancel: &AtomicBool
         events: pending_events,
         error: state.error.as_ref().map(|error| error.message.clone()),
     };
-    match client.job_report(&job.job_id, "complete", &report).await {
+    match reporter.report(&job.job_id, "complete", &report).await {
         Ok(()) => info!(
             job_id = %job_id,
             execution_id = %execution_id,
@@ -767,7 +945,12 @@ async fn cancellable_sleep(delay: Duration, cancel: &AtomicBool) -> bool {
     }
 }
 
-async fn complete_failed(client: &WorkerClient, job: &WorkerJob, state: Value, message: String) {
+async fn complete_failed(
+    reporter: &DurableReporter,
+    job: &WorkerJob,
+    state: Value,
+    message: String,
+) {
     let report = JobCompleteReport {
         lease_id: job.lease_id.clone(),
         status: "failed",
@@ -775,7 +958,7 @@ async fn complete_failed(client: &WorkerClient, job: &WorkerJob, state: Value, m
         events: Vec::new(),
         error: Some(message.clone()),
     };
-    match client.job_report(&job.job_id, "complete", &report).await {
+    match reporter.report(&job.job_id, "complete", &report).await {
         Ok(()) => warn!(
             job_id = %job.job_id,
             execution_id = %job.execution_id,

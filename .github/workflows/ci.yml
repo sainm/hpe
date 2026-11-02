@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUSTUP_DIST_SERVER: https://rsproxy.cn
+  RUSTUP_UPDATE_ROOT: https://rsproxy.cn/rustup
+  COREPACK_NPM_REGISTRY: https://registry.npmmirror.com
+  NODE_MIRROR: https://npmmirror.com/mirrors/node/
+  NODEJS_ORG_MIRROR: https://npmmirror.com/mirrors/node/
+  UV_DEFAULT_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple
+  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+  PLAYWRIGHT_DOWNLOAD_HOST: https://npmmirror.com/mirrors/playwright
+
+jobs:
+  ai-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: services/ai-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.12.18
+      - run: uv sync --frozen --default-index https://pypi.tuna.tsinghua.edu.cn/simple
+      - run: uv run --frozen pytest -q
+      - run: uv run --frozen mypy src
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen ruff format --check .
+      - run: uv run --frozen pip-audit --local --progress-spinner off
+      - run: >-
+          uv export --frozen --quiet --format cyclonedx1.5
+          --output-file ../../target/sbom/hpa-ai-worker.cdx.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+      - run: cargo fmt --all --check
+        working-directory: .
+      - run: >-
+          HPA_AI_WORKER_BIN="$GITHUB_WORKSPACE/services/ai-worker/.venv/bin/hpa-ai-worker"
+          cargo test -p hpa-local --test ai_worker_process -- --nocapture
+        working-directory: .
+      - run: >-
+          HPA_AI_WORKER_BIN="$GITHUB_WORKSPACE/services/ai-worker/.venv/bin/hpa-ai-worker"
+          cargo test -p hpa-local --test otel_cross_process -- --nocapture
+        working-directory: .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hpa-ai-worker-cyclonedx-sbom
+          path: target/sbom/hpa-ai-worker.cdx.json
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: docker.m.daocloud.io/library/postgres:18@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
+        env:
+          POSTGRES_DB: hpa
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d hpa"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hpa
+      HPA_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/hpa
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y redis-server
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+      - run: cargo test -p hpa-local --test postgres_rls --test postgres_import --test postgres_distributed --test postgres_workflow_store --test postgres_execution_store --test postgres_execution_lease --test postgres_execution_recovery --test postgres_trigger_store --test postgres_atomic_execution_fire --test postgres_event_bus --test postgres_runtime --test postgres_scheduler_leader --test postgres_mcp --test mcp_http --test mcp_multinode --test connectors_extended
+      - run: cargo run -q -p hpa-local -- db migrate | tee migration-first.json
+      - run: cargo run -q -p hpa-local -- db migrate | tee migration-second.json
+      - run: |
+          grep -q '"applied": 0' migration-second.json
+      - run: cargo run -q -p hpa-local -- db status
+
+  s3-connector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      minio:
+        image: docker.m.daocloud.io/bitnamilegacy/minio:latest@sha256:451fe6858cb770cc9d0e77ba811ce287420f781c7c1b806a386f6896471a349c
+        env:
+          MINIO_ROOT_USER: hpa-test
+          MINIO_ROOT_PASSWORD: hpa-test-secret
+        ports:
+          - 9000:9000
+    env:
+      HPA_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+      HPA_S3_TEST_ACCESS_KEY: hpa-test
+      HPA_S3_TEST_SECRET_KEY: hpa-test-secret
+      HPA_S3_TEST_BUCKET: hpa-test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.13
+      - run: pip install boto3==1.43.123
+      - run: |
+          python - <<'PY'
+          import os
+          import time
+          import urllib.request
+          import boto3
+
+          health = os.environ["HPA_S3_TEST_ENDPOINT"] + "/minio/health/live"
+          for _ in range(60):
+              try:
+                  urllib.request.urlopen(health, timeout=2).read()
+                  break
+              except Exception:
+                  time.sleep(1)
+          else:
+              raise SystemExit("MinIO did not become healthy")
+
+          client = boto3.client(
+              "s3",
+              endpoint_url=os.environ["HPA_S3_TEST_ENDPOINT"],
+              region_name="us-east-1",
+              aws_access_key_id=os.environ["HPA_S3_TEST_ACCESS_KEY"],
+              aws_secret_access_key=os.environ["HPA_S3_TEST_SECRET_KEY"],
+          )
+          client.create_bucket(Bucket=os.environ["HPA_S3_TEST_BUCKET"])
+          PY
+      - run: cargo test -p hpa-local --test connectors_extended s3_connector -- --nocapture
+
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.16.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26.13.0
+          mirror: https://npmmirror.com/mirrors/node/
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install chromium
+      - run: cargo deny check licenses bans sources advisories
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo test -p hpa-local --test otel -- --nocapture
+      - run: pnpm --filter @hpa/web typecheck
+      - run: pnpm --filter @hpa/web test
+      - run: pnpm --filter @hpa/web build
+      - run: pnpm --filter workbench build
+      - run: pnpm --filter workbench test
+      - run: cargo build -p hpa-local
+      - run: pnpm test:e2e
+      - run: pnpm test:mcp-conformance
+      - run: pnpm --dir apps/vscode-extension run test:host
+      - run: pnpm --dir apps/vscode-extension run package
+      - run: node scripts/check-brand.mjs
+      - run: node scripts/check-ir.cjs
+      - run: node scripts/check-contracts.mjs
+      - run: node scripts/check-docs.mjs
+      - run: node scripts/check-supply-chain.mjs
+      - run: pnpm audit --audit-level moderate --registry=https://registry.npmjs.org
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hpa-cyclonedx-sbom
+          path: target/sbom/hpa-sbom.cdx.json

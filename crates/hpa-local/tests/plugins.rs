@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -331,6 +334,60 @@ impl Drop for Server {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[tokio::test]
+async fn marketplace_catalog_lists_publishers_keys_and_sources() {
+    let data_dir = temp_dir("remote-catalog");
+    let server = Server::start(&data_dir).await;
+    let signing = SigningKey::from_bytes(&[41u8; 32]);
+    let public_key = BASE64.encode(signing.verifying_key().to_bytes());
+
+    let (status, _) = server
+        .post(
+            "/api/marketplace/publishers",
+            json!({"id": "publisher_catalog", "name": "Catalog Publisher"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .post(
+            "/api/marketplace/publishers/publisher_catalog/keys",
+            json!({
+                "keyId": "publisher-key-1",
+                "publicKey": public_key.clone(),
+                "label": "fixture"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let (status, _) = server
+        .post(
+            "/api/marketplace/sources",
+            json!({
+                "id": "catalog_source",
+                "label": "Catalog Source",
+                "indexUri": "http://127.0.0.1:9/index.json",
+                "keyId": "source-key-1",
+                "publicKey": public_key,
+                "keyLabel": "fixture"
+            }),
+        )
+        .await;
+    assert_eq!(status, 200);
+
+    let (status, publishers) = server.get("/api/marketplace/publishers").await;
+    assert_eq!(status, 200);
+    assert_eq!(publishers["publishers"][0]["id"], "publisher_catalog");
+    assert_eq!(
+        publishers["publishers"][0]["keys"][0]["keyId"],
+        "publisher-key-1"
+    );
+    let (status, sources) = server.get("/api/marketplace/sources").await;
+    assert_eq!(status, 200);
+    assert_eq!(sources["sources"][0]["id"], "catalog_source");
+    assert_eq!(sources["sources"][0]["keys"][0]["keyId"], "source-key-1");
+    assert_eq!(sources["sources"][0]["packageCount"], 0);
 }
 
 struct MockHttp {

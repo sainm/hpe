@@ -9,6 +9,10 @@ const requiredCommands = [
   "hpa.workflow.run",
   "hpa.skill.install",
   "hpa.mcp.register",
+  "hpa.marketplace.manage",
+  "hpa.marketplace.refreshSource",
+  "hpa.marketplace.scan",
+  "hpa.marketplace.install",
   "hpa.settings.open",
 ];
 

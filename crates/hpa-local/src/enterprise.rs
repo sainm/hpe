@@ -38,6 +38,9 @@ use crate::plugin::PluginService;
 use crate::skills::SkillService;
 use crate::worker::{WorkerAuth, WorkerError, WorkerErrorKind, WorkerJob};
 
+#[path = "scim.rs"]
+mod scim;
+
 const LOCAL_TENANT: &str = "local";
 const DEFAULT_ROLE: &str = "owner";
 
@@ -51,6 +54,8 @@ pub struct EnterpriseState {
     browser_auth: BrowserAuth,
     oauth: OauthService,
     workers: crate::worker::WorkerService,
+    postgres_execution: Option<sqlx::postgres::PgPool>,
+    postgres_event_bus: Option<sqlx::postgres::PgPool>,
     cache: Arc<tokio::sync::Mutex<HashMap<String, TenantEntry>>>,
 }
 
@@ -135,8 +140,65 @@ impl EnterpriseState {
             browser_auth,
             oauth,
             workers,
+            postgres_execution: None,
+            postgres_event_bus: None,
             cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    pub fn with_postgres_execution(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.workers = self.workers.clone().with_postgres(pool.clone());
+        self.postgres_execution = Some(pool);
+        self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        self
+    }
+
+    pub fn with_postgres_event_bus(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.postgres_event_bus = Some(pool);
+        self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        self
+    }
+
+    async fn ensure_postgres_tenant(&self, tenant_id: &str) -> Result<(), ApiError> {
+        let Some(pool) = self.postgres_execution.as_ref() else {
+            return Ok(());
+        };
+        let row = sqlx::query(
+            "SELECT name, status, created_at, updated_at
+             FROM enterprise_tenants WHERE id = ?",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&self.control)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| ApiError::not_found(format!("tenant `{tenant_id}` not found")))?;
+        let created_at =
+            OffsetDateTime::parse(row.get::<String, _>("created_at").as_str(), &Rfc3339).map_err(
+                |error| ApiError::internal(format!("invalid tenant created_at: {error}")),
+            )?;
+        let updated_at =
+            OffsetDateTime::parse(row.get::<String, _>("updated_at").as_str(), &Rfc3339).map_err(
+                |error| ApiError::internal(format!("invalid tenant updated_at: {error}")),
+            )?;
+        sqlx::query(
+            "INSERT INTO hpa_control.tenants (
+                 id, name, status, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (id) DO UPDATE
+             SET name = EXCLUDED.name,
+                 status = EXCLUDED.status,
+                 updated_at = EXCLUDED.updated_at",
+        )
+        .bind(tenant_id)
+        .bind(row.get::<String, _>("name"))
+        .bind(row.get::<String, _>("status"))
+        .bind(created_at)
+        .bind(updated_at)
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+        Ok(())
     }
 
     pub async fn local_state(&self) -> Result<ApiState, ApiError> {
@@ -155,6 +217,68 @@ impl EnterpriseState {
 
     pub(crate) fn auth_required(&self) -> bool {
         self.require_auth
+    }
+
+    pub(crate) async fn expire_worker_approvals(&self) -> Result<usize, ApiError> {
+        let jobs = self
+            .workers
+            .waiting_approval_jobs()
+            .await
+            .map_err(worker_error)?;
+        let mut expired = 0usize;
+        for job in jobs {
+            let mut state: ExecutionState = serde_json::from_str(&job.state_json)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let Some(request) = state.waiting.clone() else {
+                if state.status != hpa_core::runtime::ExecutionStatus::WaitingApproval {
+                    self.workers
+                        .requeue_execution(&job.execution_id, &job.state_json)
+                        .await
+                        .map_err(worker_error)?;
+                    expired += 1;
+                }
+                continue;
+            };
+            if !request.is_overdue(OffsetDateTime::now_utc()) {
+                continue;
+            }
+            let workflow: Workflow = serde_json::from_str(&job.workflow_json)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let compilation = compile_workflow(&workflow)
+                .map_err(|issues| ApiError::internal(format!("{issues:?}")))?;
+            let events = hpa_core::runtime::expire_approval(
+                &mut state,
+                &compilation.plan,
+                &request.node_id,
+                json!({"automatic": true, "reason": "sla", "remote": true}),
+            )
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+            let state_json = serde_json::to_string(&state)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let entry = self.tenant_entry(&job.tenant_id).await?;
+            entry.state.db.save_execution(&state, &events).await?;
+            self.workers
+                .requeue_execution(&job.execution_id, &state_json)
+                .await
+                .map_err(worker_error)?;
+            expired += 1;
+            self.audit(
+                Some(&job.tenant_id),
+                None,
+                "system",
+                "worker.approval.timeout",
+                "worker_job",
+                "allow",
+                None,
+                json!({
+                    "jobId": job.id,
+                    "executionId": job.execution_id,
+                    "nodeId": request.node_id,
+                }),
+            )
+            .await;
+        }
+        Ok(expired)
     }
 
     pub(crate) async fn control_ping(&self) -> Result<(), ApiError> {
@@ -466,6 +590,20 @@ impl EnterpriseState {
         {
             return Err(unauthorized("token is expired"));
         }
+        let tenant_id: String = row.get("tenant_id");
+        let platform_admin = row.get::<i64, _>("platform_admin") != 0;
+        if !platform_admin {
+            let active: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+            )
+            .bind(&tenant_id)
+            .fetch_optional(&self.control)
+            .await
+            .map_err(internal)?;
+            if active.is_none() {
+                return Err(unauthorized("tenant is not active"));
+            }
+        }
         let token_id: String = row.get("id");
         let _ = sqlx::query("UPDATE enterprise_tokens SET last_used_at = ? WHERE id = ?")
             .bind(now_rfc3339())
@@ -474,9 +612,9 @@ impl EnterpriseState {
             .await;
         Ok(Some(Principal {
             token_id,
-            tenant_id: row.get("tenant_id"),
+            tenant_id,
             role: row.get("role"),
-            platform_admin: row.get::<i64, _>("platform_admin") != 0,
+            platform_admin,
         }))
     }
 
@@ -549,19 +687,28 @@ impl EnterpriseState {
     }
 
     async fn build_tenant(&self, tenant_id: &str) -> Result<TenantEntry, ApiError> {
+        self.ensure_postgres_tenant(tenant_id).await?;
         let tenant_dir = self.tenant_dir(tenant_id);
         tokio::fs::create_dir_all(&tenant_dir)
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
-        let db = Db::open(&tenant_dir.join("hpa.db"))
+        let mut db = Db::open(&tenant_dir.join("hpa.db"))
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
+        if let Some(pool) = self.postgres_execution.as_ref() {
+            db = db.with_postgres_execution(pool.clone(), tenant_id);
+        }
+        let event_bus = self
+            .postgres_event_bus
+            .as_ref()
+            .map(|pool| crate::event_bus::EventBusPublisher::new(pool.clone(), tenant_id));
         let runtime = RuntimeManager::new(db.clone());
         runtime
             .recover()
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
         runtime.start_approval_monitor();
+        runtime.start_recovery_monitor();
         let skills = SkillService::new(db.clone(), tenant_dir.clone());
         let connectors = ConnectorRuntime::new(db.clone());
         connectors
@@ -574,7 +721,14 @@ impl EnterpriseState {
             skills.clone(),
             connectors.clone(),
         );
-        let agents = AgentRuntime::new(skills, runtime.clone(), connectors.clone());
+        let mut agents = AgentRuntime::new(skills, runtime.clone(), connectors.clone())
+            .with_tenant_id(tenant_id);
+        if let Some(config) = crate::agent::PythonWorkerConfig::from_environment(
+            &self.mcp_base_url,
+            tenant_dir.join("agent-checkpoints"),
+        ) {
+            agents = agents.with_python_worker(config);
+        }
         agents
             .recover()
             .await
@@ -590,6 +744,7 @@ impl EnterpriseState {
             data_dir: tenant_dir,
             mcp_base_url: self.mcp_base_url.clone(),
             worker_queue: Some(self.workers.clone()),
+            event_bus,
         };
         let router = crate::api::router(state.clone());
         Ok(TenantEntry { router, state })
@@ -669,11 +824,7 @@ impl EnterpriseState {
         let quota = self.quota(tenant_id).await?;
         let db = &entry.state.db;
         let (label, count, limit) = if method == "POST" && path == "/workflows" {
-            (
-                "workflows",
-                count_query(db, "SELECT COUNT(*) FROM workflows").await?,
-                quota.max_workflows,
-            )
+            ("workflows", db.workflow_count().await?, quota.max_workflows)
         } else if method == "POST" && path == "/skills/import" {
             (
                 "skills",
@@ -705,12 +856,7 @@ impl EnterpriseState {
         } else if method == "POST" && path.ends_with("/executions") {
             (
                 "executionsToday",
-                count_like(
-                    db,
-                    "SELECT COUNT(*) FROM executions WHERE started_at LIKE ?",
-                    &format!("{}%", today_prefix()),
-                )
-                .await?,
+                db.execution_count_since(&today_prefix()).await?,
                 quota.max_executions_per_day,
             )
         } else if method == "POST" && path.starts_with("/agents/") && path.ends_with("/run") {
@@ -746,11 +892,7 @@ impl EnterpriseState {
             ));
         }
         if method == "POST" && path.ends_with("/executions") {
-            let running = count_query(
-                db,
-                "SELECT COUNT(*) FROM executions WHERE status IN ('running','waiting_approval')",
-            )
-            .await?;
+            let running = db.active_execution_count().await?;
             if running >= quota.max_concurrent_runs {
                 return Err(ApiError::new(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -766,6 +908,22 @@ impl EnterpriseState {
     }
 }
 
+pub fn spawn_remote_approval_monitor(state: EnterpriseState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let interval = std::env::var("HPA_APPROVAL_TICK_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1_000);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(interval)).await;
+            if let Err(error) = state.expire_worker_approvals().await {
+                tracing::warn!(error = %error.message, "remote approval SLA scan failed");
+            }
+        }
+    })
+}
+
 pub fn router(state: EnterpriseState) -> Router {
     Router::new()
         .route(
@@ -774,7 +932,9 @@ pub fn router(state: EnterpriseState) -> Router {
         )
         .route(
             "/api/enterprise/tenants/{id}",
-            get(get_tenant).delete(delete_tenant),
+            get(get_tenant)
+                .put(update_tenant_status)
+                .delete(delete_tenant),
         )
         .route(
             "/api/enterprise/tokens",
@@ -836,10 +996,14 @@ pub fn router(state: EnterpriseState) -> Router {
         .route("/api/enterprise/oidc", get(get_oidc).put(set_oidc))
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
+        .route("/auth/oidc/logout/callback", get(oidc_logout_callback))
         .route("/auth/session", get(auth_session))
+        .route("/auth/refresh", post(auth_refresh))
         .route("/auth/logout", post(auth_logout))
         .route("/api/auth/session", get(auth_session))
+        .route("/api/auth/refresh", post(auth_refresh))
         .route("/api/auth/logout", post(auth_logout))
+        .merge(scim::router())
         .merge(crate::oauth_http::router())
         .merge(crate::hooks::router())
         .merge(crate::observe::router())
@@ -976,6 +1140,69 @@ struct DeleteTenantRequest {
     confirm: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct UpdateTenantStatusRequest {
+    status: String,
+}
+
+async fn update_tenant_status(
+    State(state): State<EnterpriseState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateTenantStatusRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let admin = state.require_admin(&headers).await?;
+    if id == LOCAL_TENANT {
+        return Err(ApiError::conflict(
+            "TENANT_PROTECTED",
+            "the local tenant status cannot be changed",
+        ));
+    }
+    if !matches!(request.status.as_str(), "active" | "suspended") {
+        return Err(ApiError::bad_request(
+            "TENANT_STATUS_INVALID",
+            "status must be active or suspended",
+        ));
+    }
+    let now = now_rfc3339();
+    let updated = sqlx::query(
+        "UPDATE enterprise_tenants SET status = ?, updated_at = ?
+         WHERE id = ? AND status != 'deleted'",
+    )
+    .bind(&request.status)
+    .bind(&now)
+    .bind(&id)
+    .execute(&state.control)
+    .await
+    .map_err(internal)?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError::not_found(format!("tenant `{id}` not found")));
+    }
+    if request.status == "suspended" {
+        let _ = state.browser_auth.revoke_tenant_sessions(&id).await;
+    }
+    state
+        .audit(
+            Some(&id),
+            Some(&admin.token_id),
+            "token",
+            "tenant.status",
+            "tenant",
+            "allow",
+            None,
+            json!({"status": request.status}),
+        )
+        .await;
+    let row = sqlx::query(
+        "SELECT id, name, status, created_at, updated_at FROM enterprise_tenants WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&state.control)
+    .await
+    .map_err(internal)?;
+    Ok(Json(tenant_value(&row)))
+}
+
 async fn delete_tenant(
     State(state): State<EnterpriseState>,
     AxumPath(id): AxumPath<String>,
@@ -1015,6 +1242,11 @@ async fn delete_tenant(
     .execute(&state.control)
     .await
     .map_err(internal)?;
+    sqlx::query("DELETE FROM enterprise_scim_groups WHERE tenant_id = ?")
+        .bind(&id)
+        .execute(&state.control)
+        .await
+        .map_err(internal)?;
     sqlx::query("DELETE FROM enterprise_members WHERE tenant_id = ?")
         .bind(&id)
         .execute(&state.control)
@@ -1251,25 +1483,41 @@ async fn create_member(
         ));
     }
     let email = normalize_member_email(request.email.as_deref())?;
+    let user_name = email.clone().unwrap_or_else(|| subject.to_string());
     let now = now_rfc3339();
     let id = format!("entmem_{}", Uuid::now_v7());
     let inserted = sqlx::query(
         "INSERT INTO enterprise_members
-         (id, tenant_id, subject, display_name, email, role, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+         (id, tenant_id, subject, user_name, display_name, email, role, base_role,
+          scim_json, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}', 'active', ?, ?)
          ON CONFLICT(tenant_id, subject) DO NOTHING",
     )
     .bind(&id)
     .bind(&request.tenant_id)
     .bind(subject)
+    .bind(&user_name)
     .bind(display_name)
     .bind(&email)
+    .bind(&request.role)
     .bind(&request.role)
     .bind(&now)
     .bind(&now)
     .execute(&state.control)
     .await
-    .map_err(internal)?;
+    .map_err(|error| {
+        if error
+            .as_database_error()
+            .is_some_and(|database| database.is_unique_violation())
+        {
+            ApiError::conflict(
+                "MEMBER_IDENTITY_EXISTS",
+                "member subject, userName or externalId already exists in this tenant",
+            )
+        } else {
+            internal(error)
+        }
+    })?;
     if inserted.rows_affected() == 0 {
         return Err(ApiError::conflict(
             "MEMBER_EXISTS",
@@ -1316,7 +1564,7 @@ async fn update_member(
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
     let row = sqlx::query(
-        "SELECT tenant_id, display_name, email, role, status
+        "SELECT tenant_id, display_name, email, role, base_role, status
          FROM enterprise_members WHERE id = ?",
     )
     .bind(&id)
@@ -1355,13 +1603,35 @@ async fn update_member(
         Some(value) => normalize_member_email(Some(value))?,
         None => row.get("email"),
     };
-    let role = match request.role.as_deref() {
+    let requested_role = match request.role.as_deref() {
         Some(value) => {
             validate_role(value)?;
-            value.to_string()
+            Some(value.to_string())
         }
-        None => row.get("role"),
+        None => None,
     };
+    let mapped_roles: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT g.role
+         FROM enterprise_scim_groups g
+         JOIN enterprise_scim_group_members gm
+           ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
+         WHERE gm.tenant_id = ? AND gm.member_id = ? AND g.role IS NOT NULL",
+    )
+    .bind(&tenant_id)
+    .bind(&id)
+    .fetch_all(&state.control)
+    .await
+    .map_err(internal)?;
+    if requested_role.is_some() && !mapped_roles.is_empty() {
+        return Err(ApiError::conflict(
+            "MEMBER_ROLE_MANAGED_BY_GROUP",
+            "member role is managed by a SCIM Group; remove the group mapping first",
+        ));
+    }
+    let base_role = requested_role
+        .clone()
+        .unwrap_or_else(|| row.get("base_role"));
+    let role = requested_role.unwrap_or_else(|| row.get("role"));
     let status = match request.status.as_deref() {
         Some(value) => {
             validate_member_status(value)?;
@@ -1371,12 +1641,13 @@ async fn update_member(
     };
     sqlx::query(
         "UPDATE enterprise_members
-         SET display_name = ?, email = ?, role = ?, status = ?, updated_at = ?
+         SET display_name = ?, email = ?, role = ?, base_role = ?, status = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&display_name)
     .bind(&email)
     .bind(&role)
+    .bind(&base_role)
     .bind(&status)
     .bind(now_rfc3339())
     .bind(&id)
@@ -1643,13 +1914,24 @@ async fn list_workers(
     Query(query): Query<OpsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
-    let workers = state
-        .ops
-        .list_workers(query.tenant_id.as_deref())
-        .await
-        .map_err(ops_error)?;
+    let workers = if state.workers.has_postgres() {
+        state
+            .workers
+            .list_workers_pg(query.tenant_id.as_deref())
+            .await
+            .map_err(worker_error)?
+    } else {
+        state
+            .ops
+            .list_workers(query.tenant_id.as_deref())
+            .await
+            .map_err(ops_error)?
+            .into_iter()
+            .map(normalize_worker)
+            .collect()
+    };
     Ok(Json(json!({
-        "workers": workers.into_iter().map(normalize_worker).collect::<Vec<_>>(),
+        "workers": workers,
     })))
 }
 
@@ -1687,6 +1969,11 @@ async fn register_worker(
         )
         .await
         .map_err(ops_error)?;
+    state
+        .workers
+        .sync_worker_value(&worker)
+        .await
+        .map_err(worker_error)?;
     let worker_id = worker
         .get("id")
         .and_then(Value::as_str)
@@ -1728,6 +2015,11 @@ async fn worker_heartbeat(
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
     let worker = state.ops.heartbeat_worker(&id).await.map_err(ops_error)?;
+    state
+        .workers
+        .sync_worker_value(&worker)
+        .await
+        .map_err(worker_error)?;
     Ok(Json(normalize_worker(worker)))
 }
 
@@ -1738,6 +2030,11 @@ async fn disable_worker(
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
     let worker = state.ops.disable_worker(&id).await.map_err(ops_error)?;
+    state
+        .workers
+        .sync_worker_value(&worker)
+        .await
+        .map_err(worker_error)?;
     let _ = state.workers.revoke_worker_tokens(&id).await;
     state
         .audit(
@@ -2465,6 +2762,10 @@ struct OidcConfigRequest {
     cookie_secure: Option<bool>,
     #[serde(default)]
     session_ttl_seconds: Option<i64>,
+    #[serde(default)]
+    end_session_endpoint: Option<String>,
+    #[serde(default)]
+    post_logout_redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2520,6 +2821,8 @@ async fn set_oidc(
             request.admin_subjects.unwrap_or_default(),
             request.cookie_secure.unwrap_or(false),
             request.session_ttl_seconds.unwrap_or(28_800),
+            request.end_session_endpoint.as_deref().unwrap_or(""),
+            request.post_logout_redirect_uri.as_deref().unwrap_or(""),
         )
         .await
         .map_err(ops_error)?;
@@ -2625,6 +2928,23 @@ async fn oidc_callback(
     }
 }
 
+async fn oidc_logout_callback(
+    State(state): State<EnterpriseState>,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
+    let Some(state_value) = query.state.as_deref() else {
+        return login_error_redirect("logout_state_invalid");
+    };
+    let validation = state.browser_auth.consume_logout_state(state_value).await;
+    if validation.is_err() {
+        return login_error_redirect("logout_state_invalid");
+    }
+    if let Some(error) = query.error.as_deref() {
+        return login_error_redirect(safe_error_code(error));
+    }
+    Redirect::to("/login?loggedOut=1").into_response()
+}
+
 async fn auth_session(State(state): State<EnterpriseState>, headers: HeaderMap) -> Response {
     let sso_configured = state.browser_auth.sso_configured().await.unwrap_or(false);
     let mode = if state.require_auth {
@@ -2662,7 +2982,9 @@ async fn auth_session(State(state): State<EnterpriseState>, headers: HeaderMap) 
                 "displayName": session.display_name
             },
             "csrfToken": session.csrf_token,
-            "expiresAt": session.expires_at
+            "expiresAt": session.expires_at,
+            "accessTokenExpiresAt": session.access_token_expires_at,
+            "refreshAvailable": session.refresh_available
         }),
         None => json!({
             "authenticated": false,
@@ -2670,14 +2992,97 @@ async fn auth_session(State(state): State<EnterpriseState>, headers: HeaderMap) 
             "mode": mode,
             "principal": Value::Null,
             "csrfToken": Value::Null,
-            "expiresAt": Value::Null
+            "expiresAt": Value::Null,
+            "accessTokenExpiresAt": Value::Null,
+            "refreshAvailable": false
         }),
     };
     let mut response = Json(body).into_response();
-    if stale && let Ok(cookie) = HeaderValue::from_str(&browser_auth::clear_cookie(false)) {
+    if stale
+        && let Ok(cookie) = HeaderValue::from_str(&state.browser_auth.clear_session_cookie().await)
+    {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     response
+}
+
+async fn auth_refresh(State(state): State<EnterpriseState>, headers: HeaderMap) -> Response {
+    let Some(cookie) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return unauthorized("session is required").into_response();
+    };
+    let principal = match state.browser_auth.session(Some(cookie)).await {
+        Ok(Some(principal)) => principal,
+        Ok(None) => return unauthorized("session is not valid").into_response(),
+        Err(error) => return browser_api_error(error).into_response(),
+    };
+    let provided = headers
+        .get("x-hpa-csrf")
+        .and_then(|value| value.to_str().ok());
+    if !csrf_token_matches(&principal.csrf_token, provided) {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "CSRF_REQUIRED",
+            "X-HPA-CSRF header is required",
+        )
+        .into_response();
+    }
+    match state.browser_auth.refresh(Some(cookie)).await {
+        Ok(refreshed) => {
+            state
+                .audit(
+                    Some(&refreshed.principal.tenant_id),
+                    Some(&refreshed.principal.session_id),
+                    "session",
+                    "auth.refresh",
+                    "browser_session",
+                    "allow",
+                    None,
+                    json!({
+                        "subject": refreshed.principal.subject,
+                        "expiresAt": refreshed.principal.expires_at,
+                        "accessTokenExpiresAt": refreshed.principal.access_token_expires_at
+                    }),
+                )
+                .await;
+            let mut response = Json(json!({
+                "authenticated": true,
+                "refreshed": true,
+                "expiresAt": refreshed.principal.expires_at,
+                "accessTokenExpiresAt": refreshed.principal.access_token_expires_at,
+                "refreshAvailable": refreshed.principal.refresh_available
+            }))
+            .into_response();
+            if let Ok(cookie) = HeaderValue::from_str(&refreshed.cookie) {
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+            }
+            response
+        }
+        Err(error) => {
+            let code = browser_error_code(&error).to_string();
+            state
+                .audit(
+                    Some(&principal.tenant_id),
+                    Some(&principal.session_id),
+                    "session",
+                    "auth.refresh",
+                    "browser_session",
+                    "deny",
+                    Some(&code),
+                    json!({"subject": principal.subject}),
+                )
+                .await;
+            let mut response = browser_api_error(error).into_response();
+            if let Ok(cookie) =
+                HeaderValue::from_str(&state.browser_auth.clear_session_cookie().await)
+            {
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+            }
+            response
+        }
+    }
 }
 
 async fn auth_logout(
@@ -2706,7 +3111,7 @@ async fn auth_logout(
             "X-HPA-CSRF header is required",
         ));
     }
-    state
+    let logged_out = state
         .browser_auth
         .logout(Some(cookie))
         .await
@@ -2723,8 +3128,12 @@ async fn auth_logout(
             json!({"subject": principal.subject}),
         )
         .await;
-    let mut response = Json(json!({"loggedOut": true})).into_response();
-    if let Ok(cookie) = HeaderValue::from_str(&browser_auth::clear_cookie(false)) {
+    let mut response = Json(json!({
+        "loggedOut": logged_out.revoked,
+        "logoutUrl": logged_out.logout_url,
+    }))
+    .into_response();
+    if let Ok(cookie) = HeaderValue::from_str(&logged_out.cookie) {
         response.headers_mut().append(header::SET_COOKIE, cookie);
     }
     Ok(response)
@@ -2916,6 +3325,60 @@ async fn tenant_gate(
             "enterprise": state.require_auth,
         }))
         .into_response();
+    }
+    if path == "/internal/agent-tool-calls" {
+        let tenant_id = request
+            .headers()
+            .get("x-hpa-tenant-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .filter(|value| !value.is_empty() && value.len() <= 128);
+        let Some(tenant_id) = tenant_id else {
+            return ApiError::new(
+                StatusCode::FORBIDDEN,
+                "AGENT_TOOL_TENANT",
+                "x-hpa-tenant-id header is required",
+            )
+            .into_response();
+        };
+        let active: Option<String> = match sqlx::query_scalar(
+            "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+        )
+        .bind(&tenant_id)
+        .fetch_optional(&state.control)
+        .await
+        {
+            Ok(active) => active,
+            Err(error) => return internal(error).into_response(),
+        };
+        if active.is_none() {
+            return ApiError::new(
+                StatusCode::FORBIDDEN,
+                "AGENT_TOOL_TENANT",
+                "tenant is not active",
+            )
+            .into_response();
+        }
+        let entry = match state.tenant_entry(&tenant_id).await {
+            Ok(entry) => entry,
+            Err(error) => return error.into_response(),
+        };
+        let query = request
+            .uri()
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let mut request = request;
+        let Ok(uri) = format!("/{rest}{query}").parse::<Uri>() else {
+            return ApiError::bad_request("INVALID_URI", "cannot rebuild request URI")
+                .into_response();
+        };
+        *request.uri_mut() = uri;
+        request.extensions_mut().clear();
+        return match entry.router.oneshot(request).await {
+            Ok(response) => response,
+            Err(error) => ApiError::internal(error.to_string()).into_response(),
+        };
     }
     let headers = request.headers().clone();
     let principal = match state.authenticate(&headers).await {
@@ -3207,9 +3670,13 @@ async fn ensure_control_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             id TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             subject TEXT NOT NULL,
+            user_name TEXT,
+            external_id TEXT,
             display_name TEXT NOT NULL,
             email TEXT,
             role TEXT NOT NULL,
+            base_role TEXT NOT NULL DEFAULT 'viewer',
+            scim_json TEXT NOT NULL DEFAULT '{}',
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -3217,6 +3684,60 @@ async fn ensure_control_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         )",
         "CREATE INDEX IF NOT EXISTS idx_enterprise_members_tenant
          ON enterprise_members(tenant_id, created_at DESC)",
+        "CREATE TABLE IF NOT EXISTS enterprise_scim_groups (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            external_id TEXT,
+            role TEXT CHECK (role IS NULL OR role IN (
+                'owner', 'admin', 'developer', 'publisher',
+                'operator', 'approver', 'auditor', 'viewer'
+            )),
+            scim_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_scim_groups_name
+         ON enterprise_scim_groups(tenant_id, lower(display_name))",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_scim_groups_external_id
+         ON enterprise_scim_groups(tenant_id, external_id) WHERE external_id IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_members_tenant_id
+         ON enterprise_members(tenant_id, id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_scim_groups_tenant_id
+         ON enterprise_scim_groups(tenant_id, id)",
+        "CREATE TABLE IF NOT EXISTS enterprise_scim_group_members (
+            tenant_id TEXT NOT NULL,
+            group_id TEXT NOT NULL REFERENCES enterprise_scim_groups(id) ON DELETE CASCADE,
+            member_id TEXT NOT NULL REFERENCES enterprise_members(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (group_id, member_id)
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_enterprise_scim_group_members_member
+         ON enterprise_scim_group_members(tenant_id, member_id)",
+        "CREATE TRIGGER IF NOT EXISTS enterprise_scim_group_members_tenant_insert
+         BEFORE INSERT ON enterprise_scim_group_members
+         WHEN NOT EXISTS (
+             SELECT 1 FROM enterprise_scim_groups
+             WHERE tenant_id = NEW.tenant_id AND id = NEW.group_id
+         ) OR NOT EXISTS (
+             SELECT 1 FROM enterprise_members
+             WHERE tenant_id = NEW.tenant_id AND id = NEW.member_id
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'scim group member tenant mismatch');
+         END",
+        "CREATE TRIGGER IF NOT EXISTS enterprise_scim_group_members_tenant_update
+         BEFORE UPDATE ON enterprise_scim_group_members
+         WHEN NOT EXISTS (
+             SELECT 1 FROM enterprise_scim_groups
+             WHERE tenant_id = NEW.tenant_id AND id = NEW.group_id
+         ) OR NOT EXISTS (
+             SELECT 1 FROM enterprise_members
+             WHERE tenant_id = NEW.tenant_id AND id = NEW.member_id
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'scim group member tenant mismatch');
+         END",
         "CREATE TABLE IF NOT EXISTS enterprise_audit (
             id TEXT PRIMARY KEY,
             at TEXT NOT NULL,
@@ -3234,6 +3755,62 @@ async fn ensure_control_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     for statement in statements {
         sqlx::query(statement).execute(pool).await?;
     }
+    ensure_control_columns(pool).await?;
+    Ok(())
+}
+
+async fn ensure_control_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('enterprise_members')")
+            .fetch_all(pool)
+            .await?;
+    let backfill_base_role = !columns.iter().any(|column| column == "base_role");
+    let additions = [
+        (
+            "user_name",
+            "ALTER TABLE enterprise_members ADD COLUMN user_name TEXT",
+        ),
+        (
+            "external_id",
+            "ALTER TABLE enterprise_members ADD COLUMN external_id TEXT",
+        ),
+        (
+            "base_role",
+            "ALTER TABLE enterprise_members ADD COLUMN base_role TEXT NOT NULL DEFAULT 'viewer'",
+        ),
+        (
+            "scim_json",
+            "ALTER TABLE enterprise_members ADD COLUMN scim_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ];
+    for (name, statement) in additions {
+        if !columns.iter().any(|column| column == name) {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
+    if backfill_base_role {
+        sqlx::query("UPDATE enterprise_members SET base_role = role")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_members_user_name
+         ON enterprise_members(tenant_id, lower(user_name)) WHERE user_name IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_members_external_id
+         ON enterprise_members(tenant_id, external_id) WHERE external_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_enterprise_members_email
+         ON enterprise_members(tenant_id, lower(email)) WHERE email IS NOT NULL",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

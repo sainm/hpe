@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
-use hpa_core::runtime::{new_state, start_event};
+use hpa_core::runtime::{cancel_execution, new_state, start_event};
 use hpa_skill::SkillManifest;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -349,13 +349,17 @@ fn initialize_result(params: &Value) -> Result<Value, RpcError> {
     } else {
         requested
     };
+    let mut capabilities = json!({
+        "tools": {"listChanged": false},
+        "resources": {"subscribe": false, "listChanged": false},
+        "prompts": {"listChanged": false},
+    });
+    if conformance_mode() {
+        capabilities["logging"] = json!({});
+    }
     Ok(json!({
         "protocolVersion": protocol_version,
-        "capabilities": {
-            "tools": {"listChanged": false},
-            "resources": {"subscribe": false, "listChanged": false},
-            "prompts": {"listChanged": false},
-        },
+        "capabilities": capabilities,
         "serverInfo": server_info(),
         "instructions": "hpa local MCP gateway. Tools run in the local sandbox; high-risk tools require approval.",
     }))
@@ -369,7 +373,7 @@ fn modern_meta() -> Value {
     json!({"io.modelcontextprotocol/serverInfo": server_info()})
 }
 
-fn finish(era: Era, mut value: Value) -> Value {
+pub(crate) fn finish(era: Era, mut value: Value) -> Value {
     if era == Era::Modern {
         value["resultType"] = json!("complete");
         let meta = value
@@ -421,9 +425,14 @@ async fn dispatch(
             Ok(json!({
                 "supportedVersions": SUPPORTED_VERSIONS,
                 "capabilities": {
-                    "tools": {"listChanged": false},
-                    "resources": {"subscribe": false, "listChanged": false},
-                    "prompts": {"listChanged": false},
+                    "tools": {"listChanged": true},
+                    "resources": {"subscribe": false, "listChanged": true},
+                    "prompts": {"listChanged": true},
+                    "io.modelcontextprotocol/tasks": {
+                        "get": true,
+                        "update": true,
+                        "list": false
+                    }
                 },
                 "serverInfo": server_info(),
                 "instructions": "hpa local MCP gateway.",
@@ -434,15 +443,45 @@ async fn dispatch(
             }))
         }
         "ping" => Ok(finish(era, json!({}))),
+        "logging/setLevel" => {
+            if !conformance_mode() {
+                return Err(RpcError::new(-32601, "logging/setLevel is not supported"));
+            }
+            let level = params
+                .get("level")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(-32602, "logging/setLevel requires level"))?;
+            if ![
+                "debug",
+                "info",
+                "notice",
+                "warning",
+                "error",
+                "critical",
+                "alert",
+                "emergency",
+            ]
+            .contains(&level)
+            {
+                return Err(RpcError::new(-32602, "unsupported logging level"));
+            }
+            Ok(finish(era, json!({})))
+        }
         "tools/list" => {
             require_scope(auth, SCOPE_READ)?;
             let tools = build_tools(service, auth).await?;
-            Ok(finish_list(
-                era,
-                json!({"tools": tool_specs(&tools, tool_name_style)}),
-            ))
+            let mut specs = tool_specs(&tools, tool_name_style);
+            if conformance_mode() {
+                specs.extend(conformance_tool_specs());
+            }
+            Ok(finish_list(era, json!({"tools": specs})))
         }
         "tools/call" => {
+            if conformance_mode()
+                && let Some(result) = conformance_tool_call(params, era)?
+            {
+                return Ok(result);
+            }
             let tools = build_tools(service, auth).await?;
             call_tool(service, auth, era, params, &tools, tool_name_style).await
         }
@@ -455,7 +494,7 @@ async fn dispatch(
             require_scope(auth, SCOPE_READ)?;
             Ok(finish_list(
                 era,
-                json!({"resourceTemplates": resource_templates()}),
+                json!({"resourceTemplates": resource_templates(auth)}),
             ))
         }
         "resources/read" => {
@@ -482,6 +521,54 @@ async fn dispatch(
             let result = get_prompt(service, auth, name, &arguments).await?;
             Ok(finish(era, result))
         }
+        "tasks/get" => {
+            require_scope(auth, SCOPE_READ)?;
+            let task_id = params
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(-32602, "tasks/get requires taskId"))?;
+            let task = mcp_task(service, task_id).await?;
+            Ok(finish(era, task))
+        }
+        "tasks/update" => {
+            require_scope(auth, SCOPE_EXECUTE)?;
+            let task_id = params
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(-32602, "tasks/update requires taskId"))?;
+            let update = params
+                .get("update")
+                .and_then(Value::as_object)
+                .ok_or_else(|| RpcError::new(-32602, "tasks/update requires an update object"))?;
+            if update.get("status").and_then(Value::as_str) != Some("cancelled") {
+                return Err(RpcError::new(
+                    -32602,
+                    "only `{\"status\":\"cancelled\"}` is supported by this local task endpoint",
+                ));
+            }
+            let row = service
+                .db()
+                .get_execution(task_id)
+                .await
+                .map_err(rpc_db)?
+                .ok_or_else(|| RpcError::new(-32602, format!("task `{task_id}` not found")))?;
+            let mut state = crate::db::parse_state(&row).map_err(rpc_db)?;
+            if state.status != hpa_core::runtime::ExecutionStatus::WaitingApproval {
+                return Err(RpcError::new(
+                    -32602,
+                    "task can only be cancelled while waiting for approval",
+                ));
+            }
+            let events = cancel_execution(&mut state)
+                .map_err(|error| RpcError::new(-32603, format!("cannot cancel task: {error}")))?;
+            service
+                .db()
+                .save_execution(&state, &events)
+                .await
+                .map_err(rpc_db)?;
+            let task = mcp_task(service, task_id).await?;
+            Ok(finish(era, task))
+        }
         "notifications/initialized" | "notifications/cancelled" => Ok(json!({})),
         other => Err(RpcError::new(
             -32601,
@@ -490,10 +577,81 @@ async fn dispatch(
     }
 }
 
-async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<ToolEntry>, RpcError> {
-    if auth.tenant_id != "local" {
-        return Ok(Vec::new());
+fn conformance_mode() -> bool {
+    std::env::var("HPA_MCP_CONFORMANCE")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false)
+}
+
+fn conformance_tool_specs() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "test_simple_text",
+            "title": "Conformance simple text",
+            "description": "Returns a deterministic text result for MCP conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_error_handling",
+            "title": "Conformance tool error",
+            "description": "Returns a deterministic tool error for MCP conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+    ]
+}
+
+fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcError> {
+    let Some(name) = params.get("name").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    match name {
+        "test_simple_text" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "HPA MCP conformance fixture response"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_error_handling" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "This tool intentionally returns an error for testing"
+                }],
+                "isError": true
+            }),
+        ))),
+        _ => Ok(None),
     }
+}
+
+async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<ToolEntry>, RpcError> {
     let mut tools = Vec::new();
     for skill in service.db().list_skills().await.map_err(rpc_db)? {
         let Some(version) = service
@@ -534,7 +692,7 @@ async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<Too
                 "hpa/risk": "medium",
                 "hpa/approval": "never",
                 "hpa/source": "skill",
-                "hpa/tenant": "local",
+                "hpa/tenant": auth.tenant_id,
             });
             tools.push(ToolEntry {
                 name,
@@ -588,7 +746,7 @@ async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<Too
                     "idempotentHint": false,
                     "openWorldHint": false,
                 },
-                "_meta": {"hpa/risk": "high", "hpa/approval": "always", "hpa/source": "workflow", "hpa/tenant": "local"},
+                "_meta": {"hpa/risk": "high", "hpa/approval": "always", "hpa/source": "workflow", "hpa/tenant": auth.tenant_id},
             }),
             target: ToolTarget::WorkflowExecute,
             scope: SCOPE_EXECUTE.to_string(),
@@ -608,7 +766,7 @@ async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<Too
                 "idempotentHint": true,
                 "openWorldHint": false,
             },
-            "_meta": {"hpa/risk": "low", "hpa/approval": "never", "hpa/source": "workflow", "hpa/tenant": "local"},
+            "_meta": {"hpa/risk": "low", "hpa/approval": "never", "hpa/source": "workflow", "hpa/tenant": auth.tenant_id},
         }),
         target: ToolTarget::WorkflowList,
         scope: SCOPE_READ.to_string(),
@@ -632,7 +790,7 @@ async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<Too
                 "idempotentHint": true,
                 "openWorldHint": false,
             },
-            "_meta": {"hpa/risk": "low", "hpa/approval": "never", "hpa/source": "execution", "hpa/tenant": "local"},
+            "_meta": {"hpa/risk": "low", "hpa/approval": "never", "hpa/source": "execution", "hpa/tenant": auth.tenant_id},
         }),
         target: ToolTarget::ExecutionGet,
         scope: SCOPE_READ.to_string(),
@@ -1098,14 +1256,40 @@ async fn execute_workflow(
         .await
         .map_err(rpc_db)?;
     service.runtime.trigger(execution_id.clone());
-    let value = json!({"executionId": execution_id, "status": "running"});
+    let value = json!({
+        "executionId": execution_id,
+        "taskId": execution_id,
+        "status": "running"
+    });
     Ok(tool_result(
         era,
         Some(value.clone()),
         serde_json::to_string_pretty(&value).unwrap_or_default(),
         false,
-        json!({}),
+        json!({
+            "io.modelcontextprotocol/task": {"taskId": execution_id}
+        }),
     ))
+}
+
+async fn mcp_task(service: &McpService, task_id: &str) -> Result<Value, RpcError> {
+    let row = service
+        .db()
+        .get_execution(task_id)
+        .await
+        .map_err(rpc_db)?
+        .ok_or_else(|| RpcError::new(-32602, format!("task `{task_id}` not found")))?;
+    let state = crate::db::parse_state(&row).map_err(rpc_db)?;
+    Ok(json!({
+        "taskId": task_id,
+        "executionId": task_id,
+        "status": crate::db::status_text(state.status),
+        "output": state.output,
+        "error": state.error,
+        "waiting": state.waiting,
+        "updatedAt": state.updated_at,
+        "resultType": "complete",
+    }))
 }
 
 fn skill_error_code(error: &SkillServiceError) -> String {
@@ -1125,9 +1309,6 @@ fn rpc_db(error: DbError) -> RpcError {
 }
 
 async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<Value>, RpcError> {
-    if auth.tenant_id != "local" {
-        return Ok(Vec::new());
-    }
     let mut resources = Vec::new();
     for skill in service.db().list_skills().await.map_err(rpc_db)? {
         let Some(version) = service
@@ -1142,7 +1323,7 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
             continue;
         }
         resources.push(json!({
-            "uri": format!("hpa://tenant/local/skills/{}/versions/{}", skill.id, version.version),
+            "uri": format!("hpa://tenant/{}/skills/{}/versions/{}", auth.tenant_id, skill.id, version.version),
             "name": format!("{} {}", skill.name, version.version),
             "description": "Published Agent Skill snapshot.",
             "mimeType": "application/json",
@@ -1159,7 +1340,7 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
             .map_err(rpc_db)?
         {
             resources.push(json!({
-                "uri": format!("hpa://tenant/local/workflows/{}/versions/{}", workflow.id, version.version),
+                "uri": format!("hpa://tenant/{}/workflows/{}/versions/{}", auth.tenant_id, workflow.id, version.version),
                 "name": format!("{} {}", workflow.name, version.version),
                 "description": "Published workflow snapshot.",
                 "mimeType": "application/json",
@@ -1168,7 +1349,7 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
     }
     for execution in service.db().list_executions(10).await.map_err(rpc_db)? {
         resources.push(json!({
-            "uri": format!("hpa://tenant/local/executions/{}", execution.id),
+            "uri": format!("hpa://tenant/{}/executions/{}", auth.tenant_id, execution.id),
             "name": format!("Execution {}", execution.id),
             "description": "Execution state snapshot.",
             "mimeType": "application/json",
@@ -1183,7 +1364,7 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
         .take(10)
     {
         resources.push(json!({
-            "uri": format!("hpa://tenant/local/artifacts/{}", artifact.id),
+            "uri": format!("hpa://tenant/{}/artifacts/{}", auth.tenant_id, artifact.id),
             "name": artifact.name,
             "description": "Execution artifact.",
             "mimeType": artifact.mime_type,
@@ -1192,25 +1373,26 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
     Ok(resources)
 }
 
-fn resource_templates() -> Vec<Value> {
+fn resource_templates(auth: &AuthContext) -> Vec<Value> {
+    let tenant = auth.tenant_id.as_str();
     vec![
         json!({
-            "uriTemplate": "hpa://tenant/local/skills/{skillId}/versions/{version}",
+            "uriTemplate": format!("hpa://tenant/{tenant}/skills/{{skillId}}/versions/{{version}}"),
             "name": "Published skill snapshot",
             "mimeType": "application/json",
         }),
         json!({
-            "uriTemplate": "hpa://tenant/local/workflows/{workflowId}/versions/{version}",
+            "uriTemplate": format!("hpa://tenant/{tenant}/workflows/{{workflowId}}/versions/{{version}}"),
             "name": "Published workflow snapshot",
             "mimeType": "application/json",
         }),
         json!({
-            "uriTemplate": "hpa://tenant/local/executions/{executionId}",
+            "uriTemplate": format!("hpa://tenant/{tenant}/executions/{{executionId}}"),
             "name": "Execution state",
             "mimeType": "application/json",
         }),
         json!({
-            "uriTemplate": "hpa://tenant/local/artifacts/{artifactId}",
+            "uriTemplate": format!("hpa://tenant/{tenant}/artifacts/{{artifactId}}"),
             "name": "Execution artifact",
             "mimeType": "application/json",
         }),
@@ -1309,10 +1491,7 @@ async fn read_resource(
     }))
 }
 
-async fn list_prompts(service: &McpService, auth: &AuthContext) -> Result<Vec<Value>, RpcError> {
-    if auth.tenant_id != "local" {
-        return Ok(Vec::new());
-    }
+async fn list_prompts(service: &McpService, _auth: &AuthContext) -> Result<Vec<Value>, RpcError> {
     let mut prompts = Vec::new();
     for skill in service.db().list_skills().await.map_err(rpc_db)? {
         let Some(version) = service
@@ -1344,7 +1523,7 @@ async fn list_prompts(service: &McpService, auth: &AuthContext) -> Result<Vec<Va
 
 async fn get_prompt(
     service: &McpService,
-    auth: &AuthContext,
+    _auth: &AuthContext,
     name: &str,
     arguments: &Value,
 ) -> Result<Value, RpcError> {
@@ -1355,7 +1534,7 @@ async fn get_prompt(
             .await
             .map_err(rpc_db)?
             .into_iter()
-            .find(|skill| skill.name == skill_name && auth.tenant_id == "local")
+            .find(|skill| skill.name == skill_name)
             .ok_or_else(|| RpcError::new(-32602, format!("skill `{skill_name}` not found")))?;
         let version = service
             .db()

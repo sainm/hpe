@@ -1,7 +1,5 @@
 import fs from "node:fs";
-import playwright from "file:///Users/sainm/work/demo/BootDoc/node_modules/playwright/index.js";
-
-const { chromium } = playwright;
+import { chromium } from "playwright";
 
 const baseUrl = (process.env.HPA_BASE_URL || "http://127.0.0.1:8787").replace(/\/+$/, "");
 const baseOrigin = new URL(baseUrl).origin;
@@ -11,7 +9,7 @@ const issuer = `http://127.0.0.1:${mockPort}`;
 const clientId = process.env.OIDC_CLIENT_ID || "hpa-local-ui";
 const email = process.env.OIDC_EMAIL || "admin@example.test";
 const subject = process.env.OIDC_SUBJECT || "oidc|browser-admin";
-const scopes = process.env.OIDC_SCOPES || "openid email profile";
+const scopes = process.env.OIDC_SCOPES || "openid email profile offline_access";
 const redirectUri = `${baseUrl}/auth/oidc/callback`;
 
 const screenshots = {
@@ -130,6 +128,8 @@ async function configureOidc(adminToken) {
     adminSubjects: [email, subject],
     cookieSecure: false,
     sessionTtlSeconds: 3600,
+    endSessionEndpoint: `${issuer}/logout`,
+    postLogoutRedirectUri: `${baseUrl}/auth/oidc/logout/callback`,
   };
   const response = await fetch(`${baseUrl}/api/enterprise/oidc`, {
     method: "PUT",
@@ -292,6 +292,27 @@ async function main() {
       role: principal.role ?? null,
       email: principal.email ?? null,
       platformAdmin: true,
+    };
+
+    const csrfToken = String(session.csrfToken || "");
+    if (!csrfToken) throw new Error("authenticated session is missing csrfToken");
+    const refreshResponse = await context.request.post(`${baseUrl}/api/auth/refresh`, {
+      headers: {
+        accept: "application/json",
+        "x-hpa-csrf": csrfToken,
+      },
+      timeout: 10_000,
+    });
+    if (!refreshResponse.ok()) {
+      throw new Error(`silent renewal failed with HTTP ${refreshResponse.status()}`);
+    }
+    const refreshed = await refreshResponse.json();
+    if (refreshed.authenticated !== true || refreshed.refreshed !== true) {
+      throw new Error("silent renewal did not refresh the browser session");
+    }
+    summary.session.silentRenewal = {
+      ok: true,
+      refreshAvailable: refreshed.refreshAvailable === true,
     };
 
     const response = await page.goto(`${baseUrl}/enterprise`, { waitUntil: "domcontentloaded" });

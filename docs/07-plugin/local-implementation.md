@@ -1,6 +1,6 @@
 # Phase 5：本地 Plugin & Connector 实现
 
-Phase 5 在 Local Runtime 上增加插件分发与连接器运行时。当前实现是**本地、声明式**的：插件只携带 manifest 与 JSON/Skill/Agent 配置，不把任意 JavaScript/TypeScript handler 加载进 API 进程；没有远程 Marketplace、云端 Control Plane 或多租户。插件贡献的 Connector 与 MCP Server 进入本地注册表，Skill 与 Agent 以草稿导入，仍按各自的契约执行。
+Phase 5 在 Local Runtime 上增加插件分发与连接器运行时。插件只携带 manifest 与 JSON/Skill/Agent 配置，不把任意 JavaScript/TypeScript handler 加载进 API 进程；P13 已增加签名远程/离线 Marketplace，但云端 Control Plane 和多租户仍未实现。插件贡献的 Connector 与 MCP Server 进入本地注册表，Skill 与 Agent 以草稿导入，仍按各自的契约执行。
 
 ![Plugin Center 1440](../assets/phase5/plugins-1440.png)
 
@@ -16,7 +16,7 @@ Phase 5 在 Local Runtime 上增加插件分发与连接器运行时。当前实
 
 - 实现位于 `crates/hpa-local/src/plugin.rs`、`connector.rs`、`api.rs`、`main.rs`、`db.rs`，UI 为 `/plugins` 与 `/connectors`。
 - Plugin Center 覆盖安装、升级、回滚、启停、卸载、密钥信任、本地发布/审核/评分/撤回；Connector Center 覆盖目录、连接、测试、调用与审计。
-- 不做：远程 Marketplace、OCI 分发、Node/TS handler 执行、脚本沙箱的新执行引擎、系统依赖自动安装、漏洞数据库/在线漏洞源、多租户。
+- 不做：OCI Registry 拉取、Node/TS handler 执行、脚本沙箱的新执行引擎、系统依赖自动安装、多租户。签名远程/离线索引、OSV 与 cosign/OCI digest provenance 见 [Remote Marketplace](remote-marketplace.md)。
 - 声明式能力只有四种：`connector`、`mcp`、`skill`、`agent`。没有 Node、Tool、Trigger 等旧文档中的插件内容类型。
 
 ## 2. 包格式与 manifest
@@ -57,7 +57,7 @@ manifest 固定文件名 `hpa.plugin.json`，schema 为 `hpa.plugin/v1`；顶层
 - capability `path` 必须是包内相对路径。Connector 与 Agent 指向文件，且其 id/version 必须与 capability 一致；MCP 指向配置文件（文件本身不含 id/version，服务器 id 由插件与 capability id 生成）；Skill 指向目录，必须存在 `<path>/SKILL.md`。
 - `compatibility.hpa` 是 semver 范围，按当前二进制 `CARGO_PKG_VERSION` 校验；`os` 非空时必须包含 `std::env::consts::OS`；`runtimes` 仅保留，不参与校验。
 - `dependencies` 只支持 `kind: "plugin"`；安装时要求依赖已安装且状态为 `enabled`，`installed_version` 满足 semver `range`。不自动安装依赖。
-- `permissions` 允许 `network`、`filesystem`、`commands`、`credential`。Connector 为 HTTP 时插件必须声明 `network`，为 File 时必须声明 `filesystem`，Connector 自身也必须声明同类权限；stdio MCP 必须声明 `commands`。权限不构成通用的文件/网络运行时沙箱；主机白名单来自 Connection 配置。
+- `permissions` 允许 `network`、`filesystem`、`commands`、`credential`。Connector 为 HTTP/MQ/S3 时插件必须声明 `network`，为 PostgreSQL 时声明 `database`，为 File/Git 时声明 `filesystem`；Connector 自身也必须声明同类权限。stdio MCP 必须声明 `commands`。权限不构成通用的文件/网络运行时沙箱；主机白名单来自 Connection 配置。
 - license 走现有 `allowed_license` 白名单（Apache-2.0、MIT、BSD、ISC、MPL-2.0、GPL/LGPL/AGPL 等）；不在白名单返回 `PLUGIN_LICENSE`。
 
 内容摘要（`contentHash`）为 `sha256:<hex>`，对包内除 `hpa.plugin.json` 外的文件按路径升序计算：逐文件写入 `path`、`0x00`、十进制字节长度、`0x00`、文件内容的 SHA-256 十六进制、`0x00`，再对整串做 SHA-256。因此 manifest 本身由签名保护，其他文件由 `integrity.digest` 保护；摘要不匹配返回 `PLUGIN_SIGNATURE`。
@@ -100,7 +100,7 @@ manifest 固定文件名 `hpa.plugin.json`，schema 为 `hpa.plugin/v1`；顶层
 - 评分 1..5，可带评论；`rating` 返回 `{average, count}`。评分不要求已安装，也没有防刷、用户维度限制或分页。
 - 撤回把任意非 `withdrawn` 的 listing 置为 `withdrawn` 并写 `withdrawn_at`；可重新提交为 `pending`。
 - 安装只允许 `approved` 且未撤回的 listing；否则 `PLUGIN_FORBIDDEN`。安装复用签名校验，成功后 `downloads` 加 1。
-- 所有数据在本地 SQLite；没有远程索引、下载服务、发布者账号、付费、搜索/分类或审核 SLA。
+- 本地 listing 仍在本地 SQLite；P13 另提供签名 HTTP/离线索引、发布者账号/key、远程下载缓存、key 轮换与撤回传播、Web/VS Code 管理面和持久 SSE 撤回推送。尚无付费、搜索/分类或审核 SLA，详见 [Remote Marketplace](remote-marketplace.md)。
 
 ## 6. Connector 运行时
 
@@ -111,7 +111,7 @@ manifest 固定文件名 `hpa.plugin.json`，schema 为 `hpa.plugin/v1`；顶层
 | `http` | `1.0.0` | `request`（risk `write`）：`method`、`path`、`query`、`headers`、`body`、`idempotencyKey` |
 | `file` | `1.0.0` | `read`、`list`（read），`write`（write） |
 
-Connection 保存 `connector_id`、`connector_version`、`config_json` 与 `credential_env`；保存时 Connector 必须存在且 `enabled`。HTTP 配置：`baseUrl`、`allowedHosts[]`、`auth { kind: none|bearer|header, header? }`、`timeoutMs`、`maxAttempts`、`rateLimitPerMinute`、`maxResponseBytes`。File 配置：`root`、`allowWrite`、`maxFileBytes`。未知配置键被拒绝。
+Connection 保存 `connector_id`、`connector_version`、`config_json` 与 `credential_env`；保存时 Connector 必须存在且 `enabled`。HTTP 配置：`baseUrl`、`allowedHosts[]`、`auth { kind: none|bearer|header, header? }`、`timeoutMs`、`maxAttempts`、`rateLimitPerMinute`、`maxResponseBytes`。File 配置：`root`、`allowWrite`、`maxFileBytes`。PostgreSQL/Git/Redis MQ/S3 配置与安全边界见 [Connector 生产扩展](../08-platform/connector-implementation.md)。未知配置键被拒绝。
 
 认证只保存环境变量名：`credential_env` 必须匹配 `[A-Za-z_][A-Za-z0-9_]*`，调用时用 `std::env::var` 读取；bearer/header 认证缺少变量返回 `CONNECTOR_FORBIDDEN`。数据库与 API 不保存密钥值；审计只保存状态、延迟、响应字节数/条目数、attempts 与 idempotency key 摘要，不持久化响应正文、文件内容或凭证。
 
@@ -143,7 +143,7 @@ File 规则：`root` 在保存与每次调用时 canonicalize，必须是目录�
 
 `gates` 只有三项：`license`（是否在本地 SPDX 白名单）、`signature`（是否有签名）、`staticScan`（`pass` 或 `warnings`）。静态扫描是对 UTF-8 文本做固定字符串匹配：`child_process`、`eval(`、`curl | sh`、`wget | sh`、`rm -rf /`、`-----begin private key-----`。命中只产生 warning，不阻止安装。
 
-**没有 CVE 数据库，没有远程漏洞源，也没有依赖漏洞解析或恶意软件扫描**；SBOM 是包内文件哈希与声明清单，不是供应链漏洞报告。所有门禁均为本地确定性检查。
+**提供可选在线 OSV 与离线 OSV 快照安装门禁，但没有恶意软件情报或完整依赖解析**；离线库必须校验 schema、时间窗口和 20 MiB 上限。SBOM 仍以包内文件哈希与声明清单为主，漏洞报告由独立 API 返回。
 
 ## 9. API 与 CLI
 
@@ -223,7 +223,7 @@ hpa --data-dir ~/.hpa connector sample
 
 截图位于 `docs/assets/phase5/`：Plugin Center（1440/607）、Connector Center（1440/607）与本地 Marketplace（1440）。Plugin Center（`/plugins`）提供已安装/市场两个标签、安装路径与 `allowUnsigned`/`allowUntrusted` 开关、详情/版本/SBOM/事件、密钥信任、发布/审核/评分/撤回；Connector Center（`/connectors`）提供内置与插件来源目录、连接表单、测试/调用结果与审计。截图在 1440 与 607 宽度下均无横向溢出，实际调用了 File 连接器读取 `welcome.txt`。
 
-边界：仅本地 SQLite 和本地文件；声明式插件，不执行插件内 Node/TS/JS handler；不自动安装系统依赖；无远程 Marketplace；限流为进程内存，重启清零；插件市场审核与评分是本地单用户操作，不具备发布者身份、反刷或 SLA；`compatibility.runtimes` 未参与执行；插件 `permissions` 只做结构/一致性门禁，不是通用运行时权限系统。DNS 只在请求前校验一次，未固定到已校验地址；本地面向单用户，不宣称抵御 DNS rebinding。
+边界：本地 listing 使用 SQLite 和本地文件；声明式插件，不执行插件内 Node/TS/JS handler；不自动安装系统依赖。Remote Marketplace 已支持签名 index/发布者 key/撤回、Web/VS Code UI、OSV 门禁、key-based cosign/OCI digest provenance 和同控制面 SSE 撤回推送，但无 Fulcio/Rekor keyless、Registry attestation 拉取、跨控制面 federation 或审核 SLA。限流仍为进程内存，重启清零；本地审核/评分不具备反刷；`compatibility.runtimes` 未参与执行；`permissions` 是结构与一致性门禁，不是通用运行时沙箱。DNS 只在请求前校验一次，不固定已校验地址。
 
 ## 11. 安全非目标
 
@@ -231,5 +231,5 @@ hpa --data-dir ~/.hpa connector sample
 - 不允许插件提升权限或改写平台配置；贡献能力仍受 Connector、Skill、MCP、Agent 各自契约限制。
 - 不允许绕过 Agent/Workflow 审批；Connector 调用不会因“只读”而跳过 Agent 高风险审批。
 - 不允许未签名的市场包；市场安装强制 `requireSignature`。
-- 不提供 CVE/漏洞数据库、在线漏洞源或自动撤回已安装版本。
+- 不提供恶意软件情报、Fulcio/Rekor keyless 验证或 OCI Registry attestation 拉取；key-based cosign provenance 需配置 `HPA_COSIGN_BIN`/公钥，OSV 未配置时默认 disabled。
 - 不提供云端 Marketplace、多租户隔离、远程发布者账号或计费。

@@ -7,9 +7,9 @@
 - 默认仍是本地单用户模式：业务 API 无认证，匿名请求映射到内置租户 `local`；控制面在此模式下同样不要求令牌。
 - 设置 `HPA_ENTERPRISE_MODE=1|true|required` 后进入企业模式：除 `/api/health` 外，`/api/*` 需要 `Authorization: Bearer`。
 - 控制面数据在 `<data_dir>/control.db`；租户业务数据在各自的 `hpa.db`。
-- 隔离手段是“每租户独立 SQLite 文件 + TenantGate 路由”，没有 PostgreSQL RLS。
+- 默认隔离手段是“每租户独立 SQLite 文件 + TenantGate 路由”。设置 `HPA_POSTGRES_RUNTIME=1` 后 execution/event/artifact 使用 PostgreSQL FORCE RLS；其他 Repository 尚未整体切换。
 - 角色是固定的 8 个粗粒度角色，权限按 HTTP 动作近似映射；没有资源级 ACL、自定义角色或 ABAC 策略引擎。
-- 单节点运行；没有多节点、HA、远程 Worker 派发、浏览器 SSO 授权码流程或计量计费。
+- 单节点运行；没有多节点、HA 或计量计费。浏览器 SSO 由 Phase 9 补齐，出站 Worker 派发由 Phase 8 补齐。
 
 ## 2. 运行模式
 
@@ -92,14 +92,14 @@ HPA_ENTERPRISE_MODE=required
 
 ### 4.2 OIDC Bearer
 
-控制面支持外部 IdP 签发的 **EdDSA (Ed25519) JWT Bearer**，不实现浏览器 SSO：
+本节描述 OIDC **Bearer** 路径；浏览器 Authorization Code + PKCE SSO 见 Phase 9 文档：
 
 - 只接受 `alg=EdDSA`、JWKS 中 `kty=OKP`、`crv=Ed25519` 的密钥；按 `kid` 匹配，无 `kid` 时仅允许单密钥。
 - 必须校验 `exp`（必需）、可选 `nbf`，允许 60 秒时钟偏差；`iss` 必须精确匹配配置，`aud` 可为字符串或数组且必须包含配置值。
 - 必须包含非空 `sub`、`tenant_id`（或 `tenantId`）、`role`（或 `roles` 的第一个元素）；角色必须是固定角色。
 - 可选 `email` 参与成员目录匹配；未匹配成员时 actor 标识为 `oidc:{email|sub}`。
 - OIDC principal 永远不是平台管理员；租户必须存在且为 `active`，否则 401。
-- 没有授权码回调、会话 Cookie、刷新令牌、登出或登录 UI；外部 IdP 必须直接把 JWT 作为 Bearer 交给客户端。
+- Bearer 路径本身没有授权码回调、会话 Cookie 或登录 UI；浏览器登录使用 `/login` 和 [`browser-sso.md`](browser-sso.md) 的 session/CSRF 流程。
 
 ### 4.3 成员目录
 
@@ -223,7 +223,7 @@ Hybrid 执行：
 - 令牌签发后只在该面板显示一次 secret，可复制；列表只显示元数据与状态；支持按租户筛选和吊销。
 - 成员面板支持按租户筛选、添加 OIDC subject/邮箱、切换角色、启用/禁用与删除；未登记 OIDC 主体的回退行为在面板内说明。
 - 租户删除要求输入租户名确认；恢复备份有“完成后可能需要重启”的警告；审计支持 JSON/CSV 下载。
-- OIDC 面板配置 Bearer 校验（issuer/audience/JWKS/网络白名单）与浏览器 SSO（clientId、authorization/token endpoint、redirectUri、scopes、adminSubjects、cookieSecure、sessionTtlSeconds）；Phase 9 已实现浏览器 SSO，详见 [Browser SSO](browser-sso.md)。
+- OIDC 面板配置 Bearer 校验（issuer/audience/JWKS/网络白名单）与浏览器 SSO（clientId、authorization/token/end-session endpoint、redirectUri、postLogoutRedirectUri、scopes、adminSubjects、cookieSecure、sessionTtlSeconds）；refresh 与 RP logout 契约见 [Browser SSO](browser-sso.md)。
 
 ![Enterprise Center 1440](../assets/phase6/enterprise-1440.png)
 
@@ -242,12 +242,12 @@ Hybrid 执行：
 - `/mcp` 及 `/.well-known/oauth-protected-resource*` 不经过 TenantGate，仍绑定启动时的 `local` 租户运行时；本阶段不提供 MCP 的租户路由。
 - `hpa agent/skill/mcp/plugin/connector/run/doctor` 等 CLI 仍直接打开 `<data_dir>/hpa.db`，不会解析租户或企业令牌；只有 `serve` 挂载企业路由，`enterprise init/token` 操作控制库。
 - 每个租户启动两个后台审批监控任务；缓存移除/租户删除没有停止句柄，删除活跃租户后任务可能继续持有已删除数据库的句柄并报错。
-- 成员目录服务 OIDC Bearer 与浏览器 session 的角色/状态覆盖；仍没有组、密码、邀请或成员自服务。未登记的 OIDC 用户仍是按 claims 认证的无状态声明。
+- 成员目录服务 OIDC Bearer 与浏览器 session 的角色/状态覆盖；SCIM 2.0 Users/Groups 维护租户成员、组和固定角色映射。仍没有密码、邀请或成员自服务。未登记的 OIDC 用户仍是按 claims 认证的无状态声明。
 - 没有 RLS；隔离是文件级 + 路由级。控制库中的跨租户元数据由平台管理员统一管理。
 - 审计可读、可导出，但不可证明未被篡改；没有 WORM、保留策略执行器或外部 SIEM 投递。
 - 单节点 SQLite：不支持多进程共享数据目录、HA、只读副本、在线迁移或跨机挂载。
 - 服务只监听 `127.0.0.1` 的明文 HTTP；远程访问需 SSH 隧道或反向代理提供 TLS。
-- 无远程凭证派发/对象存储、无 Agent/Plugin 远程派发、无 durable outbox/mTLS/Redis/多节点、无 refresh token/SCIM/第三方 Cookie、无计费/计量、无租户暂停 API（代码只使用 `active` 与 `deleted`）。
+- 无远程凭证派发/对象存储、无 Agent/Plugin 远程派发、无 durable outbox/mTLS/Redis/多节点、无多 IdP/第三方 Cookie、无计费/计量；SCIM/组角色映射、租户暂停/恢复与 Browser SSO refresh/logout 已在 Phase 13 补齐。
 - 备份与控制库均未由应用加密；依赖磁盘/文件系统加密与目录权限。
 
 ## 12. 测试覆盖
@@ -265,6 +265,8 @@ audit_entries_and_csv_export
 tenant_lifecycle_delete_and_protected_local
 concurrent_run_quota_enforced
 worker_daemon_executes_remote_workflow_and_resumes_approval
+scim_users_groups_filters_etags_and_role_mapping_are_fail_closed
+scim_migrates_existing_sqlite_members_without_losing_direct_roles
 ```
 
 `crates/hpa-local/tests/enterprise_ops.rs`（服务层）包含：
@@ -280,9 +282,10 @@ oidc_verification_with_local_jwks
 ```text
 browser_sso_login_session_csrf_and_failures
 browser_sso_requires_configuration_and_csrf
+browser_sso_refresh_rejection_revokes_the_session
 ```
 
-这些用例覆盖认证边界、健康检查公开性、跨租户隔离、角色拒绝、令牌一次性与吊销、成员 CRUD/租户过滤、配额与并发 429、审计/CSV、租户删除保护、备份恢复/清理、Worker 离线派生，以及本地 JWKS 的 OIDC 校验；Phase 9 另覆盖 SSO 登录回调、Cookie 属性、CSRF、state 重放、disabled 成员与登出。本文不声称测试通过数量；以实际运行结果为准。
+这些用例覆盖认证边界、健康检查公开性、跨租户隔离、角色拒绝、令牌一次性与吊销、成员 CRUD/租户过滤、SCIM Users/Groups/filter/PATCH/ETag/角色冲突、旧库迁移、配额与并发 429、审计/CSV、租户删除保护、备份恢复/清理、Worker 离线派生，以及本地 JWKS 的 OIDC 校验；Phase 9 另覆盖 SSO 登录回调、Cookie 属性、CSRF、state 重放、disabled 成员、refresh 失败撤销与 RP-initiated logout。本文不声称测试通过数量；以实际运行结果为准。
 
 Phase 9 在最终 release 服务上用 mock IdP 分别以 EdDSA、RS256、ES256 完成浏览器登录、session、Enterprise 访问与退出；截图见 `docs/assets/phase9/`。该验证不等同于外部 IdP 兼容性测试。
 
@@ -290,6 +293,7 @@ Phase 9 在最终 release 服务上用 mock IdP 分别以 EdDSA、RS256、ES256 
 
 - [权限模型](permission-model.md)
 - [数据模型](data-model.md)
+- [SCIM 2.0](scim.md)
 - [本地部署与运维](enterprise-operations.md)
 - [Hybrid Worker 协议与实现](hybrid-workers.md)
 - [Hybrid Worker 私有部署](hybrid-worker-deployment.md)

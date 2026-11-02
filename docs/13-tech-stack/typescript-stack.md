@@ -56,7 +56,7 @@
 
 ```mermaid
 flowchart LR
-  IR["schema/ir/v1/*.json"] --> IRT["@hpa/ir-types (TS)"]
+  IR["schema/ir/v0.1/*.json"] --> IRT["typed Web DTOs (current manual)"]
   IR --> RUST["Rust jsonschema/Schemars"]
   PROTO["proto/hisha/**"] --> RUSTG["Rust (tonic-prost)"]
   PROTO --> TSG["TS (ts-proto) / Python (grpcio-tools)"]

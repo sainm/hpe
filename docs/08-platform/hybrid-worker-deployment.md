@@ -173,7 +173,7 @@ sudo systemctl enable --now hpa-worker
 User=hpa
 WorkingDirectory=/var/lib/hpa-worker
 EnvironmentFile=-/etc/hpa/worker.env
-ExecStart=/usr/local/bin/hpa worker --control-url https://control.example.internal --max-concurrency 4 --capabilities workflow
+ExecStart=/usr/local/bin/hpa --data-dir /var/lib/hpa-worker worker --control-url https://control.example.internal --max-concurrency 4 --capabilities workflow
 Restart=on-failure
 ```
 
@@ -272,7 +272,7 @@ leased / running 且租约过期 -> queued（若已请求取消则为 cancelled�
 
 Worker 遇到 `human.approval` 时以 `waiting_approval` complete，控制面清空 lease、释放并发槽，Job 进入 `waiting_approval`。审批 API 保存新的 ExecutionState 后，如果存在对应远程 Job，会把 Job 置为 `queued`、`resumed=true`、清空 `worker_id` 和 lease，不触发本地 `RuntimeManager`。Worker 下一次 lease 从新状态继续，不再发送 `execution.started`。
 
-远程执行的审批 SLA 不会自动超时；监控扫描跳过远程 execution，必须人工在 Approval Center 处理。长期停留在 `waiting_approval` 的 Job 不占 Worker 槽，但会一直留在队列中。
+控制面后台每秒扫描远程 `waiting_approval`；到 SLA 后按节点 `onTimeout` 生成恢复状态、写入租户事件并把 Job 重新置为 `queued`。也可提前在 Approval Center 人工处理。长期停留在审批的 Job 不占 Worker 槽。
 
 ### 4.2 取消
 
@@ -303,9 +303,9 @@ Worker 遇到 `human.approval` 时以 `waiting_approval` complete，控制面清
 | 配置 | 作用 |
 | --- | --- |
 | `User=hpa` / `Group=hpa` | 非 root 专用账户运行 |
-| `WorkingDirectory=/var/lib/hpa-worker` | 只作为工作目录；Worker 不在这里持久化状态 |
+| `WorkingDirectory=/var/lib/hpa-worker` + `StateDirectory=hpa-worker` | 保存 `worker-outbox.db`；目录由 systemd 创建并按 `0700` 管理 |
 | `EnvironmentFile=-/etc/hpa/worker.env` | 从 0600 Secret 文件读取 token 与日志级别 |
-| `ExecStart=/usr/local/bin/hpa worker ...` | 控制面 URL、并发和能力 |
+| `ExecStart=/usr/local/bin/hpa --data-dir /var/lib/hpa-worker worker ...` | 持久 outbox 目录、控制面 URL、并发和能力 |
 | `Restart=on-failure` / `RestartSec=5s` | 崩溃或非零退出后重启；配合 `StartLimitBurst=5` 防止死循环 |
 | `NoNewPrivileges=yes` | 禁止提权 |
 | `PrivateTmp=yes` | 私有 `/tmp`，不暴露宿主机临时目录 |
@@ -318,8 +318,7 @@ Worker 遇到 `human.approval` 时以 `waiting_approval` complete，控制面清
 | `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` | 只保留 DNS、TCP、Unix socket 和 netlink 所需地址族 |
 | `StandardOutput=journal` / `StandardError=journal` | 日志进入 journal，不写本地文件 |
 
-- 该 Worker 没有本地 data dir、outbox 或缓存，因此单元**没有** `ReadWritePaths`，也没有 `StateDirectory`。`WorkingDirectory` 只要求可进入，不要求可写；不要为了让服务“看起来正常”而加 `ProtectSystem=no` 或给整个 `/var/lib` 写权限。
-- 如果未来版本需要在 Worker 本地保存文件，应新增明确目录并使用 `StateDirectory=hpa-worker` 或最小范围的 `ReadWritePaths=`，不要复用控制面数据目录。
+- Worker 通过 `--data-dir /var/lib/hpa-worker` 把持久 outbox 放在 systemd 的 `StateDirectory`；不要复用控制面数据目录，也不要给整个 `/var/lib` 写权限。
 - `RUST_LOG=hpa=info` 适合生产。临时使用 `hpa=debug` 可以观察重试细节，但不要长期开启；日志中不应出现 token，若出现应立即轮换。
 - 当前 Workflow 的 `script` 节点是进程内 jq 表达式，不是 shell；Worker 不提供任意宿主机命令接口。`http.request` 节点会从 Worker 主机发起出站请求，受 Workflow 节点既有 Runtime 网络权限约束，但仍应在主机防火墙上限制其可达网段。
 - 单元没有启用 `RestrictNamespaces` 或 `MemoryDenyWriteExecute` 等会限制执行器/运行时的选项，以免影响后续 Runtime 能力。若自行加严，必须重新验证所有 Workflow 节点类型。
@@ -364,8 +363,8 @@ Worker 遇到 `human.approval` 时以 `waiting_approval` complete，控制面清
 
 ### 6.4 备份与恢复
 
-- `control.db` 包含 Worker 注册、token 哈希、Job 状态、租约和审计；**不包含** Worker daemon 的本地状态，因为本 MVP 没有持久 outbox、本地队列或 Worker 数据目录。
-- Worker 的未上报事件只存在内存中；进程崩溃/重启后丢失，只能从控制面最后保存的 state 重跑。
+- `control.db` 包含 Worker 注册、token 哈希、Job 状态、租约和审计，但不包含 Worker daemon 的本地 outbox。
+- Worker 的已生成 start/events/complete 先落本地 SQLite；进程崩溃重启后继续发送。尚未生成报告的在途执行仍按至少一次语义从租约重排。
 - 备份 `control.db` 时先停止控制面，再执行：
 
 ```bash
@@ -380,7 +379,7 @@ sqlite3 "$HPA_DATA/control.db" ".backup '/safe/control-$(date +%F).db'"
 ### 6.5 控制面与 Worker 重启
 
 - 控制面重启：Worker 继续 heartbeat/lease，网络错误按 1 到 30 秒退避；控制面恢复后自动继续。`remote_executions` 会阻止本地 Runtime 恢复/审批扫描接管远程 execution。服务重启期间过期的租约在下次 lease 时重排。
-- Worker 重启：没有本地 outbox，控制面只保留最后成功上报的状态。若 Job 仍在租约内，控制面要等到租约过期才重排；新进程不会立即接管同一 Job。
+- Worker 重启：新进程先排空本地 outbox；控制面仍只接管成功上报的状态。未完成执行在租约过期后重排。
 - 网络中断：heartbeat 和 lease 循环分别退避重试，进程不会因短暂断线退出。上报最多重试 8 次；租约过期后旧上报 409，Job 重排。恢复网络后不需要手工重启，但如果 token/证书已变更则需要重启加载新配置。
 - 审批等待中的 Job 在 Worker 重启后不需要重新执行到审批点：状态已保存在租户库和控制库，审批后重新入队即可。
 
@@ -425,7 +424,7 @@ sqlite3 "$HPA_DATA/control.db" ".backup '/safe/control-$(date +%F).db'"
 | 进程状态 | `systemctl is-active hpa-worker`、`systemctl show -p NRestarts` | 进程 active 不代表已连上控制面 |
 | 心跳年龄 | `GET /api/enterprise/workers` 的 `lastHeartbeatAt` | 超过 30 秒列表显示 `offline`；检查网络、TLS、token |
 | 队列积压 | `GET /api/enterprise/worker-jobs` 按 status 统计 | 关注 `queued` 数量、最老 Job 年龄、`attempts` 增长 |
-| 审批积压 | `GET /api/approvals` 或 execution 状态 | 远程审批不自动超时，需人工处理 |
+| 审批积压 | `GET /api/approvals` 或 execution 状态 | 先确认 SLA 是否已到；控制面会自动超时恢复，也可人工提前处理 |
 | 租约/重试日志 | `journalctl -u hpa-worker` | 401、409、`backing off`、`lease is no longer valid` |
 | 控制面容量 | `control.db` 大小、磁盘、进程连接数 | 单节点 SQLite，容量需人工规划 |
 
@@ -464,9 +463,9 @@ curl -sS https://control.example.internal/api/health
 | 传输与身份 | 无 mTLS、无反向隧道；TLS 反向代理 + Bearer Worker token；没有浏览器 SSO 登录 Worker |
 | 调度 | 无自动扩缩容、无优先级/抢占、无全局调度器；容量靠人工增加 Worker |
 | 凭证与产物 | 无远程凭证注入/Vault 集成；无对象存储；产物写回租户库；`env` 不作为派发字段 |
-| 审批 | 远程 execution 的审批 SLA 不自动超时，必须人工处理 |
-| 交付语义 | 无 durable outbox；重试只在内存中；至少一次，不承诺 exactly-once |
-| Worker 本地状态 | 无本地 data dir、无持久队列、无租户 SQLite/工作区访问；重启会丢失未上报事件 |
+| 审批 | 控制面自动执行远程审批 SLA，也可人工提前处理 |
+| 交付语义 | 有本地 durable outbox；至少一次，不承诺 exactly-once |
+| Worker 本地状态 | 只有 outbox SQLite，无租户 SQLite/工作区访问 |
 | 排空 | 当前无 `--drain`/SIGTERM 优雅排空；停止进程即中止在途任务，靠租约过期重排 |
 | 平台 | Docker 不在本阶段；macOS launchd 仅可自行适配，不提供模板；无 Windows 服务 |
 
@@ -485,7 +484,7 @@ curl -sS https://control.example.internal/api/health
 | token 生命周期 | 轮换 token，旧进程继续运行；再禁用 Worker | 旧 token 立即 401；新 token 重启后可用；禁用后不再 heartbeat/lease；列表不返回 token |
 | 版本/能力过滤 | 使用不匹配版本或缺少 `workflow` 的 Worker | 不领取 Job；修正版本/能力后可领取；无静默跨版本执行 |
 | 跨租户隔离 | 用租户 A 的 Worker token 查询/上报租户 B | 不可见/404/409；不能跨租户 lease |
-| 重启恢复 | 重启控制面；重启 Worker；断开网络后恢复 | 本地 Runtime 不接管远程 execution；Worker 自动重连；过期租约重排；无持久 outbox 时不假设事件不丢 |
+| 重启恢复 | 重启控制面；重启 Worker；断开网络后恢复 | 本地 Runtime 不接管远程 execution；Worker 先排空 outbox；未完成执行靠过期租约重排；外部副作用仍需业务幂等 |
 
 可运行现有测试作为回归，但测试通过不等于私有环境验收通过：
 

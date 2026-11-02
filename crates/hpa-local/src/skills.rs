@@ -1,5 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use hpa_skill::{
     EntryKind, RunOutcome, RunnerConfig, SandboxKind, SkillError, SkillManifest, SkillReport,
     SkillRunRequest, SkillSnapshot, SkillTest, publish_snapshot_issues, run_script,
@@ -7,6 +11,7 @@ use hpa_skill::{
 };
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -58,6 +63,7 @@ pub struct LoadedSkill {
     pub snapshot: SkillSnapshot,
     pub manifest: SkillManifest,
     pub report: SkillReport,
+    pub signature: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +84,14 @@ pub struct TestResult {
     pub run: Option<RunOutcome>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillSource {
+    pub version: String,
+    pub files: BTreeMap<String, String>,
+    pub binary_files: Vec<String>,
 }
 
 impl SkillService {
@@ -154,11 +168,13 @@ impl SkillService {
         let snapshot = build_skill_snapshot(&row, &files)?;
         let manifest = snapshot.manifest();
         let report: SkillReport = serde_json::from_str(&row.report_json)?;
+        let signature = self.signature_info(skill_id, version).await?;
         Ok(LoadedSkill {
             version: row,
             snapshot,
             manifest,
             report,
+            signature,
         })
     }
 
@@ -186,6 +202,26 @@ impl SkillService {
                 Some(serde_json::to_value(&issues).unwrap_or(Value::Null)),
             ));
         }
+        if let Some(signature) = &loaded.signature
+            && signature.get("verified").and_then(Value::as_bool) == Some(false)
+        {
+            return Err(SkillServiceError::invalid(
+                "SKILL_SIGNATURE_INVALID",
+                "skill signature does not match the stored snapshot",
+                Some(signature.clone()),
+            ));
+        }
+        if loaded.signature.is_none()
+            && std::env::var("HPA_REQUIRE_SKILL_SIGNATURE")
+                .map(|value| matches!(value.as_str(), "1" | "true" | "required"))
+                .unwrap_or(false)
+        {
+            return Err(SkillServiceError::invalid(
+                "SKILL_SIGNATURE_REQUIRED",
+                "skill publishing requires a local signature",
+                None,
+            ));
+        }
         Ok(self
             .db
             .publish_skill_version(skill_id, &loaded.snapshot.version, &now_rfc3339())
@@ -201,6 +237,270 @@ impl SkillService {
         let loaded = self.load(skill_id, version).await?;
         hpa_skill::export_snapshot(&loaded.snapshot, target)?;
         Ok(())
+    }
+
+    pub async fn source(
+        &self,
+        skill_id: &str,
+        version: Option<&str>,
+    ) -> Result<SkillSource, SkillServiceError> {
+        let loaded = self.load(skill_id, version).await?;
+        let mut files = BTreeMap::new();
+        let mut binary_files = Vec::new();
+        for file in loaded.snapshot.files {
+            match String::from_utf8(file.content) {
+                Ok(text) => {
+                    files.insert(file.path, text);
+                }
+                Err(_) => binary_files.push(file.path),
+            }
+        }
+        Ok(SkillSource {
+            version: loaded.snapshot.version,
+            files,
+            binary_files,
+        })
+    }
+
+    pub async fn sign(
+        &self,
+        skill_id: &str,
+        version: Option<&str>,
+    ) -> Result<Value, SkillServiceError> {
+        let loaded = self.load(skill_id, version).await?;
+        let key = self.local_signing_key().await?;
+        let payload = skill_signature_payload(
+            &loaded.snapshot.id,
+            &loaded.snapshot.version,
+            &loaded.snapshot.content_hash,
+        );
+        let signature = key.signing_key.sign(payload.as_bytes());
+        let record = serde_json::json!({
+            "algorithm": "ed25519",
+            "keyId": key.key_id,
+            "publicKey": key.public_key,
+            "value": BASE64.encode(signature.to_bytes()),
+            "contentHash": loaded.snapshot.content_hash,
+            "signedAt": now_rfc3339(),
+            "trust": "local",
+        });
+        let path = self.signature_path(&loaded.snapshot.id, &loaded.snapshot.version);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_vec_pretty(&record)?)?;
+        let mut value = record;
+        value["verified"] = Value::Bool(true);
+        Ok(value)
+    }
+
+    async fn signature_info(
+        &self,
+        skill_id: &str,
+        version: &str,
+    ) -> Result<Option<Value>, SkillServiceError> {
+        let path = self.signature_path(skill_id, version);
+        let Ok(bytes) = std::fs::read(path) else {
+            return Ok(None);
+        };
+        let mut record: Value = match serde_json::from_slice(&bytes) {
+            Ok(record) => record,
+            Err(error) => {
+                return Ok(Some(serde_json::json!({
+                    "verified": false,
+                    "error": format!("invalid signature record: {error}"),
+                })));
+            }
+        };
+        let (_, content_hash) = self.signature_target(skill_id, version).await?;
+        let verified = verify_skill_signature(&record, skill_id, version, &content_hash);
+        record["verified"] = Value::Bool(verified);
+        Ok(Some(record))
+    }
+
+    async fn signature_target(
+        &self,
+        skill_id: &str,
+        version: &str,
+    ) -> Result<(String, String), SkillServiceError> {
+        let row = self
+            .db
+            .get_skill_version(skill_id, version)
+            .await?
+            .ok_or_else(|| {
+                SkillServiceError::NotFound(format!("{skill_id}@{version} is not imported"))
+            })?;
+        Ok((row.skill_id, row.content_hash))
+    }
+
+    fn signature_path(&self, skill_id: &str, version: &str) -> PathBuf {
+        self.data_dir
+            .join("skills")
+            .join("signatures")
+            .join(skill_id)
+            .join(format!("{version}.json"))
+    }
+
+    async fn local_signing_key(&self) -> Result<LocalSigningKey, SkillServiceError> {
+        let keys_dir = self.data_dir.join("keys");
+        std::fs::create_dir_all(&keys_dir)?;
+        let secret_path = keys_dir.join("plugin-ed25519.key");
+        let signing_key = if secret_path.exists() {
+            let encoded = std::fs::read_to_string(&secret_path)?;
+            let bytes = BASE64.decode(encoded.trim()).map_err(|error| {
+                SkillServiceError::invalid(
+                    "SKILL_SIGNING_KEY",
+                    format!("invalid local signing key: {error}"),
+                    None,
+                )
+            })?;
+            let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+                SkillServiceError::invalid(
+                    "SKILL_SIGNING_KEY",
+                    "local signing key must be 32 bytes",
+                    None,
+                )
+            })?;
+            SigningKey::from_bytes(&bytes)
+        } else {
+            let mut bytes = [0u8; 32];
+            getrandom::getrandom(&mut bytes).map_err(|error| {
+                SkillServiceError::invalid(
+                    "SKILL_SIGNING_KEY",
+                    format!("cannot generate local signing key: {error}"),
+                    None,
+                )
+            })?;
+            std::fs::write(&secret_path, BASE64.encode(bytes))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+            }
+            SigningKey::from_bytes(&bytes)
+        };
+        let public_bytes = signing_key.verifying_key().to_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(public_bytes);
+        let key_id = format!("ed25519-{}", &format!("{:x}", hasher.finalize())[..16]);
+        Ok(LocalSigningKey {
+            key_id,
+            public_key: BASE64.encode(public_bytes),
+            signing_key,
+        })
+    }
+
+    pub async fn save_draft(
+        &self,
+        skill_id: &str,
+        base_version: &str,
+        new_version: &str,
+        edits: BTreeMap<String, String>,
+    ) -> Result<ImportOutcome, SkillServiceError> {
+        let loaded = self.load(skill_id, Some(base_version)).await?;
+        if !hpa_skill::manifest::valid_semver(new_version) {
+            return Err(SkillServiceError::invalid(
+                "SKILL_VERSION",
+                format!("new version `{new_version}` is not valid semver"),
+                None,
+            ));
+        }
+        if new_version == base_version {
+            return Err(SkillServiceError::invalid(
+                "SKILL_VERSION_FROZEN",
+                "edit drafts must use a new version; stored versions are immutable",
+                None,
+            ));
+        }
+        if self
+            .db
+            .get_skill_version(skill_id, new_version)
+            .await?
+            .is_some()
+        {
+            return Err(SkillServiceError::invalid(
+                "SKILL_VERSION_EXISTS",
+                format!("skill version `{skill_id}@{new_version}` already exists"),
+                None,
+            ));
+        }
+        let draft_root = self
+            .data_dir
+            .join("skills")
+            .join("drafts")
+            .join(skill_id)
+            .join(format!("{new_version}-{}", uuid::Uuid::now_v7()));
+        if draft_root.exists() {
+            return Err(SkillServiceError::invalid(
+                "SKILL_DRAFT_EXISTS",
+                format!("draft directory `{}` already exists", draft_root.display()),
+                None,
+            ));
+        }
+        std::fs::create_dir_all(&draft_root)?;
+        let mut files = loaded
+            .snapshot
+            .files
+            .into_iter()
+            .map(|file| (file.path, file.content))
+            .collect::<BTreeMap<_, _>>();
+        let mut total_bytes = files.values().map(Vec::len).sum::<usize>();
+        for (path, content) in edits {
+            validate_draft_path(&path)?;
+            total_bytes = total_bytes
+                .saturating_sub(files.get(&path).map(Vec::len).unwrap_or(0))
+                .saturating_add(content.len());
+            if content.len() > hpa_skill::loader::MAX_FILE_BYTES as usize {
+                return Err(SkillServiceError::invalid(
+                    "SKILL_FILE_TOO_LARGE",
+                    format!("draft file `{path}` exceeds the per-file limit"),
+                    None,
+                ));
+            }
+            files.insert(path, content.into_bytes());
+        }
+        if total_bytes > hpa_skill::loader::MAX_TOTAL_BYTES as usize {
+            return Err(SkillServiceError::invalid(
+                "SKILL_TOO_LARGE",
+                "draft exceeds the Skill package size limit",
+                None,
+            ));
+        }
+        let mut manifest = loaded.snapshot.manifest;
+        if let Some(edited) = files
+            .get("hpa.skill.json")
+            .and_then(|content| serde_json::from_slice::<Value>(content).ok())
+        {
+            manifest = edited;
+        }
+        let Some(manifest_object) = manifest.as_object_mut() else {
+            return Err(SkillServiceError::invalid(
+                "SKILL_MANIFEST",
+                "skill manifest must be a JSON object",
+                None,
+            ));
+        };
+        manifest_object.insert(
+            "version".to_string(),
+            Value::String(new_version.to_string()),
+        );
+        manifest_object
+            .entry("schemaVersion".to_string())
+            .or_insert_with(|| Value::String("hpa.skill/v1".to_string()));
+        files.insert(
+            "hpa.skill.json".to_string(),
+            serde_json::to_vec_pretty(&manifest)?,
+        );
+        for (relative, content) in files {
+            validate_draft_path(&relative)?;
+            let target = draft_root.join(&relative);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(target, content)?;
+        }
+        self.import(&draft_root).await
     }
 
     pub async fn run(
@@ -410,6 +710,77 @@ impl SkillService {
     }
 }
 
+fn validate_draft_path(path: &str) -> Result<(), SkillServiceError> {
+    let candidate = Path::new(path);
+    if path.is_empty()
+        || path.contains('\\')
+        || path.contains('\0')
+        || candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(SkillServiceError::invalid(
+            "SKILL_PATH_ESCAPE",
+            format!("draft path `{path}` must be a normalized relative path"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+struct LocalSigningKey {
+    key_id: String,
+    public_key: String,
+    signing_key: SigningKey,
+}
+
+fn skill_signature_payload(skill_id: &str, version: &str, content_hash: &str) -> String {
+    format!("hpa.skill/v1\n{skill_id}@{version}\n{content_hash}")
+}
+
+fn verify_skill_signature(
+    record: &Value,
+    skill_id: &str,
+    version: &str,
+    content_hash: &str,
+) -> bool {
+    if record.get("algorithm").and_then(Value::as_str) != Some("ed25519")
+        || record.get("contentHash").and_then(Value::as_str) != Some(content_hash)
+    {
+        return false;
+    }
+    let Some(public_key) = record.get("publicKey").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(signature) = record.get("value").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(public_key) = BASE64.decode(public_key) else {
+        return false;
+    };
+    let Ok(public_key) = <[u8; 32]>::try_from(public_key) else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&public_key) else {
+        return false;
+    };
+    let Ok(signature) = BASE64.decode(signature) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(&signature) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(public_key);
+    let expected_key_id = format!("ed25519-{}", &format!("{:x}", hasher.finalize())[..16]);
+    if record.get("keyId").and_then(Value::as_str) != Some(expected_key_id.as_str()) {
+        return false;
+    }
+    let payload = skill_signature_payload(skill_id, version, content_hash);
+    verifying_key.verify(payload.as_bytes(), &signature).is_ok()
+}
+
 pub fn default_script(snapshot: &SkillSnapshot, manifest: &SkillManifest) -> Option<String> {
     snapshot
         .manifest
@@ -492,6 +863,97 @@ mod tests {
             ),
             "{error:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn source_editor_creates_a_new_immutable_version() {
+        let root = temp_dir("editor");
+        let db = Db::open(&root.join("hpa.db")).await.expect("db");
+        let service = SkillService::new(db, root.clone());
+        service
+            .import(&fixture("invoice-audit"))
+            .await
+            .expect("import");
+        let source = service
+            .source("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect("source");
+        assert!(source.files.contains_key("SKILL.md"));
+        let mut edits = BTreeMap::new();
+        let mut skill_md = source.files.get("SKILL.md").expect("SKILL.md").clone();
+        skill_md.push_str("\nEdited through the API.\n");
+        edits.insert("SKILL.md".to_string(), skill_md);
+        let outcome = service
+            .save_draft("skill_invoice_audit", "1.0.0", "1.1.0", edits)
+            .await
+            .expect("save draft");
+        assert_eq!(outcome.version.version, "1.1.0");
+        let loaded = service
+            .load("skill_invoice_audit", Some("1.1.0"))
+            .await
+            .expect("load edited version");
+        assert!(loaded.snapshot.skill_md.contains("Edited through the API."));
+        assert!(
+            service
+                .save_draft("skill_invoice_audit", "1.0.0", "1.0.0", BTreeMap::new())
+                .await
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn local_signature_verifies_and_tampering_blocks_publish() {
+        let root = temp_dir("signature");
+        let db = Db::open(&root.join("hpa.db")).await.expect("db");
+        let service = SkillService::new(db, root.clone());
+        service
+            .import(&fixture("invoice-audit"))
+            .await
+            .expect("import");
+        let signature = service
+            .sign("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect("sign");
+        assert_eq!(signature["verified"], true);
+        let loaded = service
+            .load("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect("load");
+        assert_eq!(
+            loaded
+                .signature
+                .as_ref()
+                .and_then(|value| value["verified"].as_bool()),
+            Some(true)
+        );
+        service
+            .publish("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect("publish signed");
+
+        let path = service.signature_path("skill_invoice_audit", "1.0.0");
+        let mut record: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("signature")).expect("json");
+        record["value"] = json!(BASE64.encode([0u8; 64]));
+        std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).expect("tamper");
+        let loaded = service
+            .load("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect("load tampered");
+        assert_eq!(
+            loaded
+                .signature
+                .as_ref()
+                .and_then(|value| value["verified"].as_bool()),
+            Some(false)
+        );
+        let publish = service
+            .publish("skill_invoice_audit", Some("1.0.0"))
+            .await
+            .expect_err("tampered signature must fail");
+        assert!(publish.to_string().contains("signature"));
         let _ = std::fs::remove_dir_all(&root);
     }
 

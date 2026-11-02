@@ -5,14 +5,20 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::FromRow;
+use sqlx::postgres::{PgArguments, PgConnectOptions, PgConnection};
+use sqlx::query::Query;
+use sqlx::types::Json;
+use sqlx::{AssertSqlSafe, Column, Connection, FromRow, Postgres, Row};
 use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use time::macros::format_description;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -68,6 +74,10 @@ pub struct ConnectorManifest {
 pub enum ConnectorKind {
     Http,
     File,
+    Database,
+    Git,
+    Mq,
+    S3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,6 +248,109 @@ struct FileConnectionConfig {
     max_file_bytes: Option<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DatabaseConnectionConfig {
+    allowed_hosts: Vec<String>,
+    #[serde(default = "default_database_timeout_ms")]
+    statement_timeout_ms: u64,
+    #[serde(default = "default_database_max_rows")]
+    max_rows: usize,
+    #[serde(default = "default_connector_max_bytes")]
+    max_response_bytes: usize,
+    #[serde(default)]
+    rate_limit_per_minute: Option<u32>,
+}
+
+fn default_database_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_database_max_rows() -> usize {
+    500
+}
+
+fn default_connector_max_bytes() -> usize {
+    MAX_RESPONSE_BYTES
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitConnectionConfig {
+    repository_root: String,
+    #[serde(default)]
+    allow_write: bool,
+    #[serde(default = "default_git_max_output_bytes")]
+    max_output_bytes: usize,
+    #[serde(default)]
+    rate_limit_per_minute: Option<u32>,
+}
+
+fn default_git_max_output_bytes() -> usize {
+    MAX_RESPONSE_BYTES
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MqConnectionConfig {
+    url: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    allowed_channels: Vec<String>,
+    #[serde(default)]
+    database: u32,
+    #[serde(default = "default_mq_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_mq_max_message_bytes")]
+    max_message_bytes: usize,
+    #[serde(default)]
+    rate_limit_per_minute: Option<u32>,
+}
+
+fn default_mq_timeout_ms() -> u64 {
+    5_000
+}
+
+fn default_mq_max_message_bytes() -> usize {
+    1024 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct S3ConnectionConfig {
+    endpoint: String,
+    region: String,
+    bucket: String,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default = "default_s3_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_s3_max_object_bytes")]
+    max_object_bytes: usize,
+    #[serde(default)]
+    rate_limit_per_minute: Option<u32>,
+}
+
+fn default_s3_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_s3_max_object_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct S3Credentials {
+    access_key: String,
+    secret_key: String,
+    #[serde(default)]
+    session_token: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ConnectorRuntime {
     pub db: Db,
@@ -262,7 +375,11 @@ impl ConnectorRuntime {
     pub async fn initialize(&self) -> Result<(), ConnectorError> {
         let http = builtin_http_manifest()?;
         let file = builtin_file_manifest()?;
-        for manifest in [http, file] {
+        let database = builtin_database_manifest()?;
+        let git = builtin_git_manifest()?;
+        let mq = builtin_mq_manifest()?;
+        let s3 = builtin_s3_manifest()?;
+        for manifest in [http, file, database, git, mq, s3] {
             self.upsert_definition(&manifest, None, None, "enabled")
                 .await?;
         }
@@ -506,6 +623,10 @@ impl ConnectorRuntime {
         let result = match manifest.kind {
             ConnectorKind::Http => self.test_http(&connection).await,
             ConnectorKind::File => self.test_file(&connection).await,
+            ConnectorKind::Database => self.test_database(&connection).await,
+            ConnectorKind::Git => self.test_git(&connection).await,
+            ConnectorKind::Mq => self.test_mq(&connection).await,
+            ConnectorKind::S3 => self.test_s3(&connection).await,
         };
         let latency = started.elapsed().as_millis() as i64;
         let (status, detail) = match &result {
@@ -567,6 +688,23 @@ impl ConnectorRuntime {
                 config.rate_limit_per_minute
             }
             ConnectorKind::File => None,
+            ConnectorKind::Database => {
+                let config: DatabaseConnectionConfig =
+                    serde_json::from_str(&connection.config_json)?;
+                config.rate_limit_per_minute
+            }
+            ConnectorKind::Git => {
+                let config: GitConnectionConfig = serde_json::from_str(&connection.config_json)?;
+                config.rate_limit_per_minute
+            }
+            ConnectorKind::Mq => {
+                let config: MqConnectionConfig = serde_json::from_str(&connection.config_json)?;
+                config.rate_limit_per_minute
+            }
+            ConnectorKind::S3 => {
+                let config: S3ConnectionConfig = serde_json::from_str(&connection.config_json)?;
+                config.rate_limit_per_minute
+            }
         };
         self.check_rate_limit(
             connection_id,
@@ -581,6 +719,13 @@ impl ConnectorRuntime {
                     .await
             }
             ConnectorKind::File => self.invoke_file(&connection, operation, &arguments).await,
+            ConnectorKind::Database => {
+                self.invoke_database(&connection, operation, &arguments)
+                    .await
+            }
+            ConnectorKind::Git => self.invoke_git(&connection, operation, &arguments).await,
+            ConnectorKind::Mq => self.invoke_mq(&connection, operation, &arguments).await,
+            ConnectorKind::S3 => self.invoke_s3(&connection, operation, &arguments).await,
         };
         let latency = started.elapsed().as_millis() as i64;
         let (status, detail) = match &result {
@@ -706,6 +851,51 @@ impl ConnectorRuntime {
             "kind": "file",
             "root": root,
             "writable": writable,
+        }))
+    }
+
+    async fn test_database(&self, connection: &ConnectionRow) -> Result<Value, ConnectorError> {
+        let config: DatabaseConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let mut database = connect_database(connection, &config).await?;
+        let value: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&mut database)
+            .await?;
+        Ok(json!({
+            "ok": value == 1,
+            "kind": "database",
+            "database": "postgresql"
+        }))
+    }
+
+    async fn test_git(&self, connection: &ConnectionRow) -> Result<Value, ConnectorError> {
+        let config: GitConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let root = canonical_git_root(&config)?;
+        let output = git_command(
+            &[
+                "-C".to_string(),
+                root.to_string_lossy().to_string(),
+                "rev-parse".to_string(),
+                "--show-toplevel".to_string(),
+            ],
+            config.max_output_bytes.min(MAX_RESPONSE_BYTES),
+            Duration::from_secs(5),
+        )
+        .await?;
+        Ok(json!({
+            "ok": output["exitCode"] == 0,
+            "kind": "git",
+            "root": output["stdout"].as_str().unwrap_or_default().trim()
+        }))
+    }
+
+    async fn test_mq(&self, connection: &ConnectionRow) -> Result<Value, ConnectorError> {
+        let config: MqConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let mut redis = connect_mq(connection, &config).await?;
+        let response = redis_command(&mut redis, &["PING"]).await?;
+        Ok(json!({
+            "ok": response == RedisReply::Simple("PONG".to_string()),
+            "kind": "mq",
+            "protocol": "redis"
         }))
     }
 
@@ -1078,6 +1268,611 @@ impl ConnectorRuntime {
         }
     }
 
+    async fn invoke_database(
+        &self,
+        connection: &ConnectionRow,
+        operation: &ConnectorOperation,
+        arguments: &Value,
+    ) -> Result<Value, ConnectorError> {
+        let config: DatabaseConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let sql = arguments
+            .get("sql")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ConnectorError::Invalid("database operation requires sql".to_string())
+            })?;
+        if sql.len() > 256 * 1024 {
+            return Err(ConnectorError::Invalid(
+                "database SQL exceeds 256 KiB".to_string(),
+            ));
+        }
+        let parameters = arguments
+            .get("parameters")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if parameters.len() > 100 {
+            return Err(ConnectorError::Invalid(
+                "database parameters exceed 100 values".to_string(),
+            ));
+        }
+        let timeout_ms = arguments
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(config.statement_timeout_ms)
+            .clamp(100, 60_000);
+        let mut database = connect_database(connection, &config).await?;
+        let mut transaction = database.begin().await?;
+        sqlx::query("SELECT set_config('statement_timeout', $1, true)")
+            .bind(format!("{timeout_ms}ms"))
+            .execute(&mut *transaction)
+            .await?;
+
+        match operation.name.as_str() {
+            "query" => {
+                if !database_read_statement(sql) {
+                    return Err(ConnectorError::Forbidden(
+                        "database query must start with SELECT, WITH, SHOW, VALUES or EXPLAIN"
+                            .to_string(),
+                    ));
+                }
+                sqlx::query("SET TRANSACTION READ ONLY")
+                    .execute(&mut *transaction)
+                    .await?;
+                let mut query = sqlx::query::<Postgres>(AssertSqlSafe(sql.to_string()));
+                for parameter in &parameters {
+                    query = bind_postgres_value(query, parameter);
+                }
+                let mut rows = query.fetch(&mut *transaction);
+                let mut values = Vec::new();
+                let mut truncated = false;
+                while let Some(row) = rows.try_next().await? {
+                    if values.len() >= config.max_rows {
+                        truncated = true;
+                        break;
+                    }
+                    values.push(postgres_row_json(&row));
+                }
+                let bytes = serde_json::to_vec(&values)?.len();
+                if bytes > config.max_response_bytes.min(MAX_RESPONSE_BYTES) {
+                    return Err(ConnectorError::Invalid(format!(
+                        "database response exceeds {} bytes",
+                        config.max_response_bytes.min(MAX_RESPONSE_BYTES)
+                    )));
+                }
+                drop(rows);
+                transaction.commit().await?;
+                Ok(json!({
+                    "ok": true,
+                    "kind": "database",
+                    "database": "postgresql",
+                    "rows": values,
+                    "rowCount": values.len(),
+                    "truncated": truncated
+                }))
+            }
+            "execute" => {
+                if database_read_statement(sql) {
+                    return Err(ConnectorError::Invalid(
+                        "read statements must use the query operation".to_string(),
+                    ));
+                }
+                let mut query = sqlx::query::<Postgres>(AssertSqlSafe(sql.to_string()));
+                for parameter in &parameters {
+                    query = bind_postgres_value(query, parameter);
+                }
+                let result = query.execute(&mut *transaction).await?;
+                transaction.commit().await?;
+                Ok(json!({
+                    "ok": true,
+                    "kind": "database",
+                    "database": "postgresql",
+                    "rowsAffected": result.rows_affected()
+                }))
+            }
+            other => Err(ConnectorError::Invalid(format!(
+                "database operation `{other}` is not supported"
+            ))),
+        }
+    }
+
+    async fn invoke_git(
+        &self,
+        connection: &ConnectionRow,
+        operation: &ConnectorOperation,
+        arguments: &Value,
+    ) -> Result<Value, ConnectorError> {
+        let config: GitConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let root = canonical_git_root(&config)?;
+        let output_limit = config.max_output_bytes.min(MAX_RESPONSE_BYTES);
+        let timeout = Duration::from_millis(
+            arguments
+                .get("timeoutMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(10_000)
+                .clamp(100, 30_000),
+        );
+        let mut args = match operation.name.as_str() {
+            "status" => vec![
+                "status".to_string(),
+                "--porcelain=v1".to_string(),
+                "--branch".to_string(),
+            ],
+            "log" => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 200);
+                let mut args = vec![
+                    "log".to_string(),
+                    "-n".to_string(),
+                    limit.to_string(),
+                    "--format=%H%x09%an%x09%aI%x09%s".to_string(),
+                ];
+                if let Some(revision) = arguments.get("revision").and_then(Value::as_str) {
+                    validate_git_revision(revision)?;
+                    args.push(revision.to_string());
+                }
+                args.push("--".to_string());
+                args
+            }
+            "show" => {
+                let revision = arguments
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ConnectorError::Invalid("git show requires revision".to_string())
+                    })?;
+                validate_git_revision(revision)?;
+                let mut args = vec![
+                    "show".to_string(),
+                    "--no-ext-diff".to_string(),
+                    "--format=fuller".to_string(),
+                    revision.to_string(),
+                    "--".to_string(),
+                ];
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    args.push(git_relative_path(path)?);
+                }
+                args
+            }
+            "diff" => {
+                let mut args = vec!["diff".to_string(), "--no-ext-diff".to_string()];
+                if arguments.get("stat").and_then(Value::as_bool) == Some(true) {
+                    args.push("--stat".to_string());
+                }
+                for field in ["from", "to"] {
+                    if let Some(revision) = arguments.get(field).and_then(Value::as_str) {
+                        validate_git_revision(revision)?;
+                        args.push(revision.to_string());
+                    }
+                }
+                args.push("--".to_string());
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    args.push(git_relative_path(path)?);
+                }
+                args
+            }
+            "ls-files" => {
+                let mut args = vec![
+                    "ls-files".to_string(),
+                    "--cached".to_string(),
+                    "--".to_string(),
+                ];
+                if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+                    args.push(git_relative_path(path)?);
+                }
+                args
+            }
+            "commit" => {
+                if !config.allow_write {
+                    return Err(ConnectorError::Forbidden(
+                        "git connector write is disabled".to_string(),
+                    ));
+                }
+                let message = arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ConnectorError::Invalid("git commit requires message".to_string())
+                    })?;
+                if message.trim().is_empty() || message.len() > 4096 || message.contains('\0') {
+                    return Err(ConnectorError::Invalid(
+                        "git commit message must be 1-4096 bytes without NUL".to_string(),
+                    ));
+                }
+                vec!["commit".to_string(), "-m".to_string(), message.to_string()]
+            }
+            other => {
+                return Err(ConnectorError::Invalid(format!(
+                    "git operation `{other}` is not supported"
+                )));
+            }
+        };
+        args.insert(0, "-C".to_string());
+        args.insert(1, root.to_string_lossy().to_string());
+        git_command(&args, output_limit, timeout).await
+    }
+
+    async fn invoke_mq(
+        &self,
+        connection: &ConnectionRow,
+        operation: &ConnectorOperation,
+        arguments: &Value,
+    ) -> Result<Value, ConnectorError> {
+        let config: MqConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        let mut redis = connect_mq(connection, &config).await?;
+        match operation.name.as_str() {
+            "ping" => {
+                let response = redis_command(&mut redis, &["PING"]).await?;
+                Ok(json!({
+                    "ok": response == RedisReply::Simple("PONG".to_string()),
+                    "kind": "mq"
+                }))
+            }
+            "publish" => {
+                let channel = arguments
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ConnectorError::Invalid("MQ publish requires channel".to_string())
+                    })?;
+                if !mq_channel_allowed(channel, &config.allowed_channels) {
+                    return Err(ConnectorError::Forbidden(format!(
+                        "channel `{channel}` is not allowed"
+                    )));
+                }
+                let message = arguments
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ConnectorError::Invalid("MQ publish requires message".to_string())
+                    })?;
+                if message.len() > config.max_message_bytes {
+                    return Err(ConnectorError::Invalid(format!(
+                        "MQ message exceeds {} bytes",
+                        config.max_message_bytes
+                    )));
+                }
+                let idempotency_key = arguments
+                    .get("idempotencyKey")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ConnectorError::Invalid("MQ publish requires idempotencyKey".to_string())
+                    })?;
+                if idempotency_key.len() > 256 || idempotency_key.trim().is_empty() {
+                    return Err(ConnectorError::Invalid(
+                        "MQ idempotencyKey must be 1-256 bytes".to_string(),
+                    ));
+                }
+                let digest = format!(
+                    "{:x}",
+                    Sha256::digest(format!("{}:{idempotency_key}", connection.id).as_bytes())
+                );
+                let key = format!("hpa:mq:idem:{digest}");
+                let script = "local inserted=redis.call('SET',KEYS[1],'1','NX','EX',ARGV[2]); \
+                              if not inserted then return -1 end; \
+                              return redis.call('PUBLISH',KEYS[2],ARGV[1])";
+                let response = redis_command(
+                    &mut redis,
+                    &["EVAL", script, "2", &key, channel, message, "86400"],
+                )
+                .await?;
+                let RedisReply::Integer(published) = response else {
+                    return Err(ConnectorError::Upstream(
+                        "unexpected Redis EVAL response".to_string(),
+                    ));
+                };
+                Ok(json!({
+                    "ok": true,
+                    "kind": "mq",
+                    "channel": channel,
+                    "published": published.max(0),
+                    "duplicate": published < 0,
+                    "idempotencyKey": idempotency_key
+                }))
+            }
+            other => Err(ConnectorError::Invalid(format!(
+                "MQ operation `{other}` is not supported"
+            ))),
+        }
+    }
+
+    async fn test_s3(&self, connection: &ConnectionRow) -> Result<Value, ConnectorError> {
+        let config: S3ConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        validate_s3_endpoint(&config).await?;
+        let response = self
+            .s3_request(
+                connection,
+                &config,
+                reqwest::Method::GET,
+                "",
+                vec![("list-type", "2"), ("max-keys", "1")],
+                Vec::new(),
+                None,
+            )
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(ConnectorError::Upstream(format!(
+                "S3 bucket probe returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        Ok(json!({
+            "ok": true,
+            "kind": "s3",
+            "bucket": config.bucket,
+            "region": config.region
+        }))
+    }
+
+    async fn invoke_s3(
+        &self,
+        connection: &ConnectionRow,
+        operation: &ConnectorOperation,
+        arguments: &Value,
+    ) -> Result<Value, ConnectorError> {
+        let config: S3ConnectionConfig = serde_json::from_str(&connection.config_json)?;
+        validate_s3_endpoint(&config).await?;
+        match operation.name.as_str() {
+            "put" => {
+                let key = s3_key(
+                    arguments
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ConnectorError::Invalid("S3 put requires key".to_string())
+                        })?,
+                )?;
+                let body = arguments
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| ConnectorError::Invalid("S3 put requires body".to_string()))?;
+                let bytes = BASE64.decode(body).map_err(|error| {
+                    ConnectorError::Invalid(format!("invalid base64 body: {error}"))
+                })?;
+                if bytes.len() > config.max_object_bytes {
+                    return Err(ConnectorError::Invalid(format!(
+                        "S3 object exceeds {} bytes",
+                        config.max_object_bytes
+                    )));
+                }
+                let content_type = arguments
+                    .get("contentType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("application/octet-stream");
+                let response = self
+                    .s3_request(
+                        connection,
+                        &config,
+                        reqwest::Method::PUT,
+                        &key,
+                        Vec::new(),
+                        bytes.clone(),
+                        Some(content_type),
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(s3_response_error("put", response).await);
+                }
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                Ok(json!({
+                    "ok": true,
+                    "kind": "s3",
+                    "key": key,
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                    "etag": etag
+                }))
+            }
+            "get" => {
+                let key = s3_key(
+                    arguments
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ConnectorError::Invalid("S3 get requires key".to_string())
+                        })?,
+                )?;
+                let response = self
+                    .s3_request(
+                        connection,
+                        &config,
+                        reqwest::Method::GET,
+                        &key,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(s3_response_error("get", response).await);
+                }
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                let mut bytes = Vec::new();
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.try_next().await.map_err(|error| {
+                    ConnectorError::Upstream(format!("S3 response failed: {error}"))
+                })? {
+                    if bytes.len() + chunk.len() > config.max_object_bytes.min(MAX_RESPONSE_BYTES) {
+                        return Err(ConnectorError::Invalid(format!(
+                            "S3 object exceeds {} bytes",
+                            config.max_object_bytes.min(MAX_RESPONSE_BYTES)
+                        )));
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(json!({
+                    "ok": true,
+                    "kind": "s3",
+                    "key": key,
+                    "bytes": bytes.len(),
+                    "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                    "contentType": content_type,
+                    "body": BASE64.encode(&bytes)
+                }))
+            }
+            "head" => {
+                let key = s3_key(
+                    arguments
+                        .get("key")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ConnectorError::Invalid("S3 head requires key".to_string())
+                        })?,
+                )?;
+                let response = self
+                    .s3_request(
+                        connection,
+                        &config,
+                        reqwest::Method::HEAD,
+                        &key,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(s3_response_error("head", response).await);
+                }
+                let content_length = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or_else(|| response.content_length());
+                Ok(json!({
+                    "ok": true,
+                    "kind": "s3",
+                    "key": key,
+                    "contentLength": content_length,
+                    "contentType": response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    "etag": response
+                        .headers()
+                        .get(reqwest::header::ETAG)
+                        .and_then(|value| value.to_str().ok())
+                }))
+            }
+            "list" => {
+                let prefix = arguments
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                s3_prefix(prefix)?;
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100)
+                    .clamp(1, 1000);
+                let response = self
+                    .s3_request(
+                        connection,
+                        &config,
+                        reqwest::Method::GET,
+                        "",
+                        vec![
+                            ("list-type", "2"),
+                            ("max-keys", &limit.to_string()),
+                            ("prefix", prefix),
+                        ],
+                        Vec::new(),
+                        None,
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(s3_response_error("list", response).await);
+                }
+                let body = response.text().await.map_err(|error| {
+                    ConnectorError::Upstream(format!("cannot read S3 list response: {error}"))
+                })?;
+                if body.len() > MAX_RESPONSE_BYTES {
+                    return Err(ConnectorError::Invalid(
+                        "S3 list response exceeded 2 MiB".to_string(),
+                    ));
+                }
+                let keys = xml_values(&body, "Key");
+                Ok(json!({
+                    "ok": true,
+                    "kind": "s3",
+                    "prefix": prefix,
+                    "keys": keys,
+                    "count": keys.len(),
+                    "truncated": xml_values(&body, "IsTruncated")
+                        .first()
+                        .is_some_and(|value| value == "true")
+                }))
+            }
+            "delete" => {
+                let key = s3_key(arguments.get("key").and_then(Value::as_str).ok_or_else(
+                    || ConnectorError::Invalid("S3 delete requires key".to_string()),
+                )?)?;
+                let response = self
+                    .s3_request(
+                        connection,
+                        &config,
+                        reqwest::Method::DELETE,
+                        &key,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    )
+                    .await?;
+                if !response.status().is_success() {
+                    return Err(s3_response_error("delete", response).await);
+                }
+                Ok(json!({"ok": true, "kind": "s3", "key": key, "deleted": true}))
+            }
+            other => Err(ConnectorError::Invalid(format!(
+                "S3 operation `{other}` is not supported"
+            ))),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn s3_request(
+        &self,
+        connection: &ConnectionRow,
+        config: &S3ConnectionConfig,
+        method: reqwest::Method,
+        key: &str,
+        mut query: Vec<(&str, &str)>,
+        body: Vec<u8>,
+        content_type: Option<&str>,
+    ) -> Result<reqwest::Response, ConnectorError> {
+        query.sort_unstable();
+        let mut url = s3_url(config, key)?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        let headers = sign_s3_request(connection, config, &method, &url, &body, content_type)?;
+        let mut request = self
+            .http
+            .request(method, url)
+            .timeout(Duration::from_millis(config.timeout_ms));
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| ConnectorError::Upstream(classify_reqwest(&error)))
+    }
+
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
@@ -1255,6 +2050,37 @@ pub fn validate_manifest(manifest: &ConnectorManifest) -> Result<(), ConnectorEr
                     ));
                 }
             }
+            ConnectorKind::S3 => {
+                if !matches!(
+                    operation.name.as_str(),
+                    "put" | "get" | "head" | "list" | "delete"
+                ) {
+                    issues.push(format!(
+                        "S3 connector operation `{}` is not supported",
+                        operation.name
+                    ));
+                }
+                if operation.http.is_some() {
+                    issues.push(format!(
+                        "S3 connector operation `{}` cannot declare http",
+                        operation.name
+                    ));
+                }
+            }
+            ConnectorKind::Mq => {
+                if !matches!(operation.name.as_str(), "ping" | "publish") {
+                    issues.push(format!(
+                        "MQ connector operation `{}` must be ping/publish",
+                        operation.name
+                    ));
+                }
+                if operation.http.is_some() {
+                    issues.push(format!(
+                        "MQ connector operation `{}` cannot declare http",
+                        operation.name
+                    ));
+                }
+            }
             ConnectorKind::File => {
                 if !matches!(operation.name.as_str(), "read" | "list" | "write") {
                     issues.push(format!(
@@ -1269,10 +2095,44 @@ pub fn validate_manifest(manifest: &ConnectorManifest) -> Result<(), ConnectorEr
                     ));
                 }
             }
+            ConnectorKind::Database => {
+                if !matches!(operation.name.as_str(), "query" | "execute") {
+                    issues.push(format!(
+                        "database connector operation `{}` must be query/execute",
+                        operation.name
+                    ));
+                }
+                if operation.http.is_some() {
+                    issues.push(format!(
+                        "database connector operation `{}` cannot declare http",
+                        operation.name
+                    ));
+                }
+            }
+            ConnectorKind::Git => {
+                if !matches!(
+                    operation.name.as_str(),
+                    "status" | "log" | "show" | "diff" | "ls-files" | "commit"
+                ) {
+                    issues.push(format!(
+                        "git connector operation `{}` is not supported",
+                        operation.name
+                    ));
+                }
+                if operation.http.is_some() {
+                    issues.push(format!(
+                        "git connector operation `{}` cannot declare http",
+                        operation.name
+                    ));
+                }
+            }
         }
     }
     for permission in &manifest.permissions {
-        if !matches!(permission.kind.as_str(), "network" | "filesystem") {
+        if !matches!(
+            permission.kind.as_str(),
+            "network" | "filesystem" | "database"
+        ) {
             issues.push(format!("unsupported permission `{}`", permission.kind));
         }
     }
@@ -1411,6 +2271,360 @@ pub fn builtin_file_manifest() -> Result<ConnectorManifest, ConnectorError> {
     })
 }
 
+pub fn builtin_database_manifest() -> Result<ConnectorManifest, ConnectorError> {
+    let database_schema = json!({
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string", "minLength": 1, "maxLength": 262144},
+            "parameters": {"type": "array", "maxItems": 100},
+            "timeoutMs": {"type": "integer", "minimum": 100, "maximum": 60000}
+        },
+        "required": ["sql"],
+        "additionalProperties": false
+    });
+    Ok(ConnectorManifest {
+        schema_version: CONNECTOR_SCHEMA.to_string(),
+        id: "database".to_string(),
+        version: "1.0.0".to_string(),
+        name: "PostgreSQL".to_string(),
+        kind: ConnectorKind::Database,
+        description: Some(
+            "PostgreSQL parameterized query and execute connector with read-only query transactions."
+                .to_string(),
+        ),
+        docs: None,
+        auth: vec![AuthMethod {
+            kind: "env".to_string(),
+            env: None,
+        }],
+        operations: vec![
+            ConnectorOperation {
+                name: "query".to_string(),
+                description: Some("Run one bounded read-only SQL statement.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: database_schema.clone(),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "execute".to_string(),
+                description: Some("Run one parameterized write SQL statement.".to_string()),
+                risk: OperationRisk::Destructive,
+                input_schema: database_schema,
+                output_schema: None,
+                rate_limit_per_minute: Some(20),
+                max_attempts: Some(1),
+                idempotency: Some("caller-required-for-write".to_string()),
+                http: None,
+            },
+        ],
+        permissions: vec![ConnectorPermission {
+            kind: "database".to_string(),
+            hosts: Vec::new(),
+            read: Vec::new(),
+            write: Vec::new(),
+        }],
+    })
+}
+
+pub fn builtin_git_manifest() -> Result<ConnectorManifest, ConnectorError> {
+    Ok(ConnectorManifest {
+        schema_version: CONNECTOR_SCHEMA.to_string(),
+        id: "git".to_string(),
+        version: "1.0.0".to_string(),
+        name: "Git".to_string(),
+        kind: ConnectorKind::Git,
+        description: Some(
+            "Inspect a local Git worktree or bare repository without shell execution.".to_string(),
+        ),
+        docs: None,
+        auth: Vec::new(),
+        operations: vec![
+            ConnectorOperation {
+                name: "status".to_string(),
+                description: Some("Show porcelain status.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({"type": "object", "additionalProperties": false}),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "log".to_string(),
+                description: Some("Show bounded commit history.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                        "revision": {"type": "string", "maxLength": 256}
+                    },
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "show".to_string(),
+                description: Some("Show one commit or object.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "revision": {"type": "string", "maxLength": 256},
+                        "path": {"type": "string"}
+                    },
+                    "required": ["revision"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(30),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "diff".to_string(),
+                description: Some("Show a bounded diff.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {"type": "string", "maxLength": 256},
+                        "to": {"type": "string", "maxLength": 256},
+                        "path": {"type": "string"},
+                        "stat": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(30),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "ls-files".to_string(),
+                description: Some("List tracked files.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "commit".to_string(),
+                description: Some(
+                    "Commit already-staged changes; connection must enable allowWrite.".to_string(),
+                ),
+                risk: OperationRisk::Write,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {"type": "string", "minLength": 1, "maxLength": 4096}
+                    },
+                    "required": ["message"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(10),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+        ],
+        permissions: vec![ConnectorPermission {
+            kind: "filesystem".to_string(),
+            hosts: Vec::new(),
+            read: vec!["${repositoryRoot}".to_string()],
+            write: vec!["${repositoryRoot}".to_string()],
+        }],
+    })
+}
+
+pub fn builtin_mq_manifest() -> Result<ConnectorManifest, ConnectorError> {
+    Ok(ConnectorManifest {
+        schema_version: CONNECTOR_SCHEMA.to_string(),
+        id: "mq".to_string(),
+        version: "1.0.0".to_string(),
+        name: "Redis MQ".to_string(),
+        kind: ConnectorKind::Mq,
+        description: Some(
+            "Allowlisted Redis pub/sub with caller idempotency keys and bounded messages."
+                .to_string(),
+        ),
+        docs: None,
+        auth: vec![AuthMethod {
+            kind: "env".to_string(),
+            env: None,
+        }],
+        operations: vec![
+            ConnectorOperation {
+                name: "ping".to_string(),
+                description: Some("Check Redis connectivity.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({"type": "object", "additionalProperties": false}),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "publish".to_string(),
+                description: Some(
+                    "Publish one bounded message with a Redis-backed idempotency key.".to_string(),
+                ),
+                risk: OperationRisk::Write,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "message": {"type": "string", "minLength": 1, "maxLength": 1048576},
+                        "idempotencyKey": {"type": "string", "minLength": 1, "maxLength": 256}
+                    },
+                    "required": ["channel", "message", "idempotencyKey"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(600),
+                max_attempts: Some(1),
+                idempotency: Some("required".to_string()),
+                http: None,
+            },
+        ],
+        permissions: vec![ConnectorPermission {
+            kind: "network".to_string(),
+            hosts: Vec::new(),
+            read: Vec::new(),
+            write: Vec::new(),
+        }],
+    })
+}
+
+pub fn builtin_s3_manifest() -> Result<ConnectorManifest, ConnectorError> {
+    let key_schema = json!({
+        "type": "object",
+        "properties": {"key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+        "required": ["key"],
+        "additionalProperties": false
+    });
+    Ok(ConnectorManifest {
+        schema_version: CONNECTOR_SCHEMA.to_string(),
+        id: "s3".to_string(),
+        version: "1.0.0".to_string(),
+        name: "S3 object storage".to_string(),
+        kind: ConnectorKind::S3,
+        description: Some(
+            "Path-style S3-compatible object access with SigV4, bounded payloads and explicit hosts."
+                .to_string(),
+        ),
+        docs: None,
+        auth: vec![AuthMethod {
+            kind: "env".to_string(),
+            env: None,
+        }],
+        operations: vec![
+            ConnectorOperation {
+                name: "put".to_string(),
+                description: Some("Put one base64-encoded object.".to_string()),
+                risk: OperationRisk::Write,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "minLength": 1, "maxLength": 1024},
+                        "body": {"type": "string", "maxLength": 2796204},
+                        "contentType": {"type": "string", "maxLength": 256}
+                    },
+                    "required": ["key", "body"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(120),
+                max_attempts: Some(1),
+                idempotency: Some("object-key".to_string()),
+                http: None,
+            },
+            ConnectorOperation {
+                name: "get".to_string(),
+                description: Some("Get one base64-encoded object.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: key_schema.clone(),
+                output_schema: None,
+                rate_limit_per_minute: Some(120),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "head".to_string(),
+                description: Some("Read object metadata.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: key_schema,
+                output_schema: None,
+                rate_limit_per_minute: Some(120),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "list".to_string(),
+                description: Some("List objects under a prefix.".to_string()),
+                risk: OperationRisk::Read,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "prefix": {"type": "string", "maxLength": 1024},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 1000}
+                    },
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(60),
+                max_attempts: Some(1),
+                idempotency: None,
+                http: None,
+            },
+            ConnectorOperation {
+                name: "delete".to_string(),
+                description: Some("Delete one object.".to_string()),
+                risk: OperationRisk::Destructive,
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"key": {"type": "string", "minLength": 1, "maxLength": 1024}},
+                    "required": ["key"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                rate_limit_per_minute: Some(30),
+                max_attempts: Some(1),
+                idempotency: Some("object-key".to_string()),
+                http: None,
+            },
+        ],
+        permissions: vec![ConnectorPermission {
+            kind: "network".to_string(),
+            hosts: Vec::new(),
+            read: Vec::new(),
+            write: Vec::new(),
+        }],
+    })
+}
+
 fn validate_connection_config(
     manifest: &ConnectorManifest,
     config: &Value,
@@ -1454,6 +2668,149 @@ fn validate_connection_config(
             if !root.is_dir() {
                 return Err(ConnectorError::Invalid(
                     "root must be a directory".to_string(),
+                ));
+            }
+        }
+        ConnectorKind::Database => {
+            let parsed: DatabaseConnectionConfig = serde_json::from_value(config.clone())?;
+            if credential_env.is_none() {
+                return Err(ConnectorError::Invalid(
+                    "credentialEnv is required for database connections".to_string(),
+                ));
+            }
+            if parsed.allowed_hosts.is_empty()
+                || parsed
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| !valid_host_rule(host))
+            {
+                return Err(ConnectorError::Invalid(
+                    "database allowedHosts must be non-empty and valid".to_string(),
+                ));
+            }
+            if !(100..=60_000).contains(&parsed.statement_timeout_ms) {
+                return Err(ConnectorError::Invalid(
+                    "statementTimeoutMs must be between 100 and 60000".to_string(),
+                ));
+            }
+            if !(1..=10_000).contains(&parsed.max_rows) {
+                return Err(ConnectorError::Invalid(
+                    "maxRows must be between 1 and 10000".to_string(),
+                ));
+            }
+        }
+        ConnectorKind::Git => {
+            let parsed: GitConnectionConfig = serde_json::from_value(config.clone())?;
+            canonical_git_root(&parsed)?;
+            if !(1024..=MAX_RESPONSE_BYTES).contains(&parsed.max_output_bytes) {
+                return Err(ConnectorError::Invalid(
+                    "git maxOutputBytes must be between 1 KiB and 2 MiB".to_string(),
+                ));
+            }
+        }
+        ConnectorKind::Mq => {
+            let parsed: MqConnectionConfig = serde_json::from_value(config.clone())?;
+            let url = reqwest::Url::parse(&parsed.url)
+                .map_err(|error| ConnectorError::Invalid(format!("invalid Redis URL: {error}")))?;
+            if url.scheme() != "redis" {
+                return Err(ConnectorError::Invalid(
+                    "MQ URL must use redis://".to_string(),
+                ));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                return Err(ConnectorError::Forbidden(
+                    "Redis credentials must use credentialEnv".to_string(),
+                ));
+            }
+            if parsed.allowed_hosts.is_empty()
+                || parsed
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| !valid_host_rule(host))
+            {
+                return Err(ConnectorError::Invalid(
+                    "MQ allowedHosts must be non-empty and valid".to_string(),
+                ));
+            }
+            if parsed.allowed_channels.is_empty()
+                || parsed
+                    .allowed_channels
+                    .iter()
+                    .any(|channel| !valid_mq_channel_pattern(channel))
+            {
+                return Err(ConnectorError::Invalid(
+                    "MQ allowedChannels must be non-empty valid channel patterns".to_string(),
+                ));
+            }
+            if !(100..=60_000).contains(&parsed.timeout_ms) {
+                return Err(ConnectorError::Invalid(
+                    "MQ timeoutMs must be between 100 and 60000".to_string(),
+                ));
+            }
+            if !(1..=MAX_RESPONSE_BYTES).contains(&parsed.max_message_bytes) {
+                return Err(ConnectorError::Invalid(
+                    "MQ maxMessageBytes must be between 1 and 2 MiB".to_string(),
+                ));
+            }
+        }
+        ConnectorKind::S3 => {
+            let parsed: S3ConnectionConfig = serde_json::from_value(config.clone())?;
+            let url = reqwest::Url::parse(&parsed.endpoint).map_err(|error| {
+                ConnectorError::Invalid(format!("invalid S3 endpoint: {error}"))
+            })?;
+            if !matches!(url.scheme(), "http" | "https")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+            {
+                return Err(ConnectorError::Invalid(
+                    "S3 endpoint must be an HTTP(S) origin without credentials or base path"
+                        .to_string(),
+                ));
+            }
+            if credential_env.is_none() {
+                return Err(ConnectorError::Invalid(
+                    "credentialEnv is required for S3 connections".to_string(),
+                ));
+            }
+            if parsed.bucket.is_empty()
+                || parsed.bucket.len() > 63
+                || parsed.bucket.contains('/')
+                || !parsed.bucket.chars().all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || matches!(character, '-' | '.')
+                })
+            {
+                return Err(ConnectorError::Invalid("S3 bucket is invalid".to_string()));
+            }
+            if parsed.region.is_empty()
+                || parsed.region.len() > 64
+                || !parsed
+                    .region
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+            {
+                return Err(ConnectorError::Invalid("S3 region is invalid".to_string()));
+            }
+            if parsed.allowed_hosts.is_empty()
+                || parsed
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| host == "*" || !valid_host_rule(host))
+            {
+                return Err(ConnectorError::Invalid(
+                    "S3 allowedHosts must be explicit and valid".to_string(),
+                ));
+            }
+            if !(100..=60_000).contains(&parsed.timeout_ms) {
+                return Err(ConnectorError::Invalid(
+                    "S3 timeoutMs must be between 100 and 60000".to_string(),
+                ));
+            }
+            if !(1..=MAX_RESPONSE_BYTES).contains(&parsed.max_object_bytes) {
+                return Err(ConnectorError::Invalid(
+                    "S3 maxObjectBytes must be between 1 and 2 MiB".to_string(),
                 ));
             }
         }
@@ -1583,6 +2940,696 @@ async fn ensure_directory(root: &Path, directory: &Path) -> Result<PathBuf, Conn
     Ok(canonical)
 }
 
+async fn connect_database(
+    connection: &ConnectionRow,
+    config: &DatabaseConnectionConfig,
+) -> Result<PgConnection, ConnectorError> {
+    let credential_env = connection.credential_env.as_deref().ok_or_else(|| {
+        ConnectorError::Invalid("database connector requires credentialEnv".to_string())
+    })?;
+    let database_url = std::env::var(credential_env).map_err(|_| {
+        ConnectorError::Invalid(format!(
+            "credential environment variable `{credential_env}` is not set"
+        ))
+    })?;
+    validate_database_url(&database_url, &config.allowed_hosts).await?;
+    let options: PgConnectOptions = database_url.parse().map_err(|error| {
+        ConnectorError::Invalid(format!("invalid PostgreSQL connection string: {error}"))
+    })?;
+    PgConnection::connect_with(&options)
+        .await
+        .map_err(|error| ConnectorError::Upstream(format!("database connection failed: {error}")))
+}
+
+async fn validate_database_url(raw: &str, allowed_hosts: &[String]) -> Result<(), ConnectorError> {
+    let url = reqwest::Url::parse(raw)
+        .map_err(|error| ConnectorError::Invalid(format!("invalid database URL: {error}")))?;
+    if !matches!(url.scheme(), "postgres" | "postgresql") {
+        return Err(ConnectorError::Invalid(
+            "database URL must use postgres or postgresql".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConnectorError::Invalid("database URL has no host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(5432);
+    if host != "localhost"
+        && host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_none_or(|ip| !ip.is_loopback())
+        && !allowed_hosts
+            .iter()
+            .any(|rule| host_rule_matches(rule, host, port))
+    {
+        return Err(ConnectorError::Forbidden(format!(
+            "database host `{host}:{port}` is not in allowedHosts"
+        )));
+    }
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| {
+            ConnectorError::Upstream(format!("cannot resolve database host `{host}`: {error}"))
+        })?;
+    for address in addresses {
+        let ip = address.ip();
+        let blocked = match ip {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_link_local()
+                    || ip.is_broadcast()
+                    || ip.is_unspecified()
+                    || ip.is_documentation()
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_unicast_link_local() || ip.is_unspecified() || ip.is_multicast()
+            }
+        };
+        if blocked {
+            return Err(ConnectorError::Forbidden(
+                "database resolves to a blocked address".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn database_read_statement(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("/*")
+        && let Some((_, rest)) = rest.split_once("*/")
+    {
+        return database_read_statement(rest);
+    }
+    let first = trimmed
+        .split(|character: char| character.is_whitespace() || character == '(')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    matches!(
+        first.as_str(),
+        "SELECT" | "WITH" | "SHOW" | "VALUES" | "EXPLAIN"
+    )
+}
+
+fn bind_postgres_value<'q>(
+    query: Query<'q, Postgres, PgArguments>,
+    value: &Value,
+) -> Query<'q, Postgres, PgArguments> {
+    match value {
+        Value::Null => query.bind(Option::<String>::None),
+        Value::Bool(value) => query.bind(*value),
+        Value::Number(value) if value.is_i64() => query.bind(value.as_i64()),
+        Value::Number(value) if value.is_u64() => {
+            let value = value.as_u64().unwrap_or_default();
+            if let Ok(value) = i64::try_from(value) {
+                query.bind(value)
+            } else {
+                query.bind(value.to_string())
+            }
+        }
+        Value::Number(value) => query.bind(value.as_f64()),
+        Value::String(value) => query.bind(value.clone()),
+        Value::Array(_) | Value::Object(_) => query.bind(Json(value.clone())),
+    }
+}
+
+fn postgres_row_json(row: &sqlx::postgres::PgRow) -> Value {
+    let mut value = serde_json::Map::new();
+    for (index, column) in row.columns().iter().enumerate() {
+        let decoded = row
+            .try_get::<Option<String>, _>(index)
+            .map(Value::from)
+            .or_else(|_| row.try_get::<Option<i32>, _>(index).map(Value::from))
+            .or_else(|_| row.try_get::<Option<i64>, _>(index).map(Value::from))
+            .or_else(|_| row.try_get::<Option<f64>, _>(index).map(Value::from))
+            .or_else(|_| row.try_get::<Option<bool>, _>(index).map(Value::from))
+            .or_else(|_| {
+                row.try_get::<Option<Json<Value>>, _>(index)
+                    .map(|value| value.map_or(Value::Null, |value| value.0))
+            })
+            .or_else(|_| {
+                row.try_get::<Option<OffsetDateTime>, _>(index)
+                    .map(|value| {
+                        value.map_or(Value::Null, |value| Value::String(value.to_string()))
+                    })
+            })
+            .or_else(|_| {
+                row.try_get::<Option<sqlx::types::Uuid>, _>(index)
+                    .map(|value| {
+                        value.map_or(Value::Null, |value| Value::String(value.to_string()))
+                    })
+            })
+            .or_else(|_| {
+                row.try_get::<Option<Vec<u8>>, _>(index).map(|value| {
+                    value.map_or(Value::Null, |value| Value::String(BASE64.encode(value)))
+                })
+            })
+            .unwrap_or(Value::Null);
+        value.insert(column.name().to_string(), decoded);
+    }
+    Value::Object(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RedisReply {
+    Simple(String),
+    Integer(i64),
+    Bulk(Option<String>),
+    Array(Vec<RedisReply>),
+}
+
+async fn connect_mq(
+    connection: &ConnectionRow,
+    config: &MqConnectionConfig,
+) -> Result<BufReader<TcpStream>, ConnectorError> {
+    let url = reqwest::Url::parse(&config.url)
+        .map_err(|error| ConnectorError::Invalid(format!("invalid Redis URL: {error}")))?;
+    if url.scheme() != "redis" {
+        return Err(ConnectorError::Invalid(
+            "MQ URL must use redis:// (TLS is not yet supported)".to_string(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConnectorError::Forbidden(
+            "Redis URL must not contain credentials; use credentialEnv".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConnectorError::Invalid("Redis URL has no host".to_string()))?;
+    let port = url.port().unwrap_or(6379);
+    if host != "localhost"
+        && host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_none_or(|ip| !ip.is_loopback())
+        && !config
+            .allowed_hosts
+            .iter()
+            .any(|rule| host_rule_matches(rule, host, port))
+    {
+        return Err(ConnectorError::Forbidden(format!(
+            "Redis host `{host}:{port}` is not in allowedHosts"
+        )));
+    }
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| ConnectorError::Upstream(format!("cannot resolve Redis host: {error}")))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ConnectorError::Upstream(
+            "Redis host resolved to no addresses".to_string(),
+        ));
+    }
+    for address in &addresses {
+        let blocked = match address.ip() {
+            std::net::IpAddr::V4(ip) => ip.is_link_local() || ip.is_unspecified(),
+            std::net::IpAddr::V6(ip) => ip.is_unicast_link_local() || ip.is_unspecified(),
+        };
+        if blocked {
+            return Err(ConnectorError::Forbidden(
+                "Redis resolves to a blocked address".to_string(),
+            ));
+        }
+    }
+    let stream = tokio::time::timeout(
+        Duration::from_millis(config.timeout_ms),
+        TcpStream::connect(addresses[0]),
+    )
+    .await
+    .map_err(|_| ConnectorError::Upstream("Redis connection timed out".to_string()))??;
+    stream.set_nodelay(true)?;
+    let mut reader = BufReader::new(stream);
+    let password = connection
+        .credential_env
+        .as_deref()
+        .map(|name| {
+            std::env::var(name).map_err(|_| {
+                ConnectorError::Invalid(format!(
+                    "credential environment variable `{name}` is not set"
+                ))
+            })
+        })
+        .transpose()?;
+    if let Some(password) = password {
+        let response = if let Some(username) = config.username.as_deref() {
+            redis_command(&mut reader, &["AUTH", username, &password]).await?
+        } else {
+            redis_command(&mut reader, &["AUTH", &password]).await?
+        };
+        if response != RedisReply::Simple("OK".to_string()) {
+            return Err(ConnectorError::Upstream(
+                "Redis authentication failed".to_string(),
+            ));
+        }
+    } else if config.username.is_some() {
+        return Err(ConnectorError::Invalid(
+            "Redis username requires credentialEnv".to_string(),
+        ));
+    }
+    if config.database != 0 {
+        let database = config.database.to_string();
+        let response = redis_command(&mut reader, &["SELECT", &database]).await?;
+        if response != RedisReply::Simple("OK".to_string()) {
+            return Err(ConnectorError::Upstream("Redis SELECT failed".to_string()));
+        }
+    }
+    Ok(reader)
+}
+
+async fn redis_command(
+    reader: &mut BufReader<TcpStream>,
+    args: &[&str],
+) -> Result<RedisReply, ConnectorError> {
+    let mut encoded = format!("*{}\r\n", args.len());
+    for arg in args {
+        encoded.push_str(&format!("${}\r\n{arg}\r\n", arg.len()));
+    }
+    reader.get_mut().write_all(encoded.as_bytes()).await?;
+    reader.get_mut().flush().await?;
+    read_redis_reply(reader).await
+}
+
+async fn read_redis_reply(reader: &mut BufReader<TcpStream>) -> Result<RedisReply, ConnectorError> {
+    let prefix = read_redis_byte(reader).await?;
+    match prefix {
+        b'+' => Ok(RedisReply::Simple(read_redis_line(reader).await?)),
+        b'-' => Err(ConnectorError::Upstream(format!(
+            "Redis error: {}",
+            read_redis_line(reader).await?
+        ))),
+        b':' => Ok(RedisReply::Integer(
+            read_redis_line(reader).await?.parse().map_err(|error| {
+                ConnectorError::Upstream(format!("invalid Redis integer: {error}"))
+            })?,
+        )),
+        b'$' => {
+            let length: i64 = read_redis_line(reader).await?.parse().map_err(|error| {
+                ConnectorError::Upstream(format!("invalid Redis bulk length: {error}"))
+            })?;
+            if length < 0 {
+                return Ok(RedisReply::Bulk(None));
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| ConnectorError::Upstream("Redis bulk length overflow".to_string()))?;
+            if length > MAX_RESPONSE_BYTES {
+                return Err(ConnectorError::Upstream(
+                    "Redis bulk response exceeds 2 MiB".to_string(),
+                ));
+            }
+            let mut bytes = vec![0u8; length + 2];
+            reader.read_exact(&mut bytes).await?;
+            bytes.truncate(length);
+            Ok(RedisReply::Bulk(Some(
+                String::from_utf8_lossy(&bytes).to_string(),
+            )))
+        }
+        b'*' => {
+            let length: i64 = read_redis_line(reader).await?.parse().map_err(|error| {
+                ConnectorError::Upstream(format!("invalid Redis array length: {error}"))
+            })?;
+            if length < 0 {
+                return Ok(RedisReply::Array(Vec::new()));
+            }
+            if length > 10_000 {
+                return Err(ConnectorError::Upstream(
+                    "Redis array response is too large".to_string(),
+                ));
+            }
+            let mut values = Vec::with_capacity(length as usize);
+            for _ in 0..length {
+                values.push(Box::pin(read_redis_reply(reader)).await?);
+            }
+            Ok(RedisReply::Array(values))
+        }
+        other => Err(ConnectorError::Upstream(format!(
+            "unsupported Redis response prefix {:?}",
+            other as char
+        ))),
+    }
+}
+
+async fn read_redis_byte(reader: &mut BufReader<TcpStream>) -> Result<u8, ConnectorError> {
+    let mut byte = [0u8; 1];
+    reader.read_exact(&mut byte).await?;
+    Ok(byte[0])
+}
+
+async fn read_redis_line(reader: &mut BufReader<TcpStream>) -> Result<String, ConnectorError> {
+    let mut bytes = Vec::new();
+    reader.read_until(b'\n', &mut bytes).await?;
+    if bytes.len() < 2 || !bytes.ends_with(b"\r\n") {
+        return Err(ConnectorError::Upstream(
+            "invalid Redis line terminator".to_string(),
+        ));
+    }
+    bytes.truncate(bytes.len() - 2);
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn mq_channel_allowed(channel: &str, allowed: &[String]) -> bool {
+    !channel.is_empty()
+        && channel.len() <= 512
+        && !channel.contains('\0')
+        && allowed.iter().any(|rule| {
+            rule.strip_suffix('*')
+                .map_or(rule == channel, |prefix| channel.starts_with(prefix))
+        })
+}
+
+fn valid_mq_channel_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern.len() <= 512
+        && !pattern.contains('\0')
+        && pattern
+            .strip_suffix('*')
+            .is_none_or(|prefix| !prefix.contains('*'))
+}
+
+async fn validate_s3_endpoint(config: &S3ConnectionConfig) -> Result<(), ConnectorError> {
+    let url = reqwest::Url::parse(&config.endpoint)
+        .map_err(|error| ConnectorError::Invalid(format!("invalid S3 endpoint: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(ConnectorError::Forbidden(
+            "S3 endpoint must be HTTP(S) without URL credentials".to_string(),
+        ));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConnectorError::Invalid("S3 endpoint has no host".to_string()))?;
+    let port = url.port_or_known_default().unwrap_or(80);
+    if host != "localhost"
+        && host
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .is_none_or(|ip| !ip.is_loopback())
+        && !config
+            .allowed_hosts
+            .iter()
+            .any(|rule| host_rule_matches(rule, host, port))
+    {
+        return Err(ConnectorError::Forbidden(format!(
+            "S3 host `{host}:{port}` is not in allowedHosts"
+        )));
+    }
+    let addresses = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|error| ConnectorError::Upstream(format!("cannot resolve S3 host: {error}")))?;
+    for address in addresses {
+        let blocked = match address.ip() {
+            std::net::IpAddr::V4(ip) => {
+                ip.is_link_local() || ip.is_broadcast() || ip.is_unspecified()
+            }
+            std::net::IpAddr::V6(ip) => {
+                ip.is_unicast_link_local() || ip.is_unspecified() || ip.is_multicast()
+            }
+        };
+        if blocked {
+            return Err(ConnectorError::Forbidden(
+                "S3 endpoint resolves to a blocked address".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn s3_url(config: &S3ConnectionConfig, key: &str) -> Result<reqwest::Url, ConnectorError> {
+    let mut url = reqwest::Url::parse(&config.endpoint)
+        .map_err(|error| ConnectorError::Invalid(format!("invalid S3 endpoint: {error}")))?;
+    if url.path() != "/" {
+        return Err(ConnectorError::Invalid(
+            "S3 endpoint must not contain a base path".to_string(),
+        ));
+    }
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            ConnectorError::Invalid("S3 endpoint cannot be used as a base URL".to_string())
+        })?;
+        segments.clear().push(&config.bucket);
+        if !key.is_empty() {
+            for segment in key.split('/') {
+                segments.push(segment);
+            }
+        }
+    }
+    Ok(url)
+}
+
+fn s3_key(key: &str) -> Result<String, ConnectorError> {
+    validate_s3_key(key, false)?;
+    Ok(key.to_string())
+}
+
+fn s3_prefix(prefix: &str) -> Result<(), ConnectorError> {
+    validate_s3_key(prefix, true)
+}
+
+fn validate_s3_key(key: &str, allow_empty: bool) -> Result<(), ConnectorError> {
+    if (!allow_empty && key.is_empty())
+        || key.len() > 1024
+        || key.starts_with('/')
+        || key.contains('\0')
+        || key
+            .split('/')
+            .any(|segment| segment == ".." || segment == ".")
+    {
+        return Err(ConnectorError::Invalid("invalid S3 object key".to_string()));
+    }
+    Ok(())
+}
+
+fn sign_s3_request(
+    connection: &ConnectionRow,
+    config: &S3ConnectionConfig,
+    method: &reqwest::Method,
+    url: &reqwest::Url,
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<Vec<(String, String)>, ConnectorError> {
+    let credential_env = connection.credential_env.as_deref().ok_or_else(|| {
+        ConnectorError::Invalid("S3 connector requires credentialEnv".to_string())
+    })?;
+    let credentials_json = std::env::var(credential_env).map_err(|_| {
+        ConnectorError::Invalid(format!(
+            "credential environment variable `{credential_env}` is not set"
+        ))
+    })?;
+    let credentials: S3Credentials = serde_json::from_str(&credentials_json).map_err(|error| {
+        ConnectorError::Invalid(format!("invalid S3 credentials JSON: {error}"))
+    })?;
+    if credentials.access_key.is_empty() || credentials.secret_key.is_empty() {
+        return Err(ConnectorError::Invalid(
+            "S3 accessKey and secretKey must not be empty".to_string(),
+        ));
+    }
+    let now = OffsetDateTime::now_utc();
+    let date = now
+        .format(format_description!("[year][month][day]"))
+        .map_err(|error| ConnectorError::Invalid(format!("cannot format S3 date: {error}")))?;
+    let timestamp = now
+        .format(format_description!(
+            "[year][month][day]T[hour][minute][second]Z"
+        ))
+        .map_err(|error| ConnectorError::Invalid(format!("cannot format S3 time: {error}")))?;
+    let payload_hash = format!("{:x}", Sha256::digest(body));
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    let mut headers = vec![
+        ("host".to_string(), host),
+        ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+        ("x-amz-date".to_string(), timestamp.clone()),
+    ];
+    if let Some(content_type) = content_type {
+        headers.push(("content-type".to_string(), content_type.to_string()));
+    }
+    if let Some(token) = credentials.session_token.as_deref() {
+        headers.push(("x-amz-security-token".to_string(), token.to_string()));
+    }
+    headers.sort_by(|left, right| left.0.cmp(&right.0));
+    let canonical_headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{}\n", value.trim()))
+        .collect::<String>();
+    let signed_headers = headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method.as_str(),
+        url.path(),
+        url.query().unwrap_or_default(),
+        canonical_headers,
+        signed_headers,
+        payload_hash
+    );
+    let scope = format!("{date}/{}/s3/aws4_request", config.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{:x}",
+        Sha256::digest(canonical_request.as_bytes())
+    );
+    let date_key = hmac_sha256(
+        format!("AWS4{}", credentials.secret_key).as_bytes(),
+        date.as_bytes(),
+    );
+    let region_key = hmac_sha256(&date_key, config.region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"s3");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+    let signature = hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    headers.push((
+        "authorization".to_string(),
+        format!(
+            "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            credentials.access_key
+        ),
+    ));
+    Ok(headers)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&key, data).as_ref().to_vec()
+}
+
+async fn s3_response_error(operation: &str, response: reqwest::Response) -> ConnectorError {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .unwrap_or_default()
+        .chars()
+        .take(4096)
+        .collect::<String>();
+    ConnectorError::Upstream(format!(
+        "S3 {operation} returned HTTP {}: {body}",
+        status.as_u16()
+    ))
+}
+
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let value_start = start + open.len();
+        let Some(end) = rest[value_start..].find(&close) else {
+            break;
+        };
+        let value = rest[value_start..value_start + end]
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'");
+        values.push(value);
+        rest = &rest[value_start + end + close.len()..];
+    }
+    values
+}
+
+fn canonical_git_root(config: &GitConnectionConfig) -> Result<PathBuf, ConnectorError> {
+    let root = std::fs::canonicalize(&config.repository_root).map_err(|error| {
+        ConnectorError::Invalid(format!(
+            "cannot open Git repository `{}`: {error}",
+            config.repository_root
+        ))
+    })?;
+    if !root.is_dir() || (!root.join(".git").exists() && !root.join("HEAD").is_file()) {
+        return Err(ConnectorError::Invalid(
+            "repositoryRoot is not a Git worktree or bare repository".to_string(),
+        ));
+    }
+    Ok(root)
+}
+
+fn validate_git_revision(revision: &str) -> Result<(), ConnectorError> {
+    if revision.is_empty()
+        || revision.len() > 256
+        || revision.starts_with('-')
+        || revision.contains('\0')
+        || revision.chars().any(|character| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '_' | '.' | '/' | '^' | '~' | '@' | '{' | '}' | '-'
+                ))
+        })
+    {
+        return Err(ConnectorError::Invalid(
+            "Git revision contains unsupported characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn git_relative_path(path: &str) -> Result<String, ConnectorError> {
+    let relative = resolve_under_root(Path::new("/"), path)?;
+    Ok(relative
+        .strip_prefix("/")
+        .unwrap_or(&relative)
+        .to_string_lossy()
+        .replace('\\', "/"))
+}
+
+async fn git_command(
+    args: &[String],
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<Value, ConnectorError> {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_PAGER", "cat")
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .map_err(|_| ConnectorError::Upstream("git command timed out".to_string()))??;
+    let (stdout, stdout_truncated) = truncate_output(&output.stdout, max_output_bytes);
+    let (stderr, stderr_truncated) = truncate_output(&output.stderr, max_output_bytes);
+    if !output.status.success() {
+        return Err(ConnectorError::Upstream(format!(
+            "git exited with {}: {}",
+            output.status.code().unwrap_or(-1),
+            stderr
+        )));
+    }
+    Ok(json!({
+        "ok": true,
+        "kind": "git",
+        "exitCode": output.status.code().unwrap_or(0),
+        "stdout": stdout,
+        "stderr": stderr,
+        "truncated": stdout_truncated || stderr_truncated
+    }))
+}
+
+fn truncate_output(bytes: &[u8], limit: usize) -> (String, bool) {
+    let truncated = bytes.len() > limit;
+    let bytes = &bytes[..bytes.len().min(limit)];
+    let mut boundary = bytes.len();
+    while boundary > 0 && std::str::from_utf8(&bytes[..boundary]).is_err() {
+        boundary -= 1;
+    }
+    (
+        String::from_utf8_lossy(&bytes[..boundary]).to_string(),
+        truncated,
+    )
+}
+
 fn audit_summary(value: &Value) -> Value {
     let mut summary = serde_json::Map::new();
     for key in [
@@ -1596,6 +3643,17 @@ fn audit_summary(value: &Value) -> Value {
         "encoding",
         "writable",
         "path",
+        "rowCount",
+        "rowsAffected",
+        "truncated",
+        "exitCode",
+        "channel",
+        "published",
+        "duplicate",
+        "sha256",
+        "etag",
+        "count",
+        "deleted",
     ] {
         if let Some(value) = value.get(key) {
             summary.insert(key.to_string(), value.clone());
@@ -1657,6 +3715,10 @@ fn connector_kind(kind: ConnectorKind) -> &'static str {
     match kind {
         ConnectorKind::Http => "http",
         ConnectorKind::File => "file",
+        ConnectorKind::Database => "database",
+        ConnectorKind::Git => "git",
+        ConnectorKind::Mq => "mq",
+        ConnectorKind::S3 => "s3",
     }
 }
 
@@ -1734,6 +3796,14 @@ mod tests {
         validate_manifest(&manifest).expect("valid");
         let file = builtin_file_manifest().expect("file manifest");
         validate_manifest(&file).expect("file valid");
+        let database = builtin_database_manifest().expect("database manifest");
+        validate_manifest(&database).expect("database valid");
+        let git = builtin_git_manifest().expect("git manifest");
+        validate_manifest(&git).expect("git valid");
+        let mq = builtin_mq_manifest().expect("mq manifest");
+        validate_manifest(&mq).expect("mq valid");
+        let s3 = builtin_s3_manifest().expect("s3 manifest");
+        validate_manifest(&s3).expect("s3 valid");
         assert!(valid_env_name("HPA_CONNECTOR_TOKEN"));
         assert!(!valid_env_name("1TOKEN"));
         assert!(!valid_env_name("TOKEN-NAME"));
@@ -1757,5 +3827,18 @@ mod tests {
             "api.example.com",
             443
         ));
+    }
+
+    #[test]
+    fn database_statement_and_git_revision_guards_are_strict() {
+        assert!(database_read_statement("SELECT 1"));
+        assert!(database_read_statement(
+            "/* audit */ WITH value AS (SELECT 1) SELECT * FROM value"
+        ));
+        assert!(!database_read_statement("INSERT INTO t VALUES (1)"));
+        assert!(validate_git_revision("HEAD~1").is_ok());
+        assert!(validate_git_revision("origin/main").is_ok());
+        assert!(validate_git_revision("--upload-pack=evil").is_err());
+        assert!(validate_git_revision("HEAD;rm").is_err());
     }
 }

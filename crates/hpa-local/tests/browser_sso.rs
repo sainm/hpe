@@ -125,8 +125,17 @@ struct MockIdp {
     port: u16,
     issuer: String,
     wrong_nonce: Arc<AtomicBool>,
+    state: Arc<Mutex<IdpState>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct IdpState {
+    active_refresh_tokens: HashSet<String>,
+    next_refresh_id: u64,
+    reject_refresh: bool,
+    logout_requests: Vec<HashMap<String, String>>,
 }
 
 impl MockIdp {
@@ -150,9 +159,11 @@ impl MockIdp {
         .to_string();
         let used: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let wrong_nonce = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(IdpState::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_issuer = issuer.clone();
         let thread_wrong = wrong_nonce.clone();
+        let thread_state = state.clone();
         let thread_stop = stop.clone();
         let handle = thread::spawn(move || {
             while !thread_stop.load(Ordering::Relaxed) {
@@ -164,6 +175,7 @@ impl MockIdp {
                         &thread_issuer,
                         &used,
                         &thread_wrong,
+                        &thread_state,
                     ),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
@@ -176,6 +188,7 @@ impl MockIdp {
             port,
             issuer,
             wrong_nonce,
+            state,
             stop,
             handle: Some(handle),
         }
@@ -183,6 +196,22 @@ impl MockIdp {
 
     fn set_wrong_nonce(&self, value: bool) {
         self.wrong_nonce.store(value, Ordering::Relaxed);
+    }
+
+    fn set_reject_refresh(&self, value: bool) {
+        self.state.lock().expect("idp state").reject_refresh = value;
+    }
+
+    fn refresh_tokens_issued(&self) -> usize {
+        self.state.lock().expect("idp state").next_refresh_id as usize
+    }
+
+    fn logout_requests(&self) -> Vec<HashMap<String, String>> {
+        self.state
+            .lock()
+            .expect("idp state")
+            .logout_requests
+            .clone()
     }
 
     fn token_endpoint(&self) -> String {
@@ -195,6 +224,10 @@ impl MockIdp {
 
     fn authorize_endpoint(&self) -> String {
         format!("{}/authorize", self.issuer)
+    }
+
+    fn end_session_endpoint(&self) -> String {
+        format!("{}/logout", self.issuer)
     }
 }
 
@@ -215,6 +248,7 @@ fn handle_connection(
     issuer: &str,
     used: &Arc<Mutex<HashSet<String>>>,
     wrong_nonce: &Arc<AtomicBool>,
+    idp_state: &Arc<Mutex<IdpState>>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let mut buffer = Vec::new();
@@ -256,8 +290,57 @@ fn handle_connection(
         respond(&mut stream, 200, "application/json", jwks);
         return;
     }
+    if method == "GET" && path.starts_with("/logout") {
+        let query = path
+            .split_once('?')
+            .map(|(_, query)| parse_form(query))
+            .unwrap_or_default();
+        let redirect = query
+            .get("post_logout_redirect_uri")
+            .expect("post_logout_redirect_uri")
+            .clone();
+        let state = query.get("state").expect("logout state").clone();
+        idp_state
+            .lock()
+            .expect("idp state")
+            .logout_requests
+            .push(query);
+        let separator = if redirect.contains('?') { '&' } else { '?' };
+        respond_redirect(&mut stream, &format!("{redirect}{separator}state={state}"));
+        return;
+    }
     if method == "POST" && path == "/token" {
         let form = parse_form(&body);
+        if form.get("grant_type").map(String::as_str) == Some("refresh_token") {
+            let provided = form.get("refresh_token").cloned().unwrap_or_default();
+            let (accepted, refresh_token) = {
+                let mut state = idp_state.lock().expect("idp state");
+                let accepted =
+                    !state.reject_refresh && state.active_refresh_tokens.remove(&provided);
+                state.next_refresh_id += 1;
+                let refresh_token = format!("refresh-{}", state.next_refresh_id);
+                if accepted {
+                    state.active_refresh_tokens.insert(refresh_token.clone());
+                }
+                (accepted, refresh_token)
+            };
+            if !accepted {
+                respond_error(&mut stream, 400, "invalid_grant");
+                return;
+            }
+            let id_token = mint_id_token(signing, issuer, "hpa-web", None);
+            let response = json!({
+                "access_token": "refreshed-access",
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "refresh_token": refresh_token,
+                "refresh_expires_in": 86_400,
+                "id_token": id_token
+            })
+            .to_string();
+            respond(&mut stream, 200, "application/json", &response);
+            return;
+        }
         let Some(code) = form.get("code") else {
             respond_error(&mut stream, 400, "invalid_request");
             return;
@@ -288,11 +371,20 @@ fn handle_connection(
         } else {
             nonce
         };
-        let id_token = mint_id_token(signing, issuer, "hpa-web", nonce);
+        let id_token = mint_id_token(signing, issuer, "hpa-web", Some(nonce));
+        let refresh_token = {
+            let mut state = idp_state.lock().expect("idp state");
+            state.next_refresh_id += 1;
+            let refresh_token = format!("refresh-{}", state.next_refresh_id);
+            state.active_refresh_tokens.insert(refresh_token.clone());
+            refresh_token
+        };
         let body = json!({
-            "access_token": "mock",
+            "access_token": "authorization-access",
             "token_type": "Bearer",
             "expires_in": 600,
+            "refresh_token": refresh_token,
+            "refresh_expires_in": 86_400,
             "id_token": id_token
         })
         .to_string();
@@ -302,13 +394,18 @@ fn handle_connection(
     respond_error(&mut stream, 404, "not_found");
 }
 
-fn mint_id_token(signing: &SigningKey, issuer: &str, audience: &str, nonce: &str) -> String {
+fn mint_id_token(
+    signing: &SigningKey,
+    issuer: &str,
+    audience: &str,
+    nonce: Option<&str>,
+) -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
     let header = json!({"alg": "EdDSA", "typ": "JWT", "kid": "primary"});
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer,
         "aud": audience,
         "sub": "oidc|admin",
@@ -316,11 +413,13 @@ fn mint_id_token(signing: &SigningKey, issuer: &str, audience: &str, nonce: &str
         "role": "owner",
         "email": "admin@example.test",
         "name": "Browser Admin",
-        "nonce": nonce,
         "iat": now,
         "nbf": now - 5,
         "exp": now + 600
     });
+    if let Some(nonce) = nonce {
+        claims["nonce"] = Value::String(nonce.to_string());
+    }
     let input = format!(
         "{}.{}",
         URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).expect("header")),
@@ -377,6 +476,13 @@ fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) 
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+}
+
+fn respond_redirect(stream: &mut TcpStream, location: &str) {
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     let _ = stream.write_all(response.as_bytes());
 }
@@ -442,7 +548,7 @@ async fn start_login(server: &Server, redirect: &str) -> LoginParams {
     );
     assert_eq!(
         params.get("scope").map(String::as_str),
-        Some("openid email profile")
+        Some("openid email profile offline_access")
     );
     let challenge = params.get("code_challenge").cloned().expect("challenge");
     assert_eq!(challenge.len(), 43);
@@ -505,10 +611,12 @@ async fn configure(server: &Server, idp: &MockIdp, admin: &str) {
         "authorizationEndpoint": idp.authorize_endpoint(),
         "tokenEndpoint": idp.token_endpoint(),
         "redirectUri": server.url("/auth/oidc/callback"),
-        "scopes": ["openid", "email", "profile"],
+        "scopes": ["openid", "email", "profile", "offline_access"],
         "adminSubjects": ["admin@example.test"],
         "cookieSecure": false,
-        "sessionTtlSeconds": 3600
+        "sessionTtlSeconds": 3600,
+        "endSessionEndpoint": idp.end_session_endpoint(),
+        "postLogoutRedirectUri": server.url("/auth/oidc/logout/callback")
     });
     let response = server
         .client
@@ -521,7 +629,11 @@ async fn configure(server: &Server, idp: &MockIdp, admin: &str) {
     assert_eq!(response.status(), 200);
     let config = json_body(response).await;
     assert_eq!(config["clientId"], "hpa-web");
-    assert_eq!(config["scopes"], json!(["openid", "email", "profile"]));
+    assert_eq!(
+        config["scopes"],
+        json!(["openid", "email", "profile", "offline_access"])
+    );
+    assert_eq!(config["endSessionEndpoint"], idp.end_session_endpoint());
 }
 
 #[tokio::test]
@@ -536,7 +648,7 @@ async fn browser_sso_login_session_csrf_and_failures() {
     let callback = complete_login(&server, &login).await;
     assert_eq!(callback.status(), 303);
     assert_eq!(location_of(&callback), "/enterprise");
-    let cookie = session_cookie(&callback);
+    let mut cookie = session_cookie(&callback);
     let flags = cookie_flags(&callback);
     assert!(
         flags.contains("HttpOnly"),
@@ -682,6 +794,51 @@ async fn browser_sso_login_session_csrf_and_failures() {
     assert_eq!(location_of(&nonce_failure), "/login?error=sso_failed");
     idp.set_wrong_nonce(false);
 
+    let refresh_without_csrf = server
+        .client
+        .post(server.url("/api/auth/refresh"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .expect("refresh without csrf");
+    assert_eq!(refresh_without_csrf.status(), 403);
+    assert_eq!(
+        json_body(refresh_without_csrf).await["error"]["code"],
+        "CSRF_REQUIRED"
+    );
+
+    let old_cookie = cookie.clone();
+    let issued_before_refresh = idp.refresh_tokens_issued();
+    let refresh = server
+        .client
+        .post(server.url("/api/auth/refresh"))
+        .header(COOKIE, &cookie)
+        .header("x-hpa-csrf", &csrf)
+        .send()
+        .await
+        .expect("refresh");
+    assert_eq!(refresh.status(), 200);
+    cookie = session_cookie(&refresh);
+    assert_ne!(cookie, old_cookie, "refresh must rotate the session cookie");
+    let refresh_body = json_body(refresh).await;
+    assert_eq!(refresh_body["authenticated"], true);
+    assert_eq!(refresh_body["refreshed"], true);
+    assert_eq!(refresh_body["refreshAvailable"], true);
+    assert!(
+        refresh_body["expiresAt"].as_i64().unwrap()
+            > refresh_body["accessTokenExpiresAt"].as_i64().unwrap()
+    );
+    assert_eq!(idp.refresh_tokens_issued(), issued_before_refresh + 1);
+
+    let rotated_old = server
+        .client
+        .get(server.url("/api/auth/session"))
+        .header(COOKIE, &old_cookie)
+        .send()
+        .await
+        .expect("old session cookie");
+    assert_eq!(json_body(rotated_old).await["authenticated"], false);
+
     let logout = server
         .client
         .post(server.url("/api/auth/logout"))
@@ -691,7 +848,51 @@ async fn browser_sso_login_session_csrf_and_failures() {
         .await
         .expect("logout");
     assert_eq!(logout.status(), 200);
-    assert_eq!(json_body(logout).await["loggedOut"], true);
+    let cleared_cookie = cookie_flags(&logout);
+    assert!(cleared_cookie.starts_with("hpa_session=;"));
+    assert!(cleared_cookie.contains("Max-Age=0"));
+    let logout_body = json_body(logout).await;
+    assert_eq!(logout_body["loggedOut"], true);
+    let logout_url = logout_body["logoutUrl"]
+        .as_str()
+        .expect("RP-initiated logout URL");
+    let idp_logout = server
+        .client
+        .get(logout_url)
+        .send()
+        .await
+        .expect("IdP logout");
+    assert_eq!(idp_logout.status(), 302);
+    let callback_location = location_of(&idp_logout);
+    let logout_callback = server
+        .client
+        .get(callback_location.clone())
+        .send()
+        .await
+        .expect("logout callback");
+    assert_eq!(logout_callback.status(), 303);
+    assert_eq!(location_of(&logout_callback), "/login?loggedOut=1");
+    let replayed_callback = server
+        .client
+        .get(callback_location)
+        .send()
+        .await
+        .expect("replayed logout callback");
+    assert_eq!(
+        location_of(&replayed_callback),
+        "/login?error=logout_state_invalid"
+    );
+    let logout_requests = idp.logout_requests();
+    assert_eq!(logout_requests.len(), 1);
+    assert_eq!(
+        logout_requests[0].get("client_id").map(String::as_str),
+        Some("hpa-web")
+    );
+    assert!(
+        logout_requests[0]
+            .get("id_token_hint")
+            .is_some_and(|token| token.split('.').count() == 3)
+    );
 
     let after = server
         .client
@@ -758,6 +959,51 @@ async fn browser_sso_requires_configuration_and_csrf() {
         .expect("bad callback");
     assert_eq!(callback.status(), 303);
     assert_eq!(location_of(&callback), "/login?error=state_invalid");
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}
+
+#[tokio::test]
+async fn browser_sso_refresh_rejection_revokes_the_session() {
+    let data_dir = temp_dir("refresh-reject");
+    let admin = init_admin(&data_dir);
+    let server = Server::start(&data_dir).await;
+    let idp = MockIdp::start();
+    configure(&server, &idp, &admin).await;
+
+    let login = start_login(&server, "/enterprise").await;
+    let callback = complete_login(&server, &login).await;
+    let cookie = session_cookie(&callback);
+    let session = server
+        .client
+        .get(server.url("/api/auth/session"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .expect("session");
+    let session = json_body(session).await;
+    let csrf = session["csrfToken"].as_str().expect("csrf");
+
+    idp.set_reject_refresh(true);
+    let refresh = server
+        .client
+        .post(server.url("/api/auth/refresh"))
+        .header(COOKIE, &cookie)
+        .header("x-hpa-csrf", csrf)
+        .send()
+        .await
+        .expect("rejected refresh");
+    assert_eq!(refresh.status(), 401);
+    assert!(cookie_flags(&refresh).starts_with("hpa_session=;"));
+
+    let after = server
+        .client
+        .get(server.url("/api/auth/session"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .expect("session after rejected refresh");
+    assert_eq!(json_body(after).await["authenticated"], false);
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }

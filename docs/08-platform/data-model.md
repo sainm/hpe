@@ -25,6 +25,16 @@
 | Membership | 用户-范围-角色 | user_id, scope_type/id, role_id | P1 |
 | Role | 角色 | id, tenant_id, name, permissions | P1 |
 | Permission | 权限点 | id, action, resource_type | P1 |
+
+企业成员目录的 Phase 13 实际表：
+
+| 表 | 关键字段 | 约束 |
+| --- | --- | --- |
+| `enterprise_members` | id, tenant_id, subject, user_name, external_id, role, base_role, scim_json, status | `(tenant_id, subject)` 唯一；同租户 userName/externalId 唯一 |
+| `enterprise_scim_groups` | id, tenant_id, display_name, external_id, role, scim_json | 同租户 displayName 唯一；role 只允许固定 8 角色或空 |
+| `enterprise_scim_group_members` | tenant_id, group_id, member_id | 复合主键；组和成员必须属于同一租户 |
+
+`base_role` 是直接角色，`role` 是当前有效角色。组角色冲突时事务失败，不自动选择最高权限。详见 [SCIM](scim.md)。
 | Policy | 策略 | id, scope, effect, conditions, version | P1（基础） |
 | Workflow | 流程 | id, project_id, name, status, current_version_id | P1 |
 | WorkflowVersion | 不可变版本 | id, workflow_id, version, ir JSONB, hash, created_by | P1 |
@@ -96,17 +106,19 @@ erDiagram
 
 ### Schema 所有权
 
-| Schema | 所有者 | 访问 | 说明 |
-| --- | --- | --- | --- |
-| `control` | NestJS + Prisma | Control Plane | Tenant/Workspace/Project/Workflow/Version/Capability/Registry/审批/审计索引 |
-| `execution` | Rust + SQLx | Rust Runtime/Worker | Execution/NodeExecution/ExecutionEvent/Checkpoint/Artifact 元数据 |
-| `ai` | Python AI Worker | Python | Agent checkpoint（LangGraph） |
-| `audit` | Control Plane/Rust（追加） | 只读查询 | 审计存储；不由业务更新 |
-| Local SQLite | Rust Local | Local Runtime | 本地全部（单用户）；与 control/execution 语义子集 |
+Phase 13 已落地的 PostgreSQL 18 基线以两个业务 schema 为边界，migration 和 schema owner 统一为 `hpa_migrator`：
 
-- 禁止跨 schema JOIN；Control Plane 通过 gRPC 查询 Rust execution；Rust 不写 control schema。
-- 迁移：Prisma 管 control；SQLx 管 execution；Python 管 ai；CI 校验。
-- 同一 ID 前缀/租户字段；跨 schema 关联只存 ID。
+| Schema | 内容 | 当前访问 |
+| --- | --- | --- |
+| `hpa_control` | Tenant、令牌、OIDC/OAuth、成员、Worker、任务、配额、审计 | 租户/Worker/管理/审计角色按 RLS 或显式授权访问 |
+| `hpa_tenant` | Workflow、Execution、Event、Artifact、Skill、Agent、MCP、Plugin、Connector、Trigger | `tenant_id` + FORCE RLS |
+| `hpa_internal` | 租户上下文函数 | 只授予函数执行权限 |
+| Local SQLite | 当前运行中的单租户/单控制面实现 | `hpa-local` |
+
+- 租户表通过 `tenant_id` 复合键和外键保持边界；RLS policy 同时检查读与写。
+- PostgreSQL migration 由 Rust/SQLx 执行并校验 checksum；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger 及 remote marker 走 PostgreSQL，Enterprise、Worker Job 和多数 Agent/Skill 元数据仍是 SQLite。不能把部分 Repository 切换当成完整生产路由完成。
+- 未来若拆分 Control/Execution/AI schema，必须新增 migration 与读写所有权 ADR；不得在未迁移数据的情况下引入第二套语义。
+- 运维约束、角色和回滚策略见 [PostgreSQL 控制面基线](postgres-control-plane.md)。
 
 ### WorkflowVersion
 

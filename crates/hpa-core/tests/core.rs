@@ -2,7 +2,29 @@ use hpa_core::compiler;
 use hpa_core::expression::{self, ExpressionScope};
 use hpa_core::ir::Workflow;
 use hpa_core::validator;
+use proptest::prelude::*;
 use serde_json::{Value, json};
+
+fn scalar_value() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        2 => Just(Value::Null),
+        2 => any::<bool>().prop_map(Value::Bool),
+        3 => any::<i64>().prop_map(Value::from),
+        5 => "[ -~]{0,64}".prop_map(Value::String),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn yaml_roundtrip_preserves_generated_json_maps(
+        entries in prop::collection::btree_map("[A-Za-z][A-Za-z0-9_]{0,12}", scalar_value(), 0..24)
+    ) {
+        let value = Value::Object(entries.into_iter().collect());
+        let yaml = hpa_core::yaml::json_to_yaml(&value).expect("emit yaml");
+        let decoded = hpa_core::yaml::yaml_to_json(&yaml).expect("parse yaml");
+        prop_assert_eq!(decoded, value);
+    }
+}
 
 const FIXTURES: &[(&str, &str)] = &[
     (

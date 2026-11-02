@@ -7,16 +7,15 @@
 
 Phase 1–10 里 `triggers` 只是 IR 的一个字段：schema 允许、JSON 能解析、设计器能原样保存，但运行时没有任何代码读取它。结果是「Automation First」只能手动点运行——没有定时、没有外部事件入口。
 
-Phase 11 补齐两件事：
+Phase 11 补齐三件事：
 
 - **调度**：`schedule` 触发器按 cron 到点自动启动执行。
 - **入站**：`webhook` 触发器让外部系统用签名请求启动执行。
-
-`event` 与 `mcp` 保持声明兼容：`event` 会被校验器标记为“未接线”（warning），`mcp` 走 `workflow.execute` 工具，不额外启动入口。
+- **内部事件**：`event` 触发器订阅 topic，通过 `/api/events/{topic}` 启动匹配的已发布版本；`mcp` 仍走 `workflow.execute` 工具。
 
 ## 2. 配置契约
 
-`trigger.config` 由自由对象收紧为两种强类型结构，未知字段一律拒绝（`deny_unknown_fields`）。
+`trigger.config` 由自由对象收紧为强类型结构，未知字段一律拒绝（`deny_unknown_fields`）。
 
 ### 2.1 schedule
 
@@ -53,7 +52,20 @@ triggers:
 
 ### 2.3 event / mcp
 
-`event`：校验器给出 warning `TRIGGER_EVENT_NOT_WIRED`，在 `trigger_state` 里以 `enabled = 0` 存一行，控制台显示“未接线”。`mcp` 同理，入口是 MCP 的 `workflow.execute` 工具。
+```yaml
+triggers:
+  - id: invoice-created
+    type: event
+    config:
+      topic: invoice.created
+      enabled: true
+```
+
+- `topic` 省略时使用 trigger id；只允许 `[A-Za-z0-9._:-]{1,128}`。
+- 发布 `POST /api/events/{topic}` 时，所有同租户、同 topic 且 enabled 的触发器各启动一次已发布版本。
+- Event ID 幂等按订阅者记录。若一次 fan-out 只有部分订阅者成功，携带同一 Event ID 重试时只补投缺失订阅者；所有订阅者均已投递才返回 409 duplicate。
+- `X-HPA-Event-Id` 可选；同一 trigger 重复 ID 返回 409，先在触发前检查，避免生成孤立执行。
+- `mcp` 不额外启动入口，仍由 MCP `workflow.execute` 工具调用。
 
 ## 3. 调度语义
 
@@ -156,17 +168,20 @@ curl -sS -X POST "$BASE/hooks/wf_demo/github-release" \
 
 ```bash
 cargo test -p hpa-core --lib                                  # cron 与配置契约（10 个）
-cargo test -p hpa-local --bin hpa -- scheduler::              # 调度语义（5 个）
+cargo test -p hpa-local --bin hpa -- scheduler::              # 调度与部分 fan-out 语义
 cargo test -p hpa-local --test triggers                       # HTTP 端到端（2 个）
 HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase11-triggers-e2e.mjs
 ```
 
 覆盖点：
 
-- 发布后 `trigger_state` 生成 3 行（schedule / webhook / event），`event` 为禁用态；`next_fire_at` 落在 `09:00 +08:00` 边界。
+- 发布后 `trigger_state` 生成 3 行（schedule / webhook / event），三个触发器默认 enabled；`next_fire_at` 落在 `09:00 +08:00` 边界。
 - 到期 slot 触发一次并推进 `next_fire_at`；同一时刻重复 tick 不重复触发。
 - `skip` 丢弃迟到 10 分钟的 slot；`catch_up` 按 `maxCatchUp` 补齐且触顶后跳过剩余。
 - Webhook：正确签名 202 并生成执行；重复 `event_id` 409；错误签名 / 过期时间戳 / 缺签名 401；未知触发器 404；停用后 409。
+- Event：topic 发布 202 并生成执行；重复 `event_id` 409；停用后没有订阅者并返回 404。
+- Event 部分成功：两个订阅者中预投递一个后重试同一 `event_id`，只为第二个创建执行；再次重试才返回 duplicate。
+- PostgreSQL execution、start event 和 trigger fire 原子提交；重复 Event ID 在 fire 唯一约束处回滚整次 execution，不产生“有执行、无触发记录”。
 - 手动触发 200；`/api/trigger-fires` 记录每次投递。
 - 非法 cron、重复 trigger id 在网络层被 422 拒绝，错误详情含 `TRIGGER_INVALID` / `TRIGGER_ID_DUPLICATE`。
 
@@ -174,8 +189,9 @@ HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase11-triggers-e2e.mjs
 
 ## 9. 明确不做
 
-- `event` 触发器没有事件总线：校验通过但不会执行，属于显式占位。
-- 没有分布式调度：每个节点各自 tick，靠乐观锁避免重复；不做 leader 选举或外部队列。
+- 默认 Event 仍是进程内同步 fan-out + SQLite 幂等；`HPA_POSTGRES_RUNTIME=1 HPA_POSTGRES_EVENT_BUS=1` 时改为 PostgreSQL outbox 异步消费，支持崩溃重投与共享 trigger fire 去重。
+- Event Bus 当前只覆盖 Topic Event；webhook、schedule 和 MCP task 尚未统一到同一 outbox 账本，也没有 Redis/Kafka 低延迟广播。
+- `HPA_POSTGRES_SCHEDULER=1` 提供 PostgreSQL leader lease、续租和强杀接管；`HPA_POSTGRES_RUNTIME=1` 时 Workflow、trigger_state、schedule claim、trigger_fires 与 execution 均写 PostgreSQL，Event ID 去重可供多节点共享。`HPA_POSTGRES_EVENT_BUS=1` 再把 Topic Event 切到持久 outbox consumer；仍没有 Redis/Kafka 低延迟广播。
 - 时区只支持固定偏移，没有 DST 规则；跨 DST 的每日任务会偏移一小时。
 - 没有退避/抖动、并发上限、触发器级配额；限流只覆盖 Webhook 进程内滑窗。
 - Webhook 不支持 mTLS、IP 白名单、请求体 schema 校验或响应回写。

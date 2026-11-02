@@ -185,6 +185,93 @@ export interface PluginSummary {
   updatedAt: string;
 }
 
+export interface MarketplaceSourceKey {
+  keyId: string;
+  label: string;
+  validFrom?: string | null;
+  validUntil?: string | null;
+}
+
+export interface MarketplaceSource {
+  id: string;
+  label: string;
+  indexUri: string;
+  enabled: boolean;
+  lastSequence: number;
+  lastRefreshAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+  keys: MarketplaceSourceKey[];
+  packageCount: number;
+  approvedCount: number;
+  withdrawnCount: number;
+}
+
+export interface MarketplacePublisherKey extends MarketplaceSourceKey {
+  revokedAt?: string | null;
+  createdAt: string;
+}
+
+export interface MarketplacePublisher {
+  id: string;
+  name: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  keys: MarketplacePublisherKey[];
+}
+
+export interface RemoteMarketplacePackage {
+  sourceId: string;
+  pluginId: string;
+  version: string;
+  publisherId: string;
+  signerKeyId: string;
+  packageSha256: string;
+  reviewStatus: string;
+  sequence: number;
+  publishedAt?: string | null;
+  withdrawnAt?: string | null;
+  revocationReason?: string | null;
+  provenance?: {
+    kind: string;
+    statementPath: string;
+    statementSha256: string;
+    bundlePath: string;
+    bundleSha256: string;
+  } | null;
+  oci?: {
+    repository: string;
+    digest: string;
+  } | null;
+}
+
+export interface VulnerabilityReport {
+  schemaVersion: string;
+  status: "disabled" | "clean" | "vulnerable";
+  source: string;
+  checkedAt?: string;
+  databaseGeneratedAt?: string | null;
+  package: { ecosystem: string; name: string; version: string };
+  query: { ecosystem?: string | null; name: string; version: string };
+  vulnerabilities: {
+    id: string;
+    summary?: string | null;
+    modified?: string | null;
+    aliases?: string[];
+  }[];
+}
+
+export interface MarketplaceEvent {
+  sequence: number;
+  id: string;
+  at: string;
+  pluginId?: string | null;
+  version?: string | null;
+  kind: string;
+  detail: JsonValue;
+}
+
 export interface McpOverview {
   endpoint: string;
   resourceMetadata: string;

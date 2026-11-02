@@ -346,6 +346,7 @@ impl HttpExternal {
         if let Some(session) = &self.session {
             request = request.header("mcp-session-id", session);
         }
+        request = add_trace_headers(request);
         let response = request
             .json(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .send()
@@ -367,6 +368,7 @@ impl HttpExternal {
         if let Some(session) = &self.session {
             request = request.header("mcp-session-id", session);
         }
+        request = add_trace_headers(request);
         let response = request
             .json(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .send()
@@ -386,6 +388,7 @@ impl HttpExternal {
         if let Some(session) = &self.session {
             request = request.header("mcp-session-id", session);
         }
+        request = add_trace_headers(request);
         let response = request
             .json(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .send()
@@ -419,6 +422,14 @@ async fn parse_response(response: reqwest::Response) -> Result<HttpResponse, Str
         status,
         session,
         body,
+    })
+}
+
+fn add_trace_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    let mut headers = axum::http::HeaderMap::new();
+    hpa_local::telemetry::inject_current_context(&mut headers);
+    headers.iter().fold(request, |request, (name, value)| {
+        request.header(name, value)
     })
 }
 

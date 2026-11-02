@@ -1,6 +1,8 @@
 # 实施路线图
 
 > 不一次性实现整个平台。每个 Phase 有明确退出标准；未通过不进入下一阶段。周期是相对估算（假设 3-5 人全职），不是承诺日期。
+>
+> 当前完成度按本地 MVP 与完整路线图两套口径记录，见 [实现状态与验收边界](../10-quality/implementation-status.md)。
 
 ## 1. 总览
 
@@ -124,7 +126,7 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ### 本地实现状态（2026-11-01）
 
-本地 Phase 5 MVP 已实现 `hpa.plugin/v1` + Ed25519 + tar 包、安装/升级/回滚/启停/卸载、本地 Marketplace（审核/评分/撤回）、HTTP/File 核心 Connector、Agent Connector 工具审批、SBOM/许可/静态扫描门禁与 Plugin Center/Connector Center。DB/Git/MQ/S3 Connector、远程 Marketplace、OCI、发布者账号/密钥轮换与 CVE 漏洞源仍为后续目标。详见 [`docs/07-plugin/local-implementation.md`](../07-plugin/local-implementation.md)。
+本地 Phase 5 MVP 已实现 `hpa.plugin/v1` + Ed25519 + tar 包、安装/升级/回滚/启停/卸载、本地 Marketplace（审核/评分/撤回）、Agent Connector 工具审批、SBOM/许可/静态扫描门禁与 Plugin Center/Connector Center。P13-05 已增加 PostgreSQL/Git/Redis MQ/S3 Connector、签名远程/离线 Marketplace、发布者与索引 key 轮换/吊销、撤回传播、Marketplace UI、OSV/离线漏洞库和 key-based cosign/OCI digest provenance；Fulcio/Rekor keyless、Registry attestation 拉取与恶意软件情报仍为后续目标。详见 [`remote-marketplace.md`](../07-plugin/remote-marketplace.md)。
 
 ## 8. Phase 6：Enterprise & SaaS
 
@@ -168,7 +170,7 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ### 本地实现状态（2026-11-01）
 
-已实现 `core` 队列 + daemon + Worker Center + 私有部署文档。真实 daemon 集成测试完成远程 Workflow 成功、审批恢复、取消；Worker queue/daemon 单元测试与租约隔离通过。仍不做 Redis/多节点、持久 outbox、mTLS、远程凭证注入、自动扩缩容。详见 [`docs/08-platform/hybrid-workers.md`](../08-platform/hybrid-workers.md)。
+已实现 `core` 队列 + daemon + Worker Center + 私有部署文档。真实 daemon 集成测试完成远程 Workflow 成功、人工/自动审批恢复、取消；start/events/complete 使用本地持久 outbox，远程审批 SLA 由控制面处理。仍不做 Redis/多节点、mTLS、远程凭证注入、对象存储与自动扩缩容。详见 [`docs/08-platform/hybrid-workers.md`](../08-platform/hybrid-workers.md)。
 
 ## 8c. Phase 9：本地 Enterprise Browser SSO
 
@@ -183,7 +185,7 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ### 本地实现状态（2026-11-01）
 
-已实现 `browser_auth`、`oidc_verify` 与控制面路由/CSRF 接线；`/login` 与 Enterprise Center 可在浏览器完成 SSO 登录/退出并显示角色与管理员状态。EdDSA/RS256/ES256 三种算法均通过 Playwright 流程；Rust HTTP 测试覆盖 Cookie 属性、CSRF 403、state 重放、redirect 逃逸、disabled 成员、nonce 失配与登出后 401。全量 Rust 142 passed / 1 ignored；Web 10 Vitest。仍不做授权服务器、refresh token、silent renew、RP-initiated logout、SCIM/组、第三方 Cookie 或多 IdP。详见 [`docs/08-platform/browser-sso.md`](../08-platform/browser-sso.md)。
+已实现 `browser_auth`、`oidc_verify` 与控制面路由/CSRF 接线；`/login` 与 Enterprise Center 可在浏览器完成 SSO 登录/退出并显示角色与管理员状态。EdDSA/RS256/ES256 三种算法均通过 Playwright 流程；Rust HTTP 测试覆盖 Cookie 属性、CSRF 403、state 重放、redirect 逃逸、disabled 成员、nonce 失配与登出后 401。Phase 10 随后补齐独立的 OAuth AS。Phase 13 为 Browser SSO 增加 AES-GCM token-at-rest、refresh 轮换/CAS、静默续期和 RP-initiated logout，并增加 SCIM 2.0 Users/Groups 与组角色映射；仍未支持第三方 Cookie 或多 IdP。详见 [`docs/08-platform/browser-sso.md`](../08-platform/browser-sso.md) 与 [`docs/08-platform/scim.md`](../08-platform/scim.md)。
 
 ## 8d. Phase 10：内置 OAuth 2.1 授权服务器
 
@@ -213,7 +215,7 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ### 本地实现状态（2026-11-01）
 
-已实现 `crates/hpa-core/src/trigger.rs`（cron 与契约）、`crates/hpa-local/src/scheduler.rs`（调度与发火）、`hooks.rs`（入站）、`db.rs` 的 `trigger_state`/`trigger_fires`，以及 `/triggers` 页面。10 个 cron/契约单元测试、5 个调度单元测试、2 个 HTTP 集成测试通过；Playwright 覆盖建流程→发布→Webhook→手动触发→启停→界面触发，1440/607 无横向溢出。不做事件总线、分布式调度、DST 时区、mTLS/IP 白名单与远程 Worker 派发。详见 [`docs/03-workflow/triggers.md`](../03-workflow/triggers.md)。
+已实现 `crates/hpa-core/src/trigger.rs`（cron/event 契约）、`crates/hpa-local/src/scheduler.rs`（调度与发火）、`hooks.rs`（入站）、`db.rs` 的 `trigger_state`/`trigger_fires`，以及 `/triggers` 页面。`event` 通过 `/api/events/{topic}` 按租户订阅并支持事件 ID 幂等；目录通知与 HTTP 测试覆盖 schedule/webhook/event。仍不做跨进程事件总线、分布式调度、DST 时区、mTLS/IP 白名单与远程 Worker 直接派发。详见 [`docs/03-workflow/triggers.md`](../03-workflow/triggers.md)。
 
 ## 8f. Phase 12：可观测性与执行洞察
 
@@ -227,6 +229,22 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 ### 本地实现状态（2026-11-01）
 
 已实现 `crates/hpa-local/src/metrics.rs` 与 `observe.rs`、driver/scheduler 埋点、`ExecutionDetail` 时间线与设置页状态卡片。2 个指标渲染单元测试、2 个 HTTP 集成测试通过；Playwright 覆盖时间线与设置页，1440/607 无横向溢出。不做 OTLP 导出、跨进程追踪、持久化指标与可配置桶。详见 [`docs/08-platform/observability.md`](../08-platform/observability.md)。
+
+## 8g. Phase 13：生产级补全（当前目标）
+
+> 状态：**IN_PROGRESS**。P13-01～04、Connector/远程 Marketplace 和 OTLP/跨进程 trace 基线已落地并通过真实 PostgreSQL、Redis、MinIO、Git、Python 和 OTLP receiver 测试；业务 API 尚未整体切换 PostgreSQL，Python Worker 已作为显式 `python` planner 接入但未完成 PostgreSQL checkpoint/多副本/mTLS，真实 Collector 部署和外部 AI 客户端仍待验证。完整完成定义见 [Phase 13 生产级补全](phase-13-production-completion.md)。
+
+范围：
+
+- PostgreSQL 控制面、RLS、migration/import/rollback。
+- 分布式调度、可靠 outbox/队列、HA Worker lease。
+- 持久 MCP session/subscription/task 与多节点 Event Bus。
+- 可选 Python 3.13/LangGraph Worker 和 LiteLLM 网关。
+- DB/Git/MQ/S3 Connector、远程 Marketplace、发布者治理。
+- OTLP/跨进程追踪、企业认证剩余能力、mTLS 与对象存储。
+- Claude Code、Codex、GitHub Copilot/Chat 的真实端到端证据。
+
+首个里程碑：P13-01 PostgreSQL schema/RLS 契约和迁移测试。
 
 ## 9. 依赖/顺序
 

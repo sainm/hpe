@@ -59,7 +59,7 @@ Phase 12 补三件事：
 | `hpa_executions_succeeded_total` / `hpa_executions_failed_total` | gauge | `tenant` |
 | `hpa_triggers_enabled` | gauge | `tenant`、`kind` |
 
-这些值每次抓取时按租户查一次 `stats()` 与 `trigger_state` 计算；某个租户打不开只会跳过并记 warn，不会让抓取失败。
+这些值每次抓取时遍历 active tenant 的 `stats()` 与 `trigger_state`，但 Prometheus series 只保存跨租户聚合值（trigger 仅按 kind）；某个租户打不开只会跳过并记 warn，不会让抓取失败。tenant/execution ID 只允许出现在 trace attributes，不作为 Prometheus label。
 
 ### 2.5 进程
 
@@ -128,7 +128,7 @@ HPA_BASE_URL=http://127.0.0.1:8787 node scripts/phase12-observability-e2e.mjs
 
 ## 6. 明确不做
 
-- 没有 OpenTelemetry / OTLP 导出，也没有 span 关联与采样；跨进程链路（如 HTTP 节点调用外部服务）不追踪。
+- P13 已增加可选 OpenTelemetry / OTLP traces、W3C traceparent 与 Rust/Python/HTTP/MCP 跨进程关联；未启用 Collector 时保留原有 Prometheus/JSON tracing。完整配置和剩余 metrics/logs bridge 边界见 [OTLP](otlp.md)。
 - 指标只在内存里，进程重启归零；没有持久化、没有 `node_exporter` 式的进程外采集。
 - 直方图桶固定 13 档（5ms–60s），不可配置；没有 exemplars。
 - 多租户指标除 `tenant` 标签外没有配额；高基数标签（workflow id、execution id）一律不采集。

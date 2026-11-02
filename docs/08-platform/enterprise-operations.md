@@ -116,6 +116,23 @@ curl -sS -X DELETE http://127.0.0.1:8787/api/enterprise/tenants/{tenantId} \
   -d '{"confirm":true}'
 ```
 
+暂停/恢复不会删除数据，但普通 API token、OIDC 与浏览器 session 在 tenant 非 active 时会被拒绝：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8787/api/enterprise/tenants/{tenantId} \
+  -H "Authorization: Bearer $HPA_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"status":"suspended"}'
+
+# 恢复
+curl -sS -X PUT http://127.0.0.1:8787/api/enterprise/tenants/{tenantId} \
+  -H "Authorization: Bearer $HPA_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"status":"active"}'
+```
+
+内置 `local` tenant 不允许暂停；暂停时已存在的浏览器 session 会被撤销，普通 token 保留但立即无法通过 tenant active 检查。
+
 删除的精确行为：
 
 - 租户记录改为 `status=deleted`，列表不再显示。
@@ -217,7 +234,7 @@ curl -sS -X PUT http://127.0.0.1:8787/api/enterprise/oidc \
 
 ### 10.2 浏览器 SSO
 
-同一 `enterprise_oidc` 行还保存浏览器 SSO 字段：`clientId`、`authorizationEndpoint`、`tokenEndpoint`、`redirectUri`、`scopes`、`adminSubjects`、`cookieSecure`、`sessionTtlSeconds`。Authorization Code + PKCE、会话与 CSRF 的完整契约见[Browser SSO](browser-sso.md)。
+同一 `enterprise_oidc` 行还保存浏览器 SSO 字段：`clientId`、`authorizationEndpoint`、`tokenEndpoint`、`redirectUri`、`scopes`、`adminSubjects`、`cookieSecure`、`sessionTtlSeconds`、`endSessionEndpoint`、`postLogoutRedirectUri`。Authorization Code + PKCE、refresh、会话、CSRF 与 RP logout 的完整契约见[Browser SSO](browser-sso.md)。
 
 ```bash
 curl -sS -X PUT http://127.0.0.1:8787/api/enterprise/oidc \
@@ -242,7 +259,8 @@ curl -sS -X PUT http://127.0.0.1:8787/api/enterprise/oidc \
 - 浏览器 session 是额外认证路径；Bearer、Worker 与本地匿名模式语义不变。`adminSubjects` 命中 sub 或 email 时才是平台管理员，ID Token claims 不授予平台管理员。
 - HTTPS 部署必须 `cookieSecure=true`；Cookie 为 HttpOnly/SameSite=Lax。Cookie 认证的写请求必须带 `X-HPA-CSRF`。
 - 成员目录 disabled 会拒绝登录并在后续会话检查中拒绝；active 成员角色覆盖 claims。
-- 没有 refresh token、silent renew、RP-initiated logout、SCIM/组或多 IdP；session 过期即重新登录。
+- SCIM 2.0 Users/Groups 通过租户 owner/admin token 管理成员与组；映射到不同角色的多组冲突 fail-closed。详见 [SCIM](scim.md)。
+- 没有多 IdP；refresh 不可用时 session 过期后必须重新登录。
 
 ### 10.1 成员目录
 
@@ -291,7 +309,7 @@ HPA_WORKER_TOKEN="<一次性 workerToken>" \
 - 注册响应的一次性 `workerToken` 只显示一次；轮换用 `POST /api/enterprise/workers/{id}/token`，禁用会吊销 token。
 - Worker 主动出站 heartbeat/lease；30s 租约、10s 心跳建议；过期 Job 自动重排。审批等待释放槽，审批后重新入队。
 - Worker 只执行 Workflow 快照，不访问租户 SQLite、不接收凭证；远程执行通过 `remote_executions` 标记防止本地 Runtime 接管。
-- 取消对 queued/leased/waiting 立即生效，running 为 step 间协作取消；远程审批 SLA 不自动超时。
+- 取消对 queued/leased/waiting 立即生效，running 为 step 间协作取消；远程审批 SLA 由控制面自动扫描并按 `onTimeout` 恢复。
 - 完整协议见 [`hybrid-workers.md`](hybrid-workers.md)，systemd/TLS/排空/故障排查见 [`hybrid-worker-deployment.md`](hybrid-worker-deployment.md)。
 
 ## 12. 变更、重启与容量
@@ -319,11 +337,12 @@ systemctl start hpa
 ## 14. 明确不支持
 
 - 多节点、HA、自动故障切换、SQLite 多写者/共享存储；远程凭证下发/对象存储、Agent/Plugin 远程派发、持久 outbox、mTLS、Redis；远程审批 SLA 自动超时。
-- 浏览器 SSO：Authorization Code + PKCE、服务端 session、CSRF、成员目录与管理员 allowlist；仍不支持 refresh token、silent renew、RP-initiated logout、SCIM/组、第三方 Cookie 或多 IdP。
-- 组、成员自服务、密码/邀请；RLS、细粒度/自定义 RBAC、ABAC 策略引擎。
+- 浏览器 SSO：Authorization Code + PKCE、服务端 session、CSRF、成员目录与管理员 allowlist、加密 refresh token、静默续期和 RP-initiated logout。
+- SCIM 2.0：Users/Groups、filter、PATCH、ETag、租户隔离与组角色映射；Bulk/密码/复杂 filter 明确不支持。
+- 多 IdP、成员自服务、密码/邀请；RLS、细粒度/自定义 RBAC、ABAC 策略引擎。
 - 审计 WORM/防篡改、自动保留、外部 SIEM 投递；计量、账单、付费计划、租户自助注册。
 - 控制库在线备份、租户暂停/恢复 API、备份加密。
-- MCP 租户路由：`/mcp` 仍绑定 `local` 租户运行时。
+- MCP 租户路由：`/mcp` 从 PAT/OAuth token 解析租户并选择对应 Runtime；请求体不能切换租户。
 - 通过 CLI 操作租户库：`agent/skill/mcp/plugin/connector/run/doctor` 仍直接使用 `<data_dir>/hpa.db`。
 
 ## 15. 故障排查

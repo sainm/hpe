@@ -1,9 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import playwright from "file:///Users/sainm/work/demo/BootDoc/node_modules/playwright/index.js";
-
-const { chromium } = playwright;
+import { chromium } from "playwright";
 
 const baseUrl = (process.env.HPA_BASE_URL || "http://127.0.0.1:8787").replace(/\/+$/, "");
 const outDir = process.env.HPA_SHOT_DIR || "docs/assets/phase11";
@@ -62,7 +60,7 @@ function workflowIr() {
         type: "webhook",
         config: { secret: SECRET },
       },
-      { id: "order-events", type: "event", config: {} },
+      { id: "order-events", type: "event", config: { topic: "order.created" } },
     ],
   };
 }
@@ -116,6 +114,7 @@ async function main() {
     enabled: trigger.enabled,
     nextFireAt: trigger.nextFireAt,
     hasSecret: trigger.webhook?.hasSecret ?? null,
+    topic: trigger.event?.topic ?? null,
   }));
   if (triggers.length !== 3) fail(`expected 3 triggers, got ${triggers.length}`);
 
@@ -127,6 +126,33 @@ async function main() {
   });
   summary.webhook = { status: delivered.status, executionId: delivered.body?.executionId ?? null };
   if (delivered.status !== 202) fail(`webhook delivery failed: ${delivered.status}`);
+
+  const eventBody = { orderId: "ord_1", amount: 42 };
+  const eventDelivery = await jsonFetch(`${baseUrl}/api/events/order.created`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-hpa-event-id": "order-event-1",
+    },
+    body: JSON.stringify(eventBody),
+  });
+  summary.event = {
+    status: eventDelivery.status,
+    executionId: eventDelivery.body?.executions?.[0]?.executionId ?? null,
+  };
+  if (eventDelivery.status !== 202) {
+    fail(`event delivery failed: ${eventDelivery.status} ${JSON.stringify(eventDelivery.body)}`);
+  }
+  const duplicateEvent = await jsonFetch(`${baseUrl}/api/events/order.created`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-hpa-event-id": "order-event-1",
+    },
+    body: JSON.stringify(eventBody),
+  });
+  summary.event.duplicateStatus = duplicateEvent.status;
+  if (duplicateEvent.status !== 409) fail(`duplicate event must be 409, got ${duplicateEvent.status}`);
 
   const manual = await jsonFetch(`${baseUrl}/api/triggers/wf_phase11/nightly-report/fire`, {
     method: "POST",
@@ -145,6 +171,8 @@ async function main() {
   await page.getByRole("heading", { name: "トリガー", exact: true }).waitFor({ timeout: 8000 });
   await page.getByText("nightly-report").first().waitFor({ timeout: 8000 });
   await page.getByText("github-release").first().waitFor({ timeout: 8000 });
+  await page.getByText("order-events").first().waitFor({ timeout: 8000 });
+  await page.getByText("/api/events/order.created", { exact: false }).first().waitFor({ timeout: 8000 });
 
   summary.ui.triggers = await page.locator("main .rounded-md, main [class*='rounded']").count();
   summary.ui.fireRows = await page.getByText("github-release ›").count();

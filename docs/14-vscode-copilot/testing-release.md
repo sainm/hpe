@@ -74,11 +74,11 @@
 
 ```bash
 cd apps/vscode-extension
-npm install
-npm run build
+pnpm install --frozen-lockfile
+pnpm --filter workbench build
 npm test
-npm run test:host
-npm run package
+pnpm --dir apps/vscode-extension run test:host
+pnpm --dir apps/vscode-extension run package
 ```
 
 - `test:host` 使用 `/tmp` 下的临时 user-data/extensions 目录与本机 VS Code；不写用户 profile。

@@ -80,6 +80,7 @@ describe("extension manifest", () => {
         "hpa.workflow.run",
         "hpa.skill.install",
         "hpa.mcp.register",
+        "hpa.marketplace.manage",
         "hpa.settings.open",
       ]),
     );

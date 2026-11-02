@@ -23,9 +23,10 @@
 1. `hpa skill import ./invoice-audit` → 校验/扫描/写入不可变版本快照。
 2. `hpa skill test skill_invoice_audit --case smoke` → 沙箱执行脚本/断言。
 3. `hpa skill run skill_invoice_audit --input '{"invoiceId":"inv_1","items":[]}'` → 确定性脚本入口。
-4. `hpa skill publish skill_invoice_audit` → 许可/测试门禁后发布；`hpa skill export skill_invoice_audit --target claude` 导出。
-5. 产物写入 `~/.hpa/artifacts/<sha256>`；审计 `~/.hpa/logs/audit.jsonl`。
-6. 断网重跑，结果一致（确定性入口）。Agent 加载 Skill（需模型）属于 Phase 4。
+4. `hpa skill sign skill_invoice_audit` → 用本地 Ed25519 密钥签名内容哈希；Skill Center/API 也可编辑文本并生成新版本。
+5. `hpa skill publish skill_invoice_audit` → 许可/测试/签名完整性门禁后发布；`hpa skill export skill_invoice_audit --target claude` 导出。
+6. 产物写入 `~/.hpa/artifacts/<sha256>`；审计 `~/.hpa/logs/audit.jsonl`。
+7. 断网重跑，结果一致（确定性入口）。Agent 加载 Skill（需模型）属于 Phase 4。
 
 ## 4. 目录与注册
 
@@ -34,11 +35,14 @@
 ├── hpa.db                 # skills / skill_versions / skill_files / skill_runs
 ├── artifacts/<sha256>     # 内容寻址产物
 ├── logs/audit.jsonl       # 执行审计
+├── keys/plugin-ed25519.key # 本地 Skill/Plugin Ed25519 私钥（0600）
+├── skills/drafts/         # Skill Center 编辑生成的临时源目录
+├── skills/signatures/     # 按 skill/version 保存的签名记录
 └── tmp/                   # 执行临时工作区（运行后清理）
 ```
 
 - 本地 Registry（SQLite）记录 Skill/版本/内容哈希/许可/测试/运行；版本快照文件以 BLOB 保存。
-- 版本不可变；修改源目录后以新版本重新导入。
+- 版本不可变；Skill Center 编辑必须提升版本并由后端写入新草稿目录。
 - 导出为标准目录后可放入 `~/.claude/skills/<name>/`、`$CODEX_HOME/skills/<name>/` 或项目内 `.agents/skills/`。
 
 ## 5. 无模型模式

@@ -1,6 +1,13 @@
 use std::path::Path;
 
 use hpa_core::runtime::{ExecutionEvent, ExecutionState, ExecutionStatus};
+use hpa_local::postgres_execution::{
+    ArtifactRecord, ExecutionLeaseRecord, ExecutionRecord, PostgresExecutionError,
+    PostgresExecutionStore, WorkflowRecord, WorkflowVersionRecord,
+};
+use hpa_local::postgres_trigger::{
+    PostgresTriggerError, PostgresTriggerStore, TriggerFireRecord, TriggerRecord, TriggerSeedRecord,
+};
 use hpa_skill::{RunOutcome, SkillFile, SkillReport, SkillSnapshot};
 use serde::Serialize;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -22,6 +29,10 @@ pub enum DbError {
     SkillVersionFrozen { skill_id: String, version: String },
     #[error("agent version `{agent_id}@{version}` is frozen")]
     AgentVersionFrozen { agent_id: String, version: String },
+    #[error("PostgreSQL execution error: {0}")]
+    PostgresExecution(String),
+    #[error("PostgreSQL trigger error: {0}")]
+    PostgresTrigger(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -29,6 +40,8 @@ pub type DbResult<T> = Result<T, DbError>;
 #[derive(Clone)]
 pub struct Db {
     pub pool: SqlitePool,
+    postgres_execution: Option<PostgresExecutionStore>,
+    postgres_trigger: Option<PostgresTriggerStore>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -45,12 +58,55 @@ pub struct WorkflowRow {
     pub updated_at: String,
 }
 
+impl From<WorkflowRecord> for WorkflowRow {
+    fn from(record: WorkflowRecord) -> Self {
+        Self {
+            id: record.id,
+            name: record.name,
+            version: record.version,
+            description: record.description,
+            published: record.published,
+            ir_json: record.ir_json,
+            yaml: record.yaml,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<&WorkflowRow> for WorkflowRecord {
+    fn from(row: &WorkflowRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            version: row.version.clone(),
+            description: row.description.clone(),
+            published: row.published,
+            ir_json: row.ir_json.clone(),
+            yaml: row.yaml.clone(),
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct WorkflowVersionRow {
     pub version: String,
     pub registry_version: String,
     pub ir_json: String,
     pub created_at: String,
+}
+
+impl From<WorkflowVersionRecord> for WorkflowVersionRow {
+    fn from(record: WorkflowVersionRecord) -> Self {
+        Self {
+            version: record.version,
+            registry_version: record.registry_version,
+            ir_json: record.ir_json,
+            created_at: record.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -243,6 +299,32 @@ pub struct AgentApprovalRow {
     pub used_at: Option<String>,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct AgentToolCallRow {
+    pub session_id: String,
+    pub call_id: String,
+    pub idempotency_key: String,
+    pub tool_name: String,
+    pub request_hash: String,
+    pub status: String,
+    pub response_json: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, FromRow, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarketplaceEventRow {
+    pub sequence: i64,
+    pub id: String,
+    pub at: String,
+    pub plugin_id: Option<String>,
+    pub version: Option<String>,
+    pub kind: String,
+    pub detail_json: String,
+}
+
 #[derive(Debug, Clone, FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionRow {
@@ -256,6 +338,40 @@ pub struct ExecutionRow {
     pub error_json: Option<String>,
     pub started_at: String,
     pub updated_at: String,
+}
+
+impl From<ExecutionRecord> for ExecutionRow {
+    fn from(record: ExecutionRecord) -> Self {
+        Self {
+            id: record.id,
+            workflow_id: record.workflow_id,
+            workflow_version: record.workflow_version,
+            status: record.status,
+            state_json: record.state_json,
+            workflow_json: record.workflow_json,
+            output_json: record.output_json,
+            error_json: record.error_json,
+            started_at: record.started_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<&ExecutionRow> for ExecutionRecord {
+    fn from(row: &ExecutionRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            workflow_id: row.workflow_id.clone(),
+            workflow_version: row.workflow_version.clone(),
+            status: row.status.clone(),
+            state_json: row.state_json.clone(),
+            workflow_json: row.workflow_json.clone(),
+            output_json: row.output_json.clone(),
+            error_json: row.error_json.clone(),
+            started_at: row.started_at.clone(),
+            updated_at: row.updated_at.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -274,6 +390,21 @@ pub struct ArtifactRow {
     pub size: i64,
     pub content_json: String,
     pub created_at: String,
+}
+
+impl From<ArtifactRecord> for ArtifactRow {
+    fn from(record: ArtifactRecord) -> Self {
+        Self {
+            id: record.id,
+            execution_id: record.execution_id,
+            name: record.name,
+            kind: record.kind,
+            mime_type: record.mime_type,
+            size: record.size,
+            content_json: record.content_json,
+            created_at: record.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +434,24 @@ pub struct TriggerStateRow {
     pub updated_at: String,
 }
 
+impl From<TriggerRecord> for TriggerStateRow {
+    fn from(record: TriggerRecord) -> Self {
+        Self {
+            workflow_id: record.workflow_id,
+            trigger_id: record.trigger_id,
+            kind: record.kind,
+            config_json: record.config_json,
+            workflow_version: record.workflow_version,
+            enabled: record.enabled,
+            next_fire_at: record.next_fire_at,
+            last_fire_at: record.last_fire_at,
+            last_execution_id: record.last_execution_id,
+            last_status: record.last_status,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TriggerFireRow {
@@ -316,6 +465,40 @@ pub struct TriggerFireRow {
     pub status: String,
     pub event_id: Option<String>,
     pub detail_json: Option<String>,
+}
+
+impl From<TriggerFireRecord> for TriggerFireRow {
+    fn from(record: TriggerFireRecord) -> Self {
+        Self {
+            id: record.id,
+            workflow_id: record.workflow_id,
+            trigger_id: record.trigger_id,
+            kind: record.kind,
+            fired_at: record.fired_at,
+            scheduled_at: record.scheduled_at,
+            execution_id: record.execution_id,
+            status: record.status,
+            event_id: record.event_id,
+            detail_json: record.detail_json,
+        }
+    }
+}
+
+impl From<&TriggerFireRow> for TriggerFireRecord {
+    fn from(row: &TriggerFireRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            workflow_id: row.workflow_id.clone(),
+            trigger_id: row.trigger_id.clone(),
+            kind: row.kind.clone(),
+            fired_at: row.fired_at.clone(),
+            scheduled_at: row.scheduled_at.clone(),
+            execution_id: row.execution_id.clone(),
+            status: row.status.clone(),
+            event_id: row.event_id.clone(),
+            detail_json: row.detail_json.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -552,12 +735,88 @@ const SCHEMA: &[&str] = &[
         used_at TEXT
     )",
     "CREATE INDEX IF NOT EXISTS idx_agent_approvals_status ON agent_approvals(status, created_at DESC)",
+    "CREATE TABLE IF NOT EXISTS agent_tool_calls (
+        session_id TEXT NOT NULL,
+        call_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_json TEXT,
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (session_id, call_id),
+        UNIQUE (session_id, idempotency_key),
+        FOREIGN KEY (session_id) REFERENCES agent_sessions(id) ON DELETE CASCADE
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_status
+        ON agent_tool_calls(status, updated_at)",
     "CREATE TABLE IF NOT EXISTS plugin_trusted_keys (
         key_id TEXT PRIMARY KEY,
         public_key TEXT NOT NULL,
         label TEXT NOT NULL,
         trust TEXT NOT NULL,
         created_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS plugin_publishers (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'suspended')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS plugin_publisher_keys (
+        publisher_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        valid_from TEXT,
+        valid_until TEXT,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (publisher_id, key_id),
+        FOREIGN KEY (publisher_id) REFERENCES plugin_publishers(id) ON DELETE CASCADE
+    )",
+    "CREATE TABLE IF NOT EXISTS marketplace_sources (
+        id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        index_uri TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_sequence INTEGER NOT NULL DEFAULT 0,
+        last_refresh_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS marketplace_source_keys (
+        source_id TEXT NOT NULL,
+        key_id TEXT NOT NULL,
+        public_key TEXT NOT NULL,
+        label TEXT NOT NULL,
+        valid_from TEXT,
+        valid_until TEXT,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (source_id, key_id),
+        FOREIGN KEY (source_id) REFERENCES marketplace_sources(id) ON DELETE CASCADE
+    )",
+    "CREATE TABLE IF NOT EXISTS marketplace_remote_packages (
+        source_id TEXT NOT NULL,
+        plugin_id TEXT NOT NULL,
+        version TEXT NOT NULL,
+        publisher_id TEXT NOT NULL,
+        signer_key_id TEXT NOT NULL,
+        package_sha256 TEXT NOT NULL,
+        package_path TEXT NOT NULL,
+        review_status TEXT NOT NULL,
+        index_sequence INTEGER NOT NULL,
+        published_at TEXT,
+        withdrawn_at TEXT,
+        revocation_reason TEXT,
+        provenance_json TEXT,
+        oci_json TEXT,
+        PRIMARY KEY (source_id, plugin_id, version),
+        FOREIGN KEY (source_id) REFERENCES marketplace_sources(id) ON DELETE CASCADE
     )",
     "CREATE TABLE IF NOT EXISTS plugin_packages (
         plugin_id TEXT NOT NULL,
@@ -631,6 +890,17 @@ const SCHEMA: &[&str] = &[
         detail_json TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_plugin_events_at ON plugin_events(at DESC)",
+    "CREATE TABLE IF NOT EXISTS marketplace_event_stream (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        at TEXT NOT NULL,
+        plugin_id TEXT,
+        version TEXT,
+        kind TEXT NOT NULL,
+        detail_json TEXT NOT NULL
+    )",
+    "CREATE INDEX IF NOT EXISTS idx_marketplace_event_stream_at
+        ON marketplace_event_stream(at)",
     "CREATE TABLE IF NOT EXISTS connector_definitions (
         connector_id TEXT NOT NULL,
         version TEXT NOT NULL,
@@ -710,10 +980,39 @@ impl Db {
         }
         ensure_version_columns(&pool).await?;
         ensure_plugin_columns(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            postgres_execution: None,
+            postgres_trigger: None,
+        })
+    }
+
+    pub fn with_postgres_execution(
+        mut self,
+        pool: sqlx::postgres::PgPool,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        let tenant_id = tenant_id.into();
+        self.postgres_execution = Some(PostgresExecutionStore::new(pool.clone(), &tenant_id));
+        self.postgres_trigger = Some(PostgresTriggerStore::new(pool, tenant_id));
+        self
+    }
+
+    fn map_postgres_execution(error: PostgresExecutionError) -> DbError {
+        DbError::PostgresExecution(error.to_string())
+    }
+
+    fn map_postgres_trigger(error: PostgresTriggerError) -> DbError {
+        DbError::PostgresTrigger(error.to_string())
     }
 
     pub async fn upsert_workflow(&self, row: &WorkflowRow) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .upsert_workflow(&WorkflowRecord::from(row))
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         sqlx::query(
             "INSERT INTO workflows (id, name, version, description, published, ir_json, yaml, created_at, updated_at)
              VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
@@ -744,6 +1043,21 @@ impl Db {
         row: &WorkflowRow,
         registry_version: &str,
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .publish_workflow(&WorkflowRecord::from(row), registry_version)
+                .await
+                .map_err(|error| match error {
+                    PostgresExecutionError::WorkflowSnapshotConflict {
+                        workflow_id,
+                        version,
+                    } => DbError::VersionFrozen {
+                        workflow_id,
+                        version,
+                    },
+                    other => Self::map_postgres_execution(other),
+                });
+        }
         let mut tx = self.pool.begin().await?;
         let existing: Option<(String,)> = sqlx::query_as(
             "SELECT ir_json FROM workflow_versions WHERE workflow_id = ? AND version = ?",
@@ -782,6 +1096,13 @@ impl Db {
     }
 
     pub async fn list_workflows(&self) -> DbResult<Vec<WorkflowRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_workflows()
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, WorkflowRow>(
             "SELECT id, name, version, description, published, ir_json, yaml, created_at, updated_at
              FROM workflows ORDER BY updated_at DESC",
@@ -791,6 +1112,13 @@ impl Db {
     }
 
     pub async fn get_workflow(&self, id: &str) -> DbResult<Option<WorkflowRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .get_workflow(id)
+                .await
+                .map(|row| row.map(Into::into))
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, WorkflowRow>(
             "SELECT id, name, version, description, published, ir_json, yaml, created_at, updated_at
              FROM workflows WHERE id = ?",
@@ -801,6 +1129,13 @@ impl Db {
     }
 
     pub async fn list_versions(&self, workflow_id: &str) -> DbResult<Vec<WorkflowVersionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_versions(workflow_id)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, WorkflowVersionRow>(
             "SELECT version, registry_version, ir_json, created_at
              FROM workflow_versions WHERE workflow_id = ? ORDER BY created_at DESC",
@@ -815,6 +1150,13 @@ impl Db {
         workflow_id: &str,
         version: &str,
     ) -> DbResult<Option<WorkflowVersionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .get_workflow_version(workflow_id, version)
+                .await
+                .map(|row| row.map(Into::into))
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, WorkflowVersionRow>(
             "SELECT version, registry_version, ir_json, created_at
              FROM workflow_versions WHERE workflow_id = ? AND version = ?",
@@ -1118,6 +1460,12 @@ impl Db {
         row: &ExecutionRow,
         start_event: &ExecutionEvent,
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .insert_execution(&ExecutionRecord::from(row), start_event)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         let event_json = serde_json::to_string(start_event)?;
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -1146,11 +1494,86 @@ impl Db {
         Ok(())
     }
 
+    pub async fn insert_execution_with_trigger(
+        &self,
+        row: &ExecutionRow,
+        start_event: &ExecutionEvent,
+        fire: &TriggerFireRow,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .insert_execution_with_trigger(
+                    &ExecutionRecord::from(row),
+                    start_event,
+                    &TriggerFireRecord::from(fire),
+                )
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        let event_json = serde_json::to_string(start_event)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO executions (id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.workflow_id)
+        .bind(&row.workflow_version)
+        .bind(&row.status)
+        .bind(&row.state_json)
+        .bind(&row.workflow_json)
+        .bind(&row.output_json)
+        .bind(&row.error_json)
+        .bind(&row.started_at)
+        .bind(&row.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO events (execution_id, sequence, payload_json) VALUES (?, ?, ?)")
+            .bind(&start_event.execution_id)
+            .bind(start_event.sequence as i64)
+            .bind(event_json)
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO trigger_fires
+             (id, workflow_id, trigger_id, kind, fired_at, scheduled_at, execution_id, status,
+              event_id, detail_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(trigger_id, event_id) WHERE event_id IS NOT NULL DO NOTHING",
+        )
+        .bind(&fire.id)
+        .bind(&fire.workflow_id)
+        .bind(&fire.trigger_id)
+        .bind(&fire.kind)
+        .bind(&fire.fired_at)
+        .bind(&fire.scheduled_at)
+        .bind(&fire.execution_id)
+        .bind(&fire.status)
+        .bind(&fire.event_id)
+        .bind(&fire.detail_json)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if !inserted {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn save_execution(
         &self,
         state: &ExecutionState,
         events: &[ExecutionEvent],
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .save_execution(state, events)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         let state_json = serde_json::to_string(state)?;
         let output_json = state
             .output
@@ -1191,7 +1614,84 @@ impl Db {
         Ok(())
     }
 
+    pub async fn acquire_execution_lease(
+        &self,
+        execution_id: &str,
+        holder_id: &str,
+        ttl_seconds: i32,
+    ) -> DbResult<Option<ExecutionLeaseRecord>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .acquire_execution_lease(execution_id, holder_id, ttl_seconds)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        let expires_at = (time::OffsetDateTime::now_utc()
+            + time::Duration::seconds(ttl_seconds as i64))
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+        Ok(Some(ExecutionLeaseRecord {
+            holder_id: holder_id.to_string(),
+            fencing_token: 0,
+            expires_at,
+        }))
+    }
+
+    pub async fn renew_execution_lease(
+        &self,
+        execution_id: &str,
+        holder_id: &str,
+        fencing_token: i64,
+        ttl_seconds: i32,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .renew_execution_lease(execution_id, holder_id, fencing_token, ttl_seconds)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(true)
+    }
+
+    pub async fn release_execution_lease(
+        &self,
+        execution_id: &str,
+        holder_id: &str,
+        fencing_token: i64,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .release_execution_lease(execution_id, holder_id, fencing_token)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(true)
+    }
+
+    pub async fn save_execution_fenced(
+        &self,
+        state: &ExecutionState,
+        events: &[ExecutionEvent],
+        holder_id: &str,
+        fencing_token: i64,
+    ) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .save_execution_fenced(state, events, holder_id, fencing_token)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        self.save_execution(state, events).await
+    }
+
     pub async fn get_execution(&self, id: &str) -> DbResult<Option<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .get_execution(id)
+                .await
+                .map(|row| row.map(Into::into))
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ExecutionRow>(
             "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at
              FROM executions WHERE id = ?",
@@ -1202,6 +1702,13 @@ impl Db {
     }
 
     pub async fn list_executions(&self, limit: i64) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_executions(limit)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ExecutionRow>(
             "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at
              FROM executions ORDER BY started_at DESC LIMIT ?",
@@ -1217,6 +1724,12 @@ impl Db {
         after: i64,
         limit: i64,
     ) -> DbResult<Vec<ExecutionEvent>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_events(execution_id, after, limit)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         let rows = sqlx::query_as::<_, EventRow>(
             "SELECT payload_json FROM events WHERE execution_id = ? AND sequence > ?
              ORDER BY sequence ASC LIMIT ?",
@@ -1234,6 +1747,13 @@ impl Db {
     }
 
     pub async fn running_executions(&self) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .running_executions()
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ExecutionRow>(
             "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at
              FROM executions
@@ -1246,6 +1766,13 @@ impl Db {
     }
 
     pub async fn waiting_executions(&self) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .waiting_executions()
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ExecutionRow>(
             "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at
              FROM executions WHERE status = 'waiting_approval' ORDER BY started_at ASC",
@@ -1255,6 +1782,13 @@ impl Db {
     }
 
     pub async fn waiting_local_executions(&self) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .waiting_local_executions()
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ExecutionRow>(
             "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at
              FROM executions
@@ -1267,6 +1801,12 @@ impl Db {
     }
 
     pub async fn mark_remote_execution(&self, execution_id: &str, worker_id: &str) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .mark_remote_execution(execution_id, worker_id)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         sqlx::query(
             "INSERT INTO remote_executions (execution_id, worker_id, created_at)
              VALUES (?, ?, ?) ON CONFLICT(execution_id) DO NOTHING",
@@ -1284,6 +1824,12 @@ impl Db {
     }
 
     pub async fn is_remote_execution(&self, execution_id: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .is_remote_execution(execution_id)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         let found: Option<String> =
             sqlx::query_scalar("SELECT execution_id FROM remote_executions WHERE execution_id = ?")
                 .bind(execution_id)
@@ -1293,6 +1839,12 @@ impl Db {
     }
 
     pub async fn save_output_artifact(&self, state: &ExecutionState) -> DbResult<()> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .save_output_artifact(state)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
         let Some(output) = &state.output else {
             return Ok(());
         };
@@ -1320,6 +1872,13 @@ impl Db {
     }
 
     pub async fn list_artifacts(&self, execution_id: Option<&str>) -> DbResult<Vec<ArtifactRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_artifacts(execution_id)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
         let rows =
             match execution_id {
                 Some(id) => sqlx::query_as::<_, ArtifactRow>(
@@ -1340,6 +1899,13 @@ impl Db {
     }
 
     pub async fn get_artifact(&self, id: &str) -> DbResult<Option<ArtifactRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .get_artifact(id)
+                .await
+                .map(|row| row.map(Into::into))
+                .map_err(Self::map_postgres_execution);
+        }
         Ok(sqlx::query_as::<_, ArtifactRow>(
             "SELECT id, execution_id, name, kind, mime_type, size, content_json, created_at
              FROM artifacts WHERE id = ?",
@@ -1350,9 +1916,30 @@ impl Db {
     }
 
     pub async fn stats(&self) -> DbResult<Stats> {
-        let workflows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM workflows")
-            .fetch_one(&self.pool)
-            .await?;
+        let workflows = if let Some(store) = self.postgres_execution.as_ref() {
+            store
+                .workflow_count()
+                .await
+                .map_err(Self::map_postgres_execution)?
+        } else {
+            sqlx::query_scalar("SELECT COUNT(*) FROM workflows")
+                .fetch_one(&self.pool)
+                .await?
+        };
+        if let Some(store) = self.postgres_execution.as_ref() {
+            let (executions, running, waiting_approval, succeeded, failed) = store
+                .execution_counts()
+                .await
+                .map_err(Self::map_postgres_execution)?;
+            return Ok(Stats {
+                workflows,
+                executions,
+                running,
+                waiting_approval,
+                succeeded,
+                failed,
+            });
+        }
         let executions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM executions")
             .fetch_one(&self.pool)
             .await?;
@@ -1380,6 +1967,49 @@ impl Db {
             succeeded,
             failed,
         })
+    }
+
+    pub async fn execution_count_since(&self, date_prefix: &str) -> DbResult<i64> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .execution_count_since(date_prefix)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        sqlx::query_scalar("SELECT COUNT(*) FROM executions WHERE started_at LIKE ?")
+            .bind(format!("{date_prefix}%"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::from)
+    }
+
+    pub async fn active_execution_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .active_execution_count()
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM executions
+             WHERE status IN ('running', 'waiting_approval')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(DbError::from)
+    }
+
+    pub async fn workflow_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .workflow_count()
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        sqlx::query_scalar("SELECT COUNT(*) FROM workflows")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(DbError::from)
     }
 
     pub async fn create_mcp_token(
@@ -2060,6 +2690,93 @@ impl Db {
         .await?;
         Ok(result.rows_affected())
     }
+
+    pub async fn get_agent_tool_call(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> DbResult<Option<AgentToolCallRow>> {
+        Ok(sqlx::query_as::<_, AgentToolCallRow>(
+            "SELECT session_id, call_id, idempotency_key, tool_name, request_hash, status,
+                    response_json, error, created_at, updated_at
+             FROM agent_tool_calls WHERE session_id = ? AND call_id = ?",
+        )
+        .bind(session_id)
+        .bind(call_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn begin_agent_tool_call(&self, row: &AgentToolCallRow) -> DbResult<bool> {
+        let result = sqlx::query(
+            "INSERT INTO agent_tool_calls
+             (session_id, call_id, idempotency_key, tool_name, request_hash, status,
+              response_json, error, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, 'in_progress', NULL, NULL, ?, ?)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&row.session_id)
+        .bind(&row.call_id)
+        .bind(&row.idempotency_key)
+        .bind(&row.tool_name)
+        .bind(&row.request_hash)
+        .bind(&row.created_at)
+        .bind(&row.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn finish_agent_tool_call(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        status: &str,
+        response_json: Option<&str>,
+        error: Option<&str>,
+        updated_at: &str,
+    ) -> DbResult<bool> {
+        let result = sqlx::query(
+            "UPDATE agent_tool_calls
+             SET status = ?, response_json = ?, error = ?, updated_at = ?
+             WHERE session_id = ? AND call_id = ? AND status = 'in_progress'",
+        )
+        .bind(status)
+        .bind(response_json)
+        .bind(error)
+        .bind(updated_at)
+        .bind(session_id)
+        .bind(call_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_marketplace_events(
+        &self,
+        after: i64,
+        limit: i64,
+    ) -> DbResult<Vec<MarketplaceEventRow>> {
+        Ok(sqlx::query_as::<_, MarketplaceEventRow>(
+            "SELECT sequence, id, at, plugin_id, version, kind, detail_json
+             FROM marketplace_event_stream
+             WHERE sequence > ?
+             ORDER BY sequence ASC
+             LIMIT ?",
+        )
+        .bind(after.max(0))
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn latest_marketplace_event_sequence(&self) -> DbResult<i64> {
+        Ok(
+            sqlx::query_scalar("SELECT COALESCE(max(sequence), 0) FROM marketplace_event_stream")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
 }
 
 pub fn status_text(status: ExecutionStatus) -> &'static str {
@@ -2140,6 +2857,23 @@ async fn ensure_plugin_columns(pool: &SqlitePool) -> DbResult<()> {
             .execute(pool)
             .await?;
     }
+    let remote_columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('marketplace_remote_packages')")
+            .fetch_all(pool)
+            .await?;
+    if !remote_columns
+        .iter()
+        .any(|column| column == "provenance_json")
+    {
+        sqlx::query("ALTER TABLE marketplace_remote_packages ADD COLUMN provenance_json TEXT")
+            .execute(pool)
+            .await?;
+    }
+    if !remote_columns.iter().any(|column| column == "oci_json") {
+        sqlx::query("ALTER TABLE marketplace_remote_packages ADD COLUMN oci_json TEXT")
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -2153,6 +2887,22 @@ impl Db {
         seeds: &[TriggerSeed],
         now: &str,
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            let records = seeds
+                .iter()
+                .map(|seed| TriggerSeedRecord {
+                    trigger_id: seed.trigger_id.clone(),
+                    kind: seed.kind.clone(),
+                    config_json: seed.config_json.clone(),
+                    enabled: seed.enabled,
+                    next_fire_at: seed.next_fire_at,
+                })
+                .collect::<Vec<_>>();
+            return store
+                .sync_triggers(workflow_id, version, &records, now)
+                .await
+                .map_err(Self::map_postgres_trigger);
+        }
         let mut tx = self.pool.begin().await?;
         let existing: Vec<String> =
             sqlx::query_scalar("SELECT trigger_id FROM trigger_state WHERE workflow_id = ?")
@@ -2199,6 +2949,13 @@ impl Db {
     }
 
     pub async fn list_triggers(&self) -> DbResult<Vec<TriggerStateRow>> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .list_triggers()
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_trigger);
+        }
         Ok(sqlx::query_as::<_, TriggerStateRow>(
             "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
                     next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
@@ -2213,6 +2970,13 @@ impl Db {
         workflow_id: &str,
         trigger_id: &str,
     ) -> DbResult<Option<TriggerStateRow>> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .get_trigger(workflow_id, trigger_id)
+                .await
+                .map(|row| row.map(Into::into))
+                .map_err(Self::map_postgres_trigger);
+        }
         Ok(sqlx::query_as::<_, TriggerStateRow>(
             "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
                     next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
@@ -2225,6 +2989,13 @@ impl Db {
     }
 
     pub async fn due_triggers(&self, now_ms: i64, limit: i64) -> DbResult<Vec<TriggerStateRow>> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .due_triggers(now_ms, limit)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_trigger);
+        }
         Ok(sqlx::query_as::<_, TriggerStateRow>(
             "SELECT workflow_id, trigger_id, kind, config_json, workflow_version, enabled,
                     next_fire_at, last_fire_at, last_execution_id, last_status, updated_at
@@ -2250,6 +3021,19 @@ impl Db {
         next_fire_at: Option<i64>,
         updated_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .claim_schedule_slot(
+                    workflow_id,
+                    trigger_id,
+                    expected_next,
+                    now_ms,
+                    next_fire_at,
+                    updated_at,
+                )
+                .await
+                .map_err(Self::map_postgres_trigger);
+        }
         let updated = sqlx::query(
             "UPDATE trigger_state
              SET next_fire_at = ?, last_fire_at = ?, updated_at = ?
@@ -2274,6 +3058,12 @@ impl Db {
         next_fire_at: Option<i64>,
         updated_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .set_trigger_enabled(workflow_id, trigger_id, enabled, next_fire_at, updated_at)
+                .await
+                .map_err(Self::map_postgres_trigger);
+        }
         let updated = sqlx::query(
             "UPDATE trigger_state SET enabled = ?, next_fire_at = ?, updated_at = ?
              WHERE workflow_id = ? AND trigger_id = ?",
@@ -2295,6 +3085,12 @@ impl Db {
         execution_id: &str,
         status: &str,
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .note_trigger_execution(workflow_id, trigger_id, execution_id, status)
+                .await
+                .map_err(Self::map_postgres_trigger);
+        }
         sqlx::query(
             "UPDATE trigger_state SET last_execution_id = ?, last_status = ?
              WHERE workflow_id = ? AND trigger_id = ?",
@@ -2308,31 +3104,38 @@ impl Db {
         Ok(())
     }
 
-    /// Returns false when the `event_id` was already recorded for this trigger.
-    pub async fn record_trigger_fire(&self, row: &TriggerFireRow) -> DbResult<bool> {
-        let inserted = sqlx::query(
-            "INSERT INTO trigger_fires
-             (id, workflow_id, trigger_id, kind, fired_at, scheduled_at, execution_id, status,
-              event_id, detail_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(trigger_id, event_id) WHERE event_id IS NOT NULL DO NOTHING",
+    pub async fn trigger_event_delivered(
+        &self,
+        trigger_id: &str,
+        event_id: &str,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .trigger_event_delivered(trigger_id, event_id)
+                .await
+                .map_err(Self::map_postgres_trigger);
+        }
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                SELECT 1 FROM trigger_fires WHERE trigger_id = ? AND event_id = ?
+             )",
         )
-        .bind(&row.id)
-        .bind(&row.workflow_id)
-        .bind(&row.trigger_id)
-        .bind(&row.kind)
-        .bind(&row.fired_at)
-        .bind(&row.scheduled_at)
-        .bind(&row.execution_id)
-        .bind(&row.status)
-        .bind(&row.event_id)
-        .bind(&row.detail_json)
-        .execute(&self.pool)
-        .await?;
-        Ok(inserted.rows_affected() > 0)
+        .bind(trigger_id)
+        .bind(event_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value| value != 0)
+        .map_err(DbError::from)
     }
 
     pub async fn list_trigger_fires(&self, limit: i64) -> DbResult<Vec<TriggerFireRow>> {
+        if let Some(store) = self.postgres_trigger.as_ref() {
+            return store
+                .list_trigger_fires(limit)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_trigger);
+        }
         Ok(sqlx::query_as::<_, TriggerFireRow>(
             "SELECT id, workflow_id, trigger_id, kind, fired_at, scheduled_at, execution_id,
                     status, event_id, detail_json

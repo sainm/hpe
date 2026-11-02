@@ -225,14 +225,14 @@ async fn metrics_and_readiness_reflect_runtime_activity() {
 
     for expected in [
         "# TYPE hpa_workflow_executions_total counter",
-        "hpa_workflow_executions_total{status=\"succeeded\",tenant=\"local\"}",
+        "hpa_workflow_executions_total{status=\"succeeded\"}",
         "# TYPE hpa_workflow_execution_seconds histogram",
         "hpa_workflow_execution_seconds_bucket{le=\"+Inf\"}",
         "hpa_node_executions_total{status=\"succeeded\",type=\"transform\"}",
         "hpa_node_seconds_bucket{type=\"transform\",le=\"+Inf\"}",
         "hpa_http_requests_total{",
         "route=\"/api/health\"",
-        "hpa_workflows_total{tenant=\"local\"} 1",
+        "hpa_workflows_total 1",
         "hpa_scheduler_ticks_total",
         "hpa_scheduler_last_tick_timestamp_seconds",
         "hpa_build_info{version=",

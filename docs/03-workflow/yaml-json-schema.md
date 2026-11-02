@@ -7,12 +7,12 @@
 | 视图 | 用途 | 语义来源 | 文本保真 |
 | --- | --- | --- | --- |
 | Canvas | 可视化编辑/布局 | IR | 不适用 |
-| YAML | 人手编辑/评审/版本控制 | IR | CST + 注释锚点 |
+| YAML | 人手编辑/评审/版本控制 | IR | 原始文本哈希 + SourceMap；当前不做注释保留式发射 |
 | JSON | API/存储/机器交换 | IR | 仅规范文本 |
 
 ## 2. Schema
 
-- JSON Schema 2020-12；`$id: https://hpa.dev/schema/workflow/v1`。
+- JSON Schema 2020-12；Workflow `$id: https://hpa.dev/schema/ir/v0.1/workflow.schema.json`。
 - IR 自身、节点 config、输入/输出、事件、能力描述分别有 schema。
 - YAML 使用同一 schema 的“JSON 兼容子集”，不定义第二套模型。
 - 发布时生成 `workflow.schema.json` 与 `node-registry.schema.json`；SDK 从 schema 生成类型。
@@ -66,7 +66,7 @@ assert text === text'
 ### L2 编辑保真（尽力）
 
 - YAML 编辑使用 `yaml` 包的 Document/CST API，仅替换被修改的标量/节点，保留其他注释/空白/引号风格。
-- 每次编辑记录 `SourceMap`：IR 路径 ↔ 文本区间（byte offset/line/col）。
+- 每次解析返回 `SourceMap`：IR 路径 ↔ 文本区间（UTF-8 byte offset/line/column），见 `hpa_core::yaml::yaml_to_json_with_source_map`。
 - Canvas 编辑重新生成规范文本；对可锚定的注释（绑定到节点 id/字段路径）尽量保留；无法锚定的注释移入 sidecar `annotations`，UI 提示。
 - 不承诺：YAML 锚点/别名/复杂多行折叠的原始风格；Canvas 编辑后的空白/排序。
 

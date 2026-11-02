@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import type { CopilotIntegration } from "./copilot";
 import type { HpaServices } from "./contracts";
 import { RuntimeApiError } from "./runtime/client";
+import { registerMarketplaceCommands } from "./marketplace";
 import type {
   ApprovalSummary,
   Artifact,
@@ -228,6 +229,7 @@ export function registerCommands(
         showError(services, error, services.i18n.t("mcp.tokenFailed"));
       }
     }),
+    ...registerMarketplaceCommands(services),
   ];
 
   function register(

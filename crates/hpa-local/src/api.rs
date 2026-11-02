@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -35,8 +35,8 @@ use crate::agent::{self, AgentError, AgentLimits, AgentRuntime, AgentStart};
 use crate::connector::{self, ConnectionInput, ConnectorError, ConnectorRuntime};
 use crate::db::{
     AgentApprovalRow, AgentEventRow, AgentSessionRow, AgentVersionRow, ArtifactRow, Db, DbError,
-    ExecutionRow, McpServerRow, SkillRunRow, SkillSummaryRow, SkillVersionRow, TriggerStateRow,
-    WorkflowRow, WorkflowVersionRow, parse_state,
+    ExecutionRow, MarketplaceEventRow, McpServerRow, SkillRunRow, SkillSummaryRow, SkillVersionRow,
+    TriggerStateRow, WorkflowRow, WorkflowVersionRow, parse_state,
 };
 use crate::driver::RuntimeManager;
 use crate::mcp::{self, McpService};
@@ -57,6 +57,7 @@ pub struct ApiState {
     pub data_dir: PathBuf,
     pub mcp_base_url: String,
     pub worker_queue: Option<crate::worker::WorkerService>,
+    pub event_bus: Option<crate::event_bus::EventBusPublisher>,
 }
 
 impl ApiState {
@@ -85,6 +86,7 @@ fn worker_api_error(error: crate::worker::WorkerError) -> ApiError {
 pub fn router(state: ApiState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/openapi.json", get(openapi_contract))
         .route("/nodes", get(list_nodes))
         .route("/stats", get(stats))
         .route("/workflows", get(list_workflows).post(create_workflow))
@@ -105,6 +107,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/agents", get(list_agents).post(create_agent))
         .route("/agents/runtime", get(agent_runtime_info))
         .route("/agents/tools", get(agent_tools))
+        .route("/internal/agent-tool-calls", post(agent_tool_call))
         .route("/agents/approvals", get(list_agent_approvals))
         .route("/agents/approvals/{id}/decide", post(decide_agent_approval))
         .route("/agents/sessions", get(list_agent_sessions))
@@ -140,6 +143,37 @@ pub fn router(state: ApiState) -> Router {
         .route("/plugins/{id}/uninstall", post(uninstall_plugin))
         .route("/marketplace", get(marketplace_list))
         .route("/marketplace/publish", post(publish_marketplace))
+        .route("/marketplace/remote", get(remote_marketplace_packages))
+        .route(
+            "/marketplace/vulnerabilities/{id}/{version}",
+            get(marketplace_vulnerabilities),
+        )
+        .route("/marketplace/events/stream", get(stream_marketplace_events))
+        .route("/marketplace/events/latest", get(marketplace_event_cursor))
+        .route(
+            "/marketplace/publishers",
+            get(list_marketplace_publishers).post(add_marketplace_publisher),
+        )
+        .route(
+            "/marketplace/publishers/{id}/keys",
+            post(add_marketplace_publisher_key).delete(revoke_marketplace_publisher_key),
+        )
+        .route(
+            "/marketplace/sources",
+            get(list_marketplace_sources).post(add_marketplace_source),
+        )
+        .route(
+            "/marketplace/sources/{id}/rotate-key",
+            post(rotate_marketplace_source_key),
+        )
+        .route(
+            "/marketplace/sources/{id}/refresh",
+            post(refresh_marketplace_source),
+        )
+        .route(
+            "/marketplace/remote/{source}/{id}/versions/{version}/install",
+            post(install_remote_marketplace_package),
+        )
         .route(
             "/marketplace/{id}/versions/{version}",
             get(marketplace_detail),
@@ -175,6 +209,15 @@ pub fn router(state: ApiState) -> Router {
         .route("/skills/{id}/runs", get(list_skill_runs))
         .route("/skills/{id}/versions/{version}", get(get_skill_version))
         .route(
+            "/skills/{id}/versions/{version}/source",
+            get(get_skill_source),
+        )
+        .route(
+            "/skills/{id}/versions/{version}/draft",
+            post(save_skill_draft),
+        )
+        .route("/skills/{id}/versions/{version}/sign", post(sign_skill))
+        .route(
             "/skills/{id}/versions/{version}/publish",
             post(publish_skill),
         )
@@ -201,6 +244,7 @@ pub fn router(state: ApiState) -> Router {
             post(fire_trigger_api),
         )
         .route("/trigger-fires", get(list_trigger_fires_api))
+        .route("/events/{topic}", post(publish_event_api))
         .route("/mcp/overview", get(mcp_overview))
         .route("/mcp/catalog", get(mcp_catalog))
         .route("/mcp/call", post(mcp_call))
@@ -220,6 +264,19 @@ pub fn router(state: ApiState) -> Router {
         .route_layer(axum::middleware::from_fn(crate::metrics::track_http))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+}
+
+async fn openapi_contract() -> Json<Value> {
+    const CONTRACT: &str = include_str!("../../../schema/openapi/local-api.json");
+    match serde_json::from_str(CONTRACT) {
+        Ok(value) => Json(value),
+        Err(error) => Json(json!({
+            "error": {
+                "code": "OPENAPI_INVALID",
+                "message": format!("embedded OpenAPI contract is invalid: {error}")
+            }
+        })),
+    }
 }
 
 #[derive(Debug)]
@@ -321,6 +378,9 @@ impl From<AgentError> for ApiError {
                 Self::new(StatusCode::BAD_GATEWAY, "AGENT_MODEL", message)
             }
             AgentError::Approval(message) => Self::conflict("AGENT_APPROVAL", message),
+            AgentError::Forbidden(message) => {
+                Self::new(StatusCode::FORBIDDEN, "AGENT_FORBIDDEN", message)
+            }
             AgentError::Budget(message) => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, "AGENT_BUDGET", message)
             }
@@ -564,6 +624,7 @@ async fn create_workflow(
     let (workflow, ir, yaml) = validate_ir(&request.ir)?;
     let row = workflow_row(&workflow, &ir, &yaml);
     state.db.upsert_workflow(&row).await?;
+    notify_mcp_catalog(&state);
     Ok(Json(WorkflowSummary::from(&row)))
 }
 
@@ -581,6 +642,7 @@ async fn update_workflow(
     }
     let row = workflow_row(&workflow, &ir, &yaml);
     state.db.upsert_workflow(&row).await?;
+    notify_mcp_catalog(&state);
     Ok(Json(WorkflowSummary::from(&row)))
 }
 
@@ -648,6 +710,7 @@ async fn publish_workflow(
     crate::scheduler::sync_published(&state.trigger_host(), &workflow, &row.version)
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    notify_mcp_catalog(&state);
     Ok(Json(WorkflowSummary::from(&row)))
 }
 
@@ -672,6 +735,7 @@ struct ValidateResponse {
     report: ValidationReport,
     canonical: Option<Value>,
     yaml: Option<String>,
+    source_map: Option<hpa_core::yaml::SourceMap>,
     node_count: usize,
     edge_count: usize,
 }
@@ -683,6 +747,15 @@ async fn validate_workflow(
         Ok((workflow, compilation)) => {
             let canonical = workflow.canonical_value().ok();
             let yaml = workflow.to_yaml_string().ok();
+            let source_map = if request.format.as_deref() != Some("json")
+                && !request.content.trim_start().starts_with('{')
+            {
+                hpa_core::yaml::yaml_to_json_with_source_map(&request.content)
+                    .ok()
+                    .map(|(_, map)| map)
+            } else {
+                None
+            };
             Ok(Json(ValidateResponse {
                 valid: true,
                 report: ValidationReport {
@@ -690,6 +763,7 @@ async fn validate_workflow(
                 },
                 canonical,
                 yaml,
+                source_map,
                 node_count: workflow.nodes.len(),
                 edge_count: workflow.edges.len(),
             }))
@@ -820,7 +894,17 @@ async fn start_execution(
     })?;
     let execution_id = format!("exec_{}", Uuid::now_v7());
     let env = request.env.unwrap_or_default();
-    let tenant_id = request.tenant_id.unwrap_or_else(|| "local".to_string());
+    if request
+        .tenant_id
+        .as_deref()
+        .is_some_and(|tenant_id| tenant_id != state.tenant_id)
+    {
+        return Err(ApiError::bad_request(
+            "TENANT_MISMATCH",
+            "execution tenant must match the authenticated tenant",
+        ));
+    }
+    let tenant_id = state.tenant_id.clone();
     let mut execution = new_state(
         &workflow,
         &compilation.plan,
@@ -1136,6 +1220,12 @@ fn mcp_service(state: &ApiState) -> McpService {
     )
 }
 
+fn notify_mcp_catalog(state: &ApiState) {
+    for kind in ["tools", "resources", "prompts"] {
+        crate::mcp_http::notify_catalog_changed(&state.tenant_id, kind);
+    }
+}
+
 fn rpc_result(response: Value) -> Result<Value, ApiError> {
     if let Some(error) = response.get("error") {
         let code = error
@@ -1304,7 +1394,7 @@ async fn mcp_token_create(
         &state.db,
         &request.name,
         &scopes,
-        "local",
+        &state.tenant_id,
         &mcp::now_rfc3339(),
     )
     .await
@@ -1624,6 +1714,7 @@ fn skill_detail_value(loaded: &LoadedSkill) -> Value {
             "size": file.size,
             "sha256": file.sha256,
         })).collect::<Vec<_>>(),
+        "signature": loaded.signature,
         "sourcePath": loaded.version.source_path,
     })
 }
@@ -2013,17 +2104,22 @@ async fn decide_agent_approval(
     })))
 }
 
-async fn agent_runtime_info() -> Json<Value> {
+async fn agent_runtime_info(State(state): State<ApiState>) -> Json<Value> {
+    let mut planners = vec!["deterministic", "openAi"];
+    if state.agents.python_worker_available() {
+        planners.push("python");
+    }
     Json(json!({
         "schemaVersion": agent::AGENT_SCHEMA,
         "sessionSchemaVersion": agent::AGENT_SESSION_SCHEMA,
         "approvalTtlSeconds": agent::APPROVAL_TTL_SECONDS,
         "defaultLimits": AgentLimits::default(),
-        "planners": ["deterministic", "openAi"],
+        "planners": planners,
         "risk": {
             "workflow.execute": "high",
             "mcp": "high",
             "skill": "medium",
+            "agent.handoff": "medium",
             "workflow.list": "low",
             "execution.get": "low",
             "execution.wait": "low"
@@ -2034,6 +2130,55 @@ async fn agent_runtime_info() -> Json<Value> {
 
 async fn agent_tools(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(state.agents.tool_catalog().await?))
+}
+
+async fn agent_tool_call(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<agent::ToolInvokeRequest>,
+) -> Result<Json<agent::ToolInvokeResponse>, ApiError> {
+    if request.tenant_id != state.tenant_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "AGENT_TOOL_TENANT",
+            "tool request tenant does not match the routed tenant",
+        ));
+    }
+    let header_tenant = headers
+        .get("x-hpa-tenant-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "AGENT_TOOL_TENANT",
+                "x-hpa-tenant-id header is required",
+            )
+        })?;
+    if header_tenant != state.tenant_id {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "AGENT_TOOL_TENANT",
+            "tool request tenant header does not match the routed tenant",
+        ));
+    }
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "AGENT_TOOL_AUTH",
+                "a session-bound tool capability is required",
+            )
+        })?;
+    Ok(Json(
+        state
+            .agents
+            .invoke_python_tool(token.trim(), request)
+            .await?,
+    ))
 }
 
 async fn agent_session_detail(state: &ApiState, row: &AgentSessionRow) -> Result<Value, ApiError> {
@@ -2190,6 +2335,286 @@ async fn uninstall_plugin(
 async fn marketplace_list(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     Ok(Json(
         json!({"plugins": state.plugins.marketplace_list().await?}),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteMarketplaceQuery {
+    source: Option<String>,
+}
+
+async fn remote_marketplace_packages(
+    State(state): State<ApiState>,
+    Query(query): Query<RemoteMarketplaceQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "packages": state
+            .plugins
+            .remote_marketplace_packages(query.source.as_deref())
+            .await?
+    })))
+}
+
+struct MarketplaceSseStream {
+    receiver: mpsc::Receiver<MarketplaceEventRow>,
+}
+
+impl Stream for MarketplaceSseStream {
+    type Item = Result<Event, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.receiver.poll_recv(context) {
+            Poll::Ready(Some(event)) => Poll::Ready(Some(Ok(marketplace_event_to_sse(event)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+fn marketplace_event_to_sse(event: MarketplaceEventRow) -> Event {
+    let payload = json!({
+        "sequence": event.sequence,
+        "id": event.id,
+        "at": event.at,
+        "pluginId": event.plugin_id,
+        "version": event.version,
+        "kind": event.kind,
+        "detail": serde_json::from_str::<Value>(&event.detail_json).unwrap_or(Value::Null),
+    });
+    Event::default()
+        .id(event.sequence.to_string())
+        .event("marketplace")
+        .data(payload.to_string())
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MarketplaceEventQuery {
+    since: Option<i64>,
+}
+
+async fn stream_marketplace_events(
+    State(state): State<ApiState>,
+    Query(query): Query<MarketplaceEventQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let header_sequence = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0);
+    let explicit = query
+        .since
+        .or((header_sequence > 0).then_some(header_sequence));
+    let after = match explicit {
+        Some(sequence) => sequence.max(0),
+        None => state
+            .db
+            .latest_marketplace_event_sequence()
+            .await
+            .unwrap_or(0),
+    };
+    let (sender, receiver) = mpsc::channel(256);
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let mut last = after;
+        loop {
+            match db.list_marketplace_events(last, 500).await {
+                Ok(events) if !events.is_empty() => {
+                    for event in events {
+                        last = event.sequence;
+                        if sender.try_send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                Err(_) => return,
+            }
+        }
+    });
+    let mut response = Sse::new(MarketplaceSseStream { receiver })
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("hpa marketplace stream"),
+        )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&after.to_string()) {
+        response.headers_mut().insert("x-hpa-event-sequence", value);
+    }
+    response
+}
+
+async fn marketplace_event_cursor(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "sequence": state.db.latest_marketplace_event_sequence().await?
+    })))
+}
+
+async fn marketplace_vulnerabilities(
+    State(state): State<ApiState>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state.plugins.vulnerability_report(&id, &version).await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddMarketplacePublisherRequest {
+    id: String,
+    name: String,
+}
+
+async fn list_marketplace_publishers(
+    State(state): State<ApiState>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "publishers": state.plugins.marketplace_publishers().await?
+    })))
+}
+
+async fn add_marketplace_publisher(
+    State(state): State<ApiState>,
+    Json(request): Json<AddMarketplacePublisherRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .add_publisher(&request.id, &request.name)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublisherKeyRequest {
+    key_id: String,
+    public_key: String,
+    label: String,
+    valid_from: Option<String>,
+    valid_until: Option<String>,
+}
+
+async fn add_marketplace_publisher_key(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<PublisherKeyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .add_publisher_key(
+                &id,
+                &request.key_id,
+                &request.public_key,
+                &request.label,
+                request.valid_from.as_deref(),
+                request.valid_until.as_deref(),
+            )
+            .await?,
+    ))
+}
+
+async fn revoke_marketplace_publisher_key(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<RevokePublisherKeyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .revoke_publisher_key(&id, &request.key_id)
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokePublisherKeyRequest {
+    key_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddMarketplaceSourceRequest {
+    id: String,
+    label: String,
+    index_uri: String,
+    key_id: String,
+    public_key: String,
+    key_label: String,
+}
+
+async fn list_marketplace_sources(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(json!({
+        "sources": state.plugins.marketplace_sources().await?
+    })))
+}
+
+async fn add_marketplace_source(
+    State(state): State<ApiState>,
+    Json(request): Json<AddMarketplaceSourceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .add_marketplace_source(
+                &request.id,
+                &request.label,
+                &request.index_uri,
+                &request.key_id,
+                &request.public_key,
+                &request.key_label,
+            )
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateMarketplaceSourceKeyRequest {
+    key_id: String,
+    public_key: String,
+    label: String,
+}
+
+async fn rotate_marketplace_source_key(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<RotateMarketplaceSourceKeyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .rotate_marketplace_source_key(
+                &id,
+                &request.key_id,
+                &request.public_key,
+                &request.label,
+            )
+            .await?,
+    ))
+}
+
+async fn refresh_marketplace_source(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(state.plugins.refresh_marketplace_source(&id).await?))
+}
+
+async fn install_remote_marketplace_package(
+    State(state): State<ApiState>,
+    Path((source, id, version)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        state
+            .plugins
+            .install_remote_package(&source, &id, &version)
+            .await?,
     ))
 }
 
@@ -2505,6 +2930,7 @@ async fn import_skill(
     let loaded = service
         .load(&outcome.summary.id, Some(&outcome.version.version))
         .await?;
+    notify_mcp_catalog(&state);
     Ok(Json(json!({
         "inserted": outcome.inserted,
         "warnings": outcome.report.issues,
@@ -2520,11 +2946,55 @@ async fn get_skill_version(
     Ok(Json(skill_detail_value(&loaded)))
 }
 
+async fn get_skill_source(
+    State(state): State<ApiState>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let source = skill_service(&state).source(&id, Some(&version)).await?;
+    Ok(Json(serde_json::to_value(source)?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSkillDraftRequest {
+    version: String,
+    files: BTreeMap<String, String>,
+}
+
+async fn save_skill_draft(
+    State(state): State<ApiState>,
+    Path((id, version)): Path<(String, String)>,
+    Json(request): Json<SaveSkillDraftRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let service = skill_service(&state);
+    let outcome = service
+        .save_draft(&id, &version, &request.version, request.files)
+        .await?;
+    let loaded = service
+        .load(&outcome.summary.id, Some(&outcome.version.version))
+        .await?;
+    notify_mcp_catalog(&state);
+    Ok(Json(json!({
+        "inserted": outcome.inserted,
+        "warnings": outcome.report.issues,
+        "skill": skill_detail_value(&loaded),
+    })))
+}
+
+async fn sign_skill(
+    State(state): State<ApiState>,
+    Path((id, version)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let signature = skill_service(&state).sign(&id, Some(&version)).await?;
+    Ok(Json(json!({"signature": signature})))
+}
+
 async fn publish_skill(
     State(state): State<ApiState>,
     Path((id, version)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let published = skill_service(&state).publish(&id, Some(&version)).await?;
+    notify_mcp_catalog(&state);
     Ok(Json(json!({"published": published})))
 }
 
@@ -2692,6 +3162,9 @@ fn trigger_error(error: crate::scheduler::TriggerError) -> ApiError {
             "TRIGGER_DUPLICATE",
             format!("event `{event_id}` was already delivered"),
         ),
+        TriggerError::NoSubscribers { topic } => ApiError::not_found(format!(
+            "no enabled event trigger subscribes to topic `{topic}`"
+        )),
         TriggerError::VersionMissing {
             workflow_id,
             version,
@@ -2703,6 +3176,66 @@ fn trigger_error(error: crate::scheduler::TriggerError) -> ApiError {
         TriggerError::Runtime(message) => ApiError::internal(message),
         TriggerError::Db(error) => ApiError::internal(error.to_string()),
     }
+}
+
+async fn publish_event_api(
+    State(state): State<ApiState>,
+    Path(topic): Path<String>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let event_id = headers
+        .get("x-hpa-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("evt_{}", Uuid::now_v7()));
+    let host = state.trigger_host();
+    if let Some(publisher) = state.event_bus.as_ref() {
+        crate::scheduler::ensure_event_subscribers(&host, &topic)
+            .await
+            .map_err(trigger_error)?;
+        let outcome = publisher
+            .publish(&topic, &event_id, &payload)
+            .await
+            .map_err(|error| match error {
+                crate::event_bus::EventBusError::IdempotencyConflict { event_id } => {
+                    ApiError::conflict(
+                        "EVENT_ID_CONFLICT",
+                        format!("event `{event_id}` was already published with different content"),
+                    )
+                }
+                other => ApiError::internal(other.to_string()),
+            })?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "topic": topic,
+                "eventId": event_id,
+                "messageId": outcome.message_id,
+                "queued": outcome.queued,
+                "status": if outcome.queued { "queued" } else { "duplicate" },
+            })),
+        ));
+    }
+    let (event_id, outcomes) = crate::scheduler::fire_event(&host, &topic, payload, Some(event_id))
+        .await
+        .map_err(trigger_error)?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "topic": topic,
+            "eventId": event_id,
+            "executions": outcomes.iter().map(|outcome| json!({
+                "executionId": outcome.execution_id,
+                "workflowId": outcome.workflow_id,
+                "workflowVersion": outcome.workflow_version,
+                "triggerId": outcome.trigger_id,
+                "kind": outcome.kind,
+            })).collect::<Vec<_>>(),
+        })),
+    ))
 }
 
 fn trigger_value(row: &TriggerStateRow, state: &ApiState) -> Value {
@@ -2718,6 +3251,7 @@ fn trigger_value(row: &TriggerStateRow, state: &ApiState) -> Value {
     };
     let mut schedule = Value::Null;
     let mut webhook = Value::Null;
+    let mut event = Value::Null;
     match hpa_core::trigger::parse_trigger(&trigger) {
         Ok(hpa_core::trigger::TriggerSpec::Schedule(spec)) => {
             schedule = json!({
@@ -2743,6 +3277,15 @@ fn trigger_value(row: &TriggerStateRow, state: &ApiState) -> Value {
                 "signatureHeader": "X-HPA-Signature",
             });
         }
+        Ok(hpa_core::trigger::TriggerSpec::Event(spec)) => {
+            event = json!({
+                "topic": spec.topic,
+                "publishUrl": format!(
+                    "{}/api/events/{}",
+                    state.mcp_base_url, spec.topic
+                ),
+            });
+        }
         _ => {}
     }
     json!({
@@ -2753,6 +3296,7 @@ fn trigger_value(row: &TriggerStateRow, state: &ApiState) -> Value {
         "workflowVersion": row.workflow_version,
         "schedule": schedule,
         "webhook": webhook,
+        "event": event,
         "nextFireAt": row.next_fire_at,
         "lastFireAt": row.last_fire_at,
         "lastExecutionId": row.last_execution_id,

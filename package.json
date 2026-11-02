@@ -9,14 +9,30 @@
   "scripts": {
     "check:brand": "node scripts/check-brand.mjs",
     "check:ir": "node scripts/check-ir.cjs",
-    "check": "npm run check:brand && npm run check:ir",
+    "check:contracts": "node scripts/check-contracts.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
+    "check:mirrors": "node scripts/check-domestic-mirrors.mjs",
+    "check:otel": "node scripts/check-otel-config.mjs",
+    "check:supply-chain": "node scripts/check-supply-chain.mjs",
+    "check:audit": "pnpm audit --audit-level moderate --registry=https://registry.npmjs.org",
+    "check": "npm run check:brand && npm run check:ir && npm run check:contracts && npm run check:docs && npm run check:mirrors && npm run check:otel && npm run check:supply-chain && npm run check:audit",
     "build": "turbo run build",
     "test": "turbo run test",
-    "lint": "turbo run lint"
+    "lint": "turbo run lint",
+    "test:a11y": "node scripts/check-web-a11y.mjs",
+    "test:e2e": "node scripts/run-local-e2e.mjs",
+    "test:marketplace-ui": "node scripts/phase13-marketplace-ui-e2e.mjs",
+    "test:ai-worker-container": "node scripts/phase13-ai-worker-container-smoke.mjs",
+    "test:scim-e2e": "node scripts/scim-e2e.mjs",
+    "test:mcp-conformance": "node scripts/mcp-conformance.mjs",
+    "test:postgres:backup": "node scripts/check-postgres-backup.mjs"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
+    "@modelcontextprotocol/conformance": "0.1.16",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
+    "playwright": "1.64.1",
     "turbo": "2.11.10",
     "typescript": "5.9.3",
     "yaml": "2.9.1"

@@ -1,11 +1,52 @@
-use saphyr::{LoadableYamlNode, Scalar, Yaml, YamlEmitter};
+use saphyr::{
+    LoadableYamlNode, MarkedYamlOwned, Scalar, ScalarOwned, Yaml, YamlDataOwned, YamlEmitter,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcePosition {
+    /// UTF-8 byte offset in the original source.
+    pub offset: usize,
+    /// One-based source line.
+    pub line: usize,
+    /// Zero-based character column.
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceLocation {
+    /// JSON-pointer-like path rooted at `$`.
+    pub path: String,
+    pub start: SourcePosition,
+    pub end: SourcePosition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceMap {
+    pub source_hash: String,
+    pub entries: Vec<SourceLocation>,
+}
+
+impl SourceMap {
+    pub fn location(&self, path: &str) -> Option<&SourceLocation> {
+        self.entries.iter().find(|entry| entry.path == path)
+    }
+}
+
 pub fn yaml_to_json(text: &str) -> CoreResult<Value> {
+    yaml_to_json_with_source_map(text).map(|(value, _)| value)
+}
+
+pub fn yaml_to_json_with_source_map(text: &str) -> CoreResult<(Value, SourceMap)> {
     let documents =
-        Yaml::load_from_str(text).map_err(|error| CoreError::Yaml(error.to_string()))?;
+        MarkedYamlOwned::load_from_str(text).map_err(|error| CoreError::Yaml(error.to_string()))?;
     let document = documents
         .first()
         .ok_or_else(|| CoreError::Yaml("document is empty".to_string()))?;
@@ -15,7 +56,16 @@ pub fn yaml_to_json(text: &str) -> CoreResult<Value> {
             documents.len()
         )));
     }
-    convert(document, "$")
+    let mut entries = Vec::new();
+    let value = convert_marked(document, "$", text, &mut entries)?;
+    let source_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    Ok((
+        value,
+        SourceMap {
+            source_hash,
+            entries,
+        },
+    ))
 }
 
 pub fn json_to_yaml(value: &Value) -> CoreResult<String> {
@@ -40,41 +90,103 @@ pub fn json_to_yaml(value: &Value) -> CoreResult<String> {
     Ok(out)
 }
 
-fn convert(node: &Yaml<'_>, path: &str) -> CoreResult<Value> {
-    match node {
-        Yaml::Value(scalar) => scalar_to_json(scalar, path),
-        Yaml::Representation(value, style, tag) => {
+fn convert_marked(
+    node: &MarkedYamlOwned,
+    path: &str,
+    source: &str,
+    entries: &mut Vec<SourceLocation>,
+) -> CoreResult<Value> {
+    entries.push(SourceLocation {
+        path: path.to_string(),
+        start: source_position(
+            source,
+            node.span.start.index(),
+            node.span.start.line(),
+            node.span.start.col(),
+        ),
+        end: source_position(
+            source,
+            node.span.end.index(),
+            node.span.end.line(),
+            node.span.end.col(),
+        ),
+    });
+    match &node.data {
+        YamlDataOwned::Value(scalar) => scalar_to_json(&scalar.as_scalar(), path),
+        YamlDataOwned::Representation(value, style, tag) => {
+            let tag = tag.as_ref().map(std::borrow::Cow::Borrowed);
             let parsed =
-                Scalar::parse_from_cow_and_metadata(value.clone(), *style, tag.as_ref())
+                Scalar::parse_from_cow_and_metadata(value.clone().into(), *style, tag.as_ref())
                     .ok_or_else(|| CoreError::Yaml(format!("cannot resolve scalar at {path}")))?;
             scalar_to_json(&parsed, path)
         }
-        Yaml::Sequence(items) => {
+        YamlDataOwned::Sequence(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
-                out.push(convert(item, &format!("{path}[{index}]"))?);
+                out.push(convert_marked(
+                    item,
+                    &format!("{path}[{index}]"),
+                    source,
+                    entries,
+                )?);
             }
             Ok(Value::Array(out))
         }
-        Yaml::Mapping(mapping) => {
+        YamlDataOwned::Mapping(mapping) => {
             let mut out = Map::new();
             for (key, value) in mapping.iter() {
-                let key = key_to_string(key, path)?;
+                let key = marked_key_to_string(key, path)?;
                 let child_path = format!("{path}.{}", escape_pointer(&key));
                 if out.contains_key(&key) {
                     return Err(CoreError::Yaml(format!("duplicate key `{key}` at {path}")));
                 }
-                out.insert(key, convert(value, &child_path)?);
+                out.insert(key, convert_marked(value, &child_path, source, entries)?);
             }
             Ok(Value::Object(out))
         }
-        Yaml::Tagged(tag, _) => Err(CoreError::Yaml(format!(
+        YamlDataOwned::Tagged(tag, _) => Err(CoreError::Yaml(format!(
             "custom YAML tag `{tag:?}` at {path} is not supported"
         ))),
-        Yaml::Alias(_) => Err(CoreError::Yaml(format!(
+        YamlDataOwned::Alias(_) => Err(CoreError::Yaml(format!(
             "YAML aliases are not supported at {path}"
         ))),
-        Yaml::BadValue => Err(CoreError::Yaml(format!("invalid scalar value at {path}"))),
+        YamlDataOwned::BadValue => Err(CoreError::Yaml(format!("invalid scalar value at {path}"))),
+    }
+}
+
+fn marked_key_to_string(key: &MarkedYamlOwned, path: &str) -> CoreResult<String> {
+    match &key.data {
+        YamlDataOwned::Value(ScalarOwned::String(value)) => Ok(value.to_string()),
+        YamlDataOwned::Representation(value, style, tag) => {
+            let tag = tag.as_ref().map(std::borrow::Cow::Borrowed);
+            let parsed =
+                Scalar::parse_from_cow_and_metadata(value.clone().into(), *style, tag.as_ref())
+                    .ok_or_else(|| {
+                        CoreError::Yaml(format!("cannot resolve mapping key at {path}"))
+                    })?;
+            match parsed {
+                Scalar::String(value) => Ok(value.to_string()),
+                _ => Err(CoreError::Yaml(format!(
+                    "mapping key at {path} must be a string"
+                ))),
+            }
+        }
+        _ => Err(CoreError::Yaml(format!(
+            "mapping key at {path} must be a string"
+        ))),
+    }
+}
+
+fn source_position(source: &str, char_index: usize, line: usize, column: usize) -> SourcePosition {
+    let offset = source
+        .char_indices()
+        .nth(char_index)
+        .map(|(offset, _)| offset)
+        .unwrap_or(source.len());
+    SourcePosition {
+        offset,
+        line,
+        column,
     }
 }
 
@@ -90,27 +202,29 @@ fn scalar_to_json(scalar: &Scalar<'_>, path: &str) -> CoreResult<Value> {
     }
 }
 
-fn key_to_string(key: &Yaml<'_>, path: &str) -> CoreResult<String> {
-    match key {
-        Yaml::Value(Scalar::String(value)) => Ok(value.to_string()),
-        Yaml::Representation(value, style, tag) => {
-            let parsed = Scalar::parse_from_cow_and_metadata(value.clone(), *style, tag.as_ref())
-                .ok_or_else(|| {
-                CoreError::Yaml(format!("cannot resolve mapping key at {path}"))
-            })?;
-            match parsed {
-                Scalar::String(value) => Ok(value.to_string()),
-                _ => Err(CoreError::Yaml(format!(
-                    "mapping key at {path} must be a string"
-                ))),
-            }
-        }
-        _ => Err(CoreError::Yaml(format!(
-            "mapping key at {path} must be a string"
-        ))),
-    }
-}
-
 fn escape_pointer(value: &str) -> String {
     value.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod source_map_tests {
+    use super::*;
+
+    #[test]
+    fn source_map_tracks_unicode_offsets_and_paths() {
+        let source = "name: 日本語\nnodes:\n  - id: first\n    type: start\n";
+        let (value, map) = yaml_to_json_with_source_map(source).expect("yaml");
+        assert_eq!(value["nodes"][0]["id"], "first");
+        let location = map.location("$.name").expect("name location");
+        assert_eq!(location.start.line, 1);
+        assert_eq!(location.start.column, 6);
+        assert_eq!(
+            &source[location.start.offset..location.end.offset],
+            "日本語"
+        );
+        let id = map.location("$.nodes[0].id").expect("id location");
+        assert_eq!(id.start.line, 3);
+        assert_eq!(&source[id.start.offset..id.end.offset], "first");
+        assert_eq!(map.source_hash.len(), 64);
+    }
 }

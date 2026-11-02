@@ -1,0 +1,10 @@
+apiVersion: 1
+
+providers:
+  - name: hpa
+    orgId: 1
+    folder: HPA
+    type: file
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

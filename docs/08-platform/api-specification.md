@@ -1,6 +1,8 @@
 # API 规范
 
 > 风格：REST + JSON + OpenAPI 3.1；执行事件用 SSE；MCP 是独立协议端点，不混入 REST。
+>
+> 当前本地实现使用无版本前缀的 `/api/*`，核心契约在 `schema/openapi/local-api.json` 并由 `/api/openapi.json` 暴露；下文 `/api/v1` 是目标云契约。
 > 版本：`/api/v1`；破坏性变更走 v2。内部 Worker API 使用 `/internal/v1` + mTLS/JWT。
 
 ## 1. 基础
@@ -53,6 +55,18 @@
 | GET/POST | `/projects` | 列表/创建 |
 | GET/POST | `/members` | 成员/角色 |
 | GET | `/roles` | 角色/权限 |
+
+SCIM 2.0 使用独立租户 Bearer 端点：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/scim/v2/ServiceProviderConfig` | PATCH/filter/ETag 能力 |
+| GET/POST | `/scim/v2/Users` | 用户查询/创建 |
+| GET/PUT/PATCH/DELETE | `/scim/v2/Users/{id}` | 用户生命周期 |
+| GET/POST | `/scim/v2/Groups` | 组查询/创建 |
+| GET/PUT/PATCH/DELETE | `/scim/v2/Groups/{id}` | 组和成员生命周期 |
+
+完整映射、角色冲突和 If-Match 语义见 [SCIM](scim.md)。
 
 ### Workflow
 

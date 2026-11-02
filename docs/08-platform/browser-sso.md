@@ -8,10 +8,12 @@
 - `state`、`nonce`、`redirect`、`iss`、`aud`、`exp`、`nbf`、JWKS `kid` 校验。
 - ID Token 支持 EdDSA、RS256、ES256；JWKS 支持 OKP/Ed25519、RSA、EC/P-256。
 - 服务端 session，HttpOnly Cookie，`SameSite=Lax`，可选 `Secure`；服务端只存 session token 哈希。
+- refresh token 与 ID token 使用安装级 AES-256-GCM 加密落库；access token 原文不落库，只保存到期时间。
+- 支持 refresh token 轮换、静默续期、会话 token 再生成与 RP-initiated logout；旧 Cookie 在刷新后立即失效。
 - Cookie 认证的非 GET 请求必须带 `X-HPA-CSRF`；Bearer 请求不需要 CSRF。
 - 成员目录联动：disabled 成员拒绝登录，active 成员的角色覆盖 claims；tenant 必须 active。
 - 平台管理员 allowlist（`adminSubjects`）决定浏览器 session 能否访问 `/api/enterprise/*`；OIDC claims 中的 `platform_admin` 不被信任。
-- 不做授权服务器、refresh token、silent renew、RP-initiated logout、SCIM/组同步、第三方 Cookie、云 SaaS。
+- Browser SSO 端点本身不做 SCIM/组同步；独立 SCIM 契约见 [SCIM](scim.md)。不做授权服务器、第三方 Cookie、云 SaaS；PAR/CIMD/DPoP/JARM 由企业 IdP/Gateway 边界承担，见 ADR-0021。
 
 ## 2. OIDC 配置扩展
 
@@ -24,6 +26,8 @@
 | `tokenEndpoint` | token 端点，绝对 URL |
 | `redirectUri` | 必须指向本服务 `/auth/oidc/callback` |
 | `scopes` | 字符串数组，默认 `["openid","email","profile"]`；兼容接收空格分隔字符串 |
+| `endSessionEndpoint` | IdP RP-initiated logout 端点；与 `postLogoutRedirectUri` 成对配置 |
+| `postLogoutRedirectUri` | 本服务 `/auth/oidc/logout/callback`，必须与登录 redirect 同源 |
 | `adminSubjects` | `sub` 或 email 白名单，允许进入平台控制面 |
 | `cookieSecure` | HTTPS 部署置 true；loopback HTTP 可为 false |
 | `sessionTtlSeconds` | 默认 28800（8h），范围 300–604800 |
@@ -49,12 +53,13 @@
 
 1. 按 `state_hash` 取 flow，一次性消费；过期/不存在 → `/login?error=state_invalid`。IdP `error` 参数也重定向 `/login?error=<safe-code>`。
 2. POST token endpoint（form）：`grant_type=authorization_code`、`code`、`redirect_uri`、`client_id`、`code_verifier`；不发送 client secret。
-3. 响应必须有 `id_token`；忽略 access_token（本阶段不调用 UserInfo）。
+3. 响应必须有 Bearer `access_token`、合法正整数 `expires_in` 与 `id_token`；建议 scope 包含 `offline_access` 以获得 `refresh_token`。
 4. 校验 JWT：算法白名单、kid、JWKS、iss/aud/exp/nbf/nonce。
 5. claims：`sub`、`tenant_id`/`tenantId`、`role`/`roles`；可选 `email`、`name`。
 6. tenant active；若成员目录命中 subject/email：disabled → `/login?error=member_disabled`，active 使用目录 role/displayName；未命中使用 claims role。
 7. `platform_admin = adminSubjects` 命中 sub/email（email 大小写不敏感）。
-8. 创建 session，设置 Cookie，302 回安全 redirect。token 交换或 ID Token 校验失败返回 `/login?error=sso_failed`；tenant 非 active 返回 `tenant_inactive`。
+8. 创建 session，设置 Cookie，302 回安全 redirect。refresh token 与 ID token 以 AES-256-GCM 加密保存，access token 到期时间单独保存；密钥位于 `<data_dir>/keys/browser-auth.key`，权限必须为 `0600`。
+9. token 交换或 ID Token 校验失败返回 `/login?error=sso_failed`；tenant 非 active 返回 `tenant_inactive`。
 
 ### 3.3 会话与登出
 
@@ -74,13 +79,17 @@
     "displayName": "Admin"
   },
   "csrfToken": "<opaque>",
-  "expiresAt": 1793520000000
+  "expiresAt": 1793520000000,
+  "accessTokenExpiresAt": 1793520000000,
+  "refreshAvailable": true
 }
 ```
 
 未登录返回 `authenticated:false`、`ssoConfigured`、`mode`（`local`/`enterprise`）与 `csrfToken:null`。Cookie 名为 `hpa_session`，HttpOnly、SameSite=Lax、Path=/、Max-Age=TTL，HTTPS 时 Secure。过期/撤销的 Cookie 会在该响应中被清除。
 
-`POST /auth/logout`（前端调用 `/api/auth/logout`）：需要 Cookie + `X-HPA-CSRF`；revoke session，清 Cookie，返回 `{loggedOut:true}`。没有 refresh；过期即重新登录。
+`POST /auth/refresh`（前端调用 `/api/auth/refresh`）：需要有效 Cookie + `X-HPA-CSRF`。服务端解密 refresh token，调用 token endpoint 的 `grant_type=refresh_token`；成功时轮换浏览器 session token、更新 Cookie、重新校验 tenant/member，并返回新的 `expiresAt`、`accessTokenExpiresAt`、`refreshAvailable`。同一 session 的 refresh version 使用 CAS；并发重复刷新或上游拒绝 `invalid_grant` 时整条 session 被撤销，旧身份不能继续使用。Web 在 access token 到期前 60 秒触发静默续期。
+
+`POST /auth/logout`（前端调用 `/api/auth/logout`）：需要 Cookie + `X-HPA-CSRF`；本地 session 总是先撤销并清 Cookie。若配置了 end-session endpoint，响应额外返回经服务端构造的 `logoutUrl`，包含 `id_token_hint`、`client_id`、`post_logout_redirect_uri` 与一次性 logout `state`；前端跳转到 IdP 后，再经 `/auth/oidc/logout/callback` 校验 state 并回到 `/login?loggedOut=1`。
 
 ## 4. API 认证
 
@@ -102,12 +111,21 @@ enterprise_auth_flows:
 enterprise_sessions:
   id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, csrf_token TEXT, tenant_id TEXT,
   subject TEXT, email TEXT, display_name TEXT, role TEXT, platform_admin INTEGER,
-  created_at INTEGER, expires_at INTEGER, revoked_at INTEGER, last_seen_at INTEGER
+  created_at INTEGER, expires_at INTEGER, revoked_at INTEGER, last_seen_at INTEGER,
+  refresh_token_ciphertext TEXT, refresh_token_version INTEGER,
+  refresh_token_expires_at INTEGER, id_token_ciphertext TEXT,
+  access_token_expires_at INTEGER, last_refresh_at INTEGER
+
+enterprise_logout_flows:
+  state_hash TEXT PRIMARY KEY, created_at INTEGER, expires_at INTEGER
 ```
 
 - session token 只存 SHA-256；csrf token 存明文本（非认证凭证），只通过 `/auth/session` 发给同源页面。
-- 登录成功清理过期/已撤销 session 行；每次会话查询更新 `last_seen_at`。
-- session TTL 默认 8h；登录成功创建新 session，不实现 refresh。
+- refresh token 与 ID token 使用 AES-256-GCM、随机 96-bit nonce 和 session/AAD 绑定后落库；不得导出到前端、日志或审计详情。
+- access token 原文不保存；当前浏览器认证仍使用 ID Token 身份，不调用 UserInfo。
+- 每次会话查询更新 `last_seen_at`；过期/撤销行不被接受。
+- session TTL 默认 8h；刷新可续期至配置的 TTL，但不会超过 refresh token 到期时间。
+- 安装密钥必须与应用数据分开备份；丢失密钥会使 refresh/ID token 无法解密，但不会绕过 session 撤销。生产环境应把相同边界映射到 KMS/Vault。
 - 过期/撤销 session 不被接受；登录/登出写审计（`auth.login`/`auth.logout`，不带 token/cookie）；失败的登录也写 `auth.login` deny 与稳定错误码。
 - 登录失败不区分“用户不存在/角色无效”等细节给浏览器，只给稳定错误码；服务端日志可记原因但不含 token。
 
@@ -138,6 +156,9 @@ cargo test -p hpa-local --test enterprise_ops
 - nonce 不匹配、iss/aud/exp/nbf/kid/alg 失败；RS256/ES256/EdDSA 正例与错签名负例。
 - JWKS URL/authorization/token endpoint 的 HTTPS/allowlist/SSRF；不跟随重定向。
 - Cookie：HttpOnly/SameSite/Path/Secure 配置；session token 哈希；登出/过期/撤销；旧 Cookie 登出后 API 401。
+- Refresh：token 轮换、Cookie 再生成、旧 Cookie 失效、上游拒绝后撤销 session、refresh version CAS。
+- Token at rest：明文不得出现在 SQLite；AES-GCM 篡改与 AAD 错配必须失败；密钥文件权限为 `0600`。
+- RP logout：`id_token_hint`、client_id、redirect 同源/路径校验、一次性 state、state 重放拒绝、Secure Cookie 清理。
 - CSRF：Cookie 写操作缺头 403；Bearer 写操作不受影响；登出缺少 CSRF 拒绝。
 - 成员 disabled、tenant disabled、admin allowlist、redirect 逃逸与跨租户越权。
 - 本地模式匿名、现有 Bearer/Worker/VS Code 不回归。
@@ -149,7 +170,7 @@ OIDC_PORT=18970 OIDC_ALG=EdDSA node scripts/oidc-mock.mjs
 HPA_TOKEN_FILE=/tmp/hpa-final-ent.token OIDC_MOCK_PORT=18970 node scripts/phase9-sso-e2e.mjs
 ```
 
-`scripts/phase9-sso-e2e.mjs` 使用 Playwright 完成 `/login` → mock 授权 → 回调 → `/enterprise` → 退出，检查 Cookie、session principal、平台管理员、回调错误与 1440/607 截图；`OIDC_ALG` 可切换 `EdDSA`/`RS256`/`ES256`，三种算法均已跑通。
+`scripts/phase9-sso-e2e.mjs` 使用 Playwright 完成 `/login` → mock 授权 → 回调 → `/enterprise` → refresh → RP logout → 回调 → 登录页，检查 Cookie、session principal、平台管理员、回调错误与 1440/607 截图；`OIDC_ALG` 可切换 `EdDSA`/`RS256`/`ES256`。
 
 ## 8. 截图
 
@@ -160,5 +181,6 @@ HPA_TOKEN_FILE=/tmp/hpa-final-ent.token OIDC_MOCK_PORT=18970 node scripts/phase9
 
 ## 9. 非目标
 
-- `client_secret`、refresh token、silent renew、PKCE downgrade/plain、RP-initiated logout、IdP session 管理、SCIM/组、第三方 Cookie、SameSite=None、多 IdP、云 SaaS。
+- `client_secret`、PKCE downgrade/plain、第三方 Cookie、SameSite=None、多 IdP、云 SaaS。用户/组目录同步使用独立 [SCIM](scim.md) 端点。
+- IdP session 是否立即全局退出取决于 IdP 对 `end_session_endpoint` 的实现；本地 session 撤销不依赖该跳转成功。
 - 浏览器 session 不改变 API Bearer token 或 Worker token 语义。

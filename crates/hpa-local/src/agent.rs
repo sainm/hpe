@@ -1,6 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
 use hpa_core::runtime::{new_state, start_event};
@@ -13,10 +17,13 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use crate::ai_worker_client::{
+    AiWorkerConfig, AiWorkerError, AiWorkerProcess, AiWorkerStart, checkpoint_schema_name,
+};
 use crate::connector::ConnectorRuntime;
 use crate::db::{
-    AgentApprovalRow, AgentEventRow, AgentSessionRow, AgentSummaryRow, AgentVersionRow, Db,
-    DbError, ExecutionRow,
+    AgentApprovalRow, AgentEventRow, AgentSessionRow, AgentSummaryRow, AgentToolCallRow,
+    AgentVersionRow, Db, DbError, ExecutionRow,
 };
 use crate::driver::RuntimeManager;
 use crate::mcp_client::{self, ExternalServer};
@@ -69,6 +76,11 @@ pub enum PlannerConfig {
         output_cost_per_1k: Option<f64>,
         #[serde(default)]
         network: Vec<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Python {
+        #[serde(default)]
+        model: Option<String>,
     },
 }
 
@@ -233,6 +245,26 @@ pub struct AgentSessionState {
     pub started_ms: u64,
     pub updated_at: String,
     pub event_sequence: i64,
+    #[serde(default)]
+    pub python: Option<PythonSessionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PythonSessionState {
+    pub last_sequence: i64,
+    pub pending_call_id: Option<String>,
+    pub pending_request_hash: Option<String>,
+    #[serde(default)]
+    pub pending_tool_name: Option<String>,
+    #[serde(default)]
+    pub child_tool_calls: u32,
+    #[serde(default)]
+    pub child_tokens_in: u64,
+    #[serde(default)]
+    pub child_tokens_out: u64,
+    #[serde(default)]
+    pub child_cost_usd: f64,
 }
 
 #[derive(Debug, Error)]
@@ -254,6 +286,8 @@ pub enum AgentError {
     #[error("{0}")]
     Approval(String),
     #[error("{0}")]
+    Forbidden(String),
+    #[error("{0}")]
     Budget(String),
     #[error("{0}")]
     Json(#[from] serde_json::Error),
@@ -266,11 +300,122 @@ pub struct AgentRuntime {
     pub workflow_runtime: RuntimeManager,
     pub connectors: ConnectorRuntime,
     http: reqwest::Client,
+    tenant_id: String,
+    python: Option<PythonWorkerConfig>,
+    tool_capabilities: Arc<tokio::sync::Mutex<HashMap<String, ToolCapability>>>,
+    active_python: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PythonWorkerConfig {
+    pub executable: PathBuf,
+    pub tool_endpoint: String,
+    pub checkpoint_dir: PathBuf,
+    pub postgres_checkpoint_url: Option<String>,
+}
+
+impl PythonWorkerConfig {
+    pub fn from_environment(base_url: &str, checkpoint_dir: PathBuf) -> Option<PythonWorkerConfig> {
+        let executable = std::env::var_os("HPA_AI_WORKER_BIN").map(PathBuf::from)?;
+        let tool_endpoint = std::env::var("HPA_AI_TOOL_ENDPOINT").unwrap_or_else(|_| {
+            format!(
+                "{}/api/internal/agent-tool-calls",
+                base_url.trim_end_matches('/')
+            )
+        });
+        Some(PythonWorkerConfig {
+            executable,
+            tool_endpoint,
+            checkpoint_dir,
+            postgres_checkpoint_url: std::env::var("HPA_AI_CHECKPOINT_POSTGRES_URL").ok(),
+        })
+    }
+
+    fn environment(
+        &self,
+        tenant_id: &str,
+        checkpoint: &std::path::Path,
+        planner_mode: String,
+    ) -> BTreeMap<String, String> {
+        let mut environment = BTreeMap::from([
+            ("HPA_AI_PLANNER".to_string(), planner_mode),
+            ("HPA_TOOL_ENDPOINT".to_string(), self.tool_endpoint.clone()),
+            (
+                "HPA_AI_CHECKPOINT_PATH".to_string(),
+                checkpoint.to_string_lossy().to_string(),
+            ),
+        ]);
+        if let Some(url) = &self.postgres_checkpoint_url {
+            environment.insert("HPA_AI_CHECKPOINT_POSTGRES_URL".to_string(), url.clone());
+            environment.insert(
+                "HPA_AI_CHECKPOINT_SCHEMA".to_string(),
+                checkpoint_schema_name(tenant_id),
+            );
+        }
+        environment
+    }
+}
+
+#[derive(Clone)]
+struct ToolCapability {
+    session_id: String,
+    tenant_id: String,
+    expires_at: Instant,
+    approval_id: Option<String>,
+    approval_call_id: Option<String>,
+    approval_request_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolInvokeRequest {
+    pub tenant_id: String,
+    pub session_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+    pub idempotency_key: String,
+    pub risk: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInvokeResponse {
+    pub call_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub retryable: bool,
 }
 
 struct ToolOutcome {
     value: Value,
     is_error: bool,
+}
+
+enum PythonRunError {
+    Worker(AiWorkerError),
+    Agent(AgentError),
+}
+
+impl From<AiWorkerError> for PythonRunError {
+    fn from(error: AiWorkerError) -> Self {
+        Self::Worker(error)
+    }
+}
+
+impl From<AgentError> for PythonRunError {
+    fn from(error: AgentError) -> Self {
+        Self::Agent(error)
+    }
+}
+
+impl From<DbError> for PythonRunError {
+    fn from(error: DbError) -> Self {
+        Self::Agent(AgentError::Db(error))
+    }
 }
 
 pub struct AgentStart {
@@ -299,7 +444,25 @@ impl AgentRuntime {
                 .timeout(Duration::from_secs(60))
                 .build()
                 .unwrap_or_default(),
+            tenant_id: "local".to_string(),
+            python: None,
+            tool_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_python: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_python_worker(mut self, config: PythonWorkerConfig) -> Self {
+        self.python = Some(config);
+        self
+    }
+
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = tenant_id.into();
+        self
+    }
+
+    pub fn python_worker_available(&self) -> bool {
+        self.python.is_some()
     }
 
     pub async fn latest_published(&self, agent_id: &str) -> Result<AgentVersionRow, AgentError> {
@@ -364,6 +527,7 @@ impl AgentRuntime {
             started_ms: now_ms(),
             updated_at: now.clone(),
             event_sequence: 0,
+            python: None,
         };
         prepare_messages(&definition, &mut state);
         let row = AgentSessionRow {
@@ -451,6 +615,11 @@ impl AgentRuntime {
                 AgentError::NotFound(format!("agent session `{session_id}` not found"))
             })?;
         let mut state: AgentSessionState = serde_json::from_str(&row.state_json)?;
+        if matches!(definition.planner, PlannerConfig::Python { .. }) {
+            return self
+                .drive_python(session_id, definition, version, &mut state)
+                .await;
+        }
         loop {
             if state.status.is_terminal() || state.status == AgentStatus::WaitingApproval {
                 break;
@@ -736,6 +905,412 @@ impl AgentRuntime {
         Ok(row)
     }
 
+    async fn drive_python(
+        &self,
+        session_id: &str,
+        definition: &AgentDefinition,
+        version: &AgentVersionRow,
+        state: &mut AgentSessionState,
+    ) -> Result<AgentSessionRow, AgentError> {
+        if state.status.is_terminal() || state.status == AgentStatus::WaitingApproval {
+            return self
+                .db
+                .get_agent_session(session_id)
+                .await?
+                .ok_or_else(|| AgentError::NotFound(session_id.to_string()));
+        }
+        if state.status == AgentStatus::Interrupted {
+            state.status = AgentStatus::Running;
+            state.stop_reason = None;
+            state.error = None;
+            self.emit(
+                state,
+                session_id,
+                "agent.resumed",
+                json!({"from": "interrupted"}),
+            )
+            .await?;
+            self.persist(session_id, state).await?;
+        }
+        let config = self.python.clone().ok_or_else(|| {
+            AgentError::Invalid(
+                "Python planner requires HPA_AI_WORKER_BIN and a configured tool endpoint"
+                    .to_string(),
+            )
+        })?;
+        let tools = self.tool_schemas(definition, version).await?;
+        let budget = python_budget(definition, state)?;
+        let tool_token = self
+            .issue_tool_capability(
+                session_id,
+                &self.tenant_id,
+                None,
+                python_capability_ttl(definition, state)?,
+            )
+            .await?;
+        let planner_mode =
+            std::env::var("HPA_AI_WORKER_PLANNER").unwrap_or_else(|_| "litellm".to_string());
+        let checkpoint = config.checkpoint_dir.join(format!("{session_id}.sqlite"));
+        tokio::fs::create_dir_all(&config.checkpoint_dir)
+            .await
+            .map_err(|error| {
+                AgentError::Model(format!("cannot create checkpoint directory: {error}"))
+            })?;
+        let environment = config.environment(&self.tenant_id, &checkpoint, planner_mode);
+        let mut process = AiWorkerProcess::spawn(AiWorkerConfig {
+            executable: config.executable,
+            args: Vec::new(),
+            request_token: random_capability("hpa_worker")?,
+            environment,
+        })
+        .await
+        .map_err(|error| AgentError::Model(format!("cannot spawn Python worker: {error}")))?;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel(1);
+        self.active_python
+            .lock()
+            .await
+            .insert(session_id.to_string(), cancel_tx);
+        let instructions = definition
+            .instructions
+            .as_deref()
+            .unwrap_or("Execute the requested task using only the declared tools.");
+        let model = match &definition.planner {
+            PlannerConfig::Python { model } => model.as_deref(),
+            _ => None,
+        };
+        let request = AiWorkerStart {
+            session_id,
+            tenant_id: &self.tenant_id,
+            agent_version_id: &version.version,
+            input: state.input.clone(),
+            instructions: Some(instructions),
+            tools: &tools,
+            budget,
+            tool_token: Some(&tool_token),
+            model,
+        };
+        let started = process.start(request).await;
+        let collected = match started {
+            Ok(()) => {
+                self.collect_python_events(
+                    &mut process,
+                    session_id,
+                    definition,
+                    state,
+                    &mut cancel_rx,
+                )
+                .await
+            }
+            Err(error) => Err(PythonRunError::Worker(error)),
+        };
+        self.active_python.lock().await.remove(session_id);
+        let shutdown = process.shutdown().await;
+        self.revoke_tool_capability(&tool_token).await;
+        if let Err(error) = collected {
+            self.finish_python_worker_error(session_id, state, error)
+                .await?;
+        } else if let Err(error) = shutdown
+            && !state.status.is_terminal()
+            && state.status != AgentStatus::WaitingApproval
+        {
+            self.finish_python_worker_error(session_id, state, PythonRunError::Worker(error))
+                .await?;
+        }
+        self.db
+            .get_agent_session(session_id)
+            .await?
+            .ok_or_else(|| AgentError::NotFound(session_id.to_string()))
+    }
+
+    async fn collect_python_events(
+        &self,
+        process: &mut AiWorkerProcess,
+        session_id: &str,
+        definition: &AgentDefinition,
+        state: &mut AgentSessionState,
+        cancel_rx: &mut tokio::sync::mpsc::Receiver<String>,
+    ) -> Result<(), PythonRunError> {
+        loop {
+            let event = tokio::select! {
+                event = process.next_event(Duration::from_secs(60)) => event?,
+                reason = cancel_rx.recv() => {
+                    if let Some(reason) = reason {
+                        let _ = process.cancel(session_id, &reason).await;
+                    }
+                    let current = self
+                        .db
+                        .get_agent_session(session_id)
+                        .await?
+                        .ok_or_else(|| AgentError::NotFound(session_id.to_string()))?;
+                    *state = serde_json::from_str(&current.state_json)
+                        .map_err(|error| AgentError::Invalid(error.to_string()))?;
+                    break;
+                }
+            };
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let data = event.get("data").cloned().unwrap_or_else(|| json!({}));
+            let sequence = data.get("sequence").and_then(Value::as_i64).unwrap_or(0);
+            if state.python.is_none() {
+                state.python = Some(PythonSessionState {
+                    last_sequence: 0,
+                    pending_call_id: None,
+                    pending_request_hash: None,
+                    pending_tool_name: None,
+                    child_tool_calls: 0,
+                    child_tokens_in: 0,
+                    child_tokens_out: 0,
+                    child_cost_usd: 0.0,
+                });
+            }
+            let last_sequence = state
+                .python
+                .as_ref()
+                .map(|python| python.last_sequence)
+                .unwrap_or(0);
+            if sequence > 0 && sequence <= last_sequence {
+                continue;
+            }
+            match event_type {
+                "session.started" => {}
+                "step" => {
+                    if let Some(python) = state.python.as_mut() {
+                        python.last_sequence = sequence;
+                    }
+                    self.emit(state, session_id, "agent.step", data).await?;
+                    self.persist(session_id, state).await?;
+                }
+                "tool.call" => {
+                    if let Some(python) = state.python.as_mut() {
+                        python.last_sequence = sequence;
+                        python.pending_tool_name =
+                            data.get("tool").and_then(Value::as_str).map(str::to_string);
+                    }
+                    state.pending_tool_call_id = data
+                        .get("callId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    self.emit(state, session_id, "agent.tool_requested", data)
+                        .await?;
+                    self.persist(session_id, state).await?;
+                }
+                "tool.result" => {
+                    let status = data
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("failed");
+                    if status == "succeeded"
+                        && let Some(result) = data.get("result")
+                    {
+                        state.last_output = result.clone();
+                    }
+                    let pending_tool = state.python.as_mut().and_then(|python| {
+                        python.last_sequence = sequence;
+                        python.pending_call_id = None;
+                        python.pending_request_hash = None;
+                        python.pending_tool_name.take()
+                    });
+                    if pending_tool.as_deref() == Some("agent.handoff")
+                        && status == "succeeded"
+                        && let Some(result) = data.get("result")
+                    {
+                        apply_python_handoff(state, result)?;
+                    }
+                    let kind = if status == "succeeded" {
+                        "agent.tool_completed"
+                    } else {
+                        "agent.tool_failed"
+                    };
+                    self.emit(state, session_id, kind, data).await?;
+                    self.persist(session_id, state).await?;
+                }
+                "usage" => {
+                    let child_usage = state
+                        .python
+                        .as_ref()
+                        .map(|python| {
+                            (
+                                python.child_tool_calls,
+                                python.child_tokens_in,
+                                python.child_tokens_out,
+                                python.child_cost_usd,
+                            )
+                        })
+                        .unwrap_or_default();
+                    apply_python_usage(state, &data);
+                    state.tool_calls = state.tool_calls.saturating_add(child_usage.0);
+                    state.tokens_in = state.tokens_in.saturating_add(child_usage.1);
+                    state.tokens_out = state.tokens_out.saturating_add(child_usage.2);
+                    state.cost_usd += child_usage.3;
+                    self.emit(state, session_id, "agent.model_usage", data)
+                        .await?;
+                    self.persist(session_id, state).await?;
+                    if python_budget_exhausted(definition, state) {
+                        self.finish_with_error(
+                            state,
+                            session_id,
+                            AgentStatus::BudgetExhausted,
+                            "AGENT_BUDGET",
+                            "Python worker exceeded the Rust budget".to_string(),
+                        )
+                        .await?;
+                        break;
+                    }
+                }
+                "approval.required" => {
+                    let tool = data.get("tool").and_then(Value::as_str).ok_or_else(|| {
+                        AiWorkerError::Protocol("approval event has no tool".to_string())
+                    })?;
+                    let call_id = data.get("callId").and_then(Value::as_str).ok_or_else(|| {
+                        AiWorkerError::Protocol("approval event has no callId".to_string())
+                    })?;
+                    let arguments = data.get("arguments").cloned().ok_or_else(|| {
+                        AiWorkerError::Protocol("approval event has no arguments".to_string())
+                    })?;
+                    if !definition.tools.iter().any(|declared| declared == tool) {
+                        return Err(AiWorkerError::Protocol(format!(
+                            "Python worker requested approval for undeclared tool `{tool}`"
+                        ))
+                        .into());
+                    }
+                    let risk = tool_risk(tool);
+                    if !requires_approval(definition, tool, risk) {
+                        return Err(AiWorkerError::Protocol(format!(
+                            "Python worker requested approval for non-approval tool `{tool}`"
+                        ))
+                        .into());
+                    }
+                    let approval = self
+                        .create_approval(session_id, tool, &arguments, risk)
+                        .await?;
+                    let request_hash = tool_request_hash(tool, &arguments)?;
+                    state.pending_action = Some(PlanStep::Tool {
+                        tool: tool.to_string(),
+                        arguments,
+                    });
+                    state.pending_approval = Some(approval.id.clone());
+                    state.pending_tool_call_id = Some(call_id.to_string());
+                    state.status = AgentStatus::WaitingApproval;
+                    state.stop_reason = Some("approval".to_string());
+                    if let Some(python) = state.python.as_mut() {
+                        python.pending_call_id = Some(call_id.to_string());
+                        python.pending_request_hash = Some(request_hash);
+                    }
+                    self.emit(
+                        state,
+                        session_id,
+                        "agent.approval_requested",
+                        json!({
+                            "approvalId": approval.id,
+                            "tool": tool,
+                            "risk": risk,
+                            "callId": call_id
+                        }),
+                    )
+                    .await?;
+                    self.persist(session_id, state).await?;
+                    break;
+                }
+                "session.completed" => {
+                    if let Some(python) = state.python.as_mut() {
+                        python.last_sequence = sequence;
+                    }
+                }
+                "session.result" => {
+                    if python_budget_exhausted(definition, state) {
+                        self.finish_with_error(
+                            state,
+                            session_id,
+                            AgentStatus::BudgetExhausted,
+                            "AGENT_BUDGET",
+                            "Python worker exceeded the Rust budget".to_string(),
+                        )
+                        .await?;
+                        break;
+                    }
+                    state.output = Some(data.get("output").cloned().unwrap_or_else(|| json!({})));
+                    state.status = AgentStatus::Succeeded;
+                    state.stop_reason = Some("completed".to_string());
+                    state.pending_action = None;
+                    state.pending_approval = None;
+                    state.pending_tool_call_id = None;
+                    if let Some(python) = state.python.as_mut() {
+                        python.pending_call_id = None;
+                        python.pending_request_hash = None;
+                        python.pending_tool_name = None;
+                    }
+                    self.emit(
+                        state,
+                        session_id,
+                        "agent.finished",
+                        json!({"status": "succeeded", "output": state.output}),
+                    )
+                    .await?;
+                    self.persist(session_id, state).await?;
+                    break;
+                }
+                "session.cancelled" => {
+                    state.status = AgentStatus::Cancelled;
+                    state.stop_reason = Some("cancelled".to_string());
+                    self.emit(state, session_id, "agent.cancelled", data)
+                        .await?;
+                    self.persist(session_id, state).await?;
+                    break;
+                }
+                "session.cancel.requested" => {}
+                "error" => {
+                    let code = event
+                        .get("code")
+                        .and_then(Value::as_str)
+                        .unwrap_or("AGENT_PYTHON");
+                    let message = event
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Python worker failed");
+                    return Err(AiWorkerError::Protocol(format!("{code}: {message}")).into());
+                }
+                other => {
+                    return Err(AiWorkerError::Protocol(format!(
+                        "unexpected Python worker event `{other}`"
+                    ))
+                    .into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_python_worker_error(
+        &self,
+        session_id: &str,
+        state: &mut AgentSessionState,
+        error: PythonRunError,
+    ) -> Result<(), AgentError> {
+        let (status, code, message) = match error {
+            PythonRunError::Worker(AiWorkerError::Timeout(duration)) => (
+                AgentStatus::Timeout,
+                "AGENT_WORKER_TIMEOUT",
+                format!("Python worker timed out after {duration:?}"),
+            ),
+            PythonRunError::Worker(AiWorkerError::Closed) => (
+                AgentStatus::Interrupted,
+                "AGENT_WORKER_LOST",
+                "Python worker exited before a terminal event; continue to recover from checkpoint"
+                    .to_string(),
+            ),
+            PythonRunError::Worker(other) => {
+                (AgentStatus::Failed, "AGENT_WORKER", other.to_string())
+            }
+            PythonRunError::Agent(other) => {
+                (AgentStatus::Failed, "AGENT_RUNTIME", other.to_string())
+            }
+        };
+        self.finish_with_error(state, session_id, status, code, message)
+            .await
+    }
+
     async fn next_action(
         &self,
         definition: &AgentDefinition,
@@ -759,6 +1334,9 @@ impl AgentRuntime {
                 self.next_model_action(definition, version, session_id, state)
                     .await
             }
+            PlannerConfig::Python { .. } => Err(AgentError::Invalid(
+                "Python planner must be driven by the Python worker".to_string(),
+            )),
         }
     }
 
@@ -1015,6 +1593,353 @@ impl AgentRuntime {
             .await?)
     }
 
+    async fn issue_tool_capability(
+        &self,
+        session_id: &str,
+        tenant_id: &str,
+        approval: Option<(String, String, String)>,
+        ttl: Duration,
+    ) -> Result<String, AgentError> {
+        let token = random_capability("hpa_tool")?;
+        let (approval_id, approval_call_id, approval_request_hash) = match approval {
+            Some((approval_id, call_id, request_hash)) => {
+                (Some(approval_id), Some(call_id), Some(request_hash))
+            }
+            None => (None, None, None),
+        };
+        let mut capabilities = self.tool_capabilities.lock().await;
+        capabilities.retain(|_, capability| capability.expires_at > Instant::now());
+        capabilities.insert(
+            token.clone(),
+            ToolCapability {
+                session_id: session_id.to_string(),
+                tenant_id: tenant_id.to_string(),
+                expires_at: Instant::now() + ttl,
+                approval_id,
+                approval_call_id,
+                approval_request_hash,
+            },
+        );
+        Ok(token)
+    }
+
+    async fn revoke_tool_capability(&self, token: &str) {
+        self.tool_capabilities.lock().await.remove(token);
+    }
+
+    async fn authorize_tool_capability(&self, token: &str) -> Result<ToolCapability, AgentError> {
+        if token.len() > 256 {
+            return Err(AgentError::Forbidden(
+                "tool capability is invalid".to_string(),
+            ));
+        }
+        let mut capabilities = self.tool_capabilities.lock().await;
+        let now = Instant::now();
+        capabilities.retain(|_, capability| capability.expires_at > now);
+        let matched = capabilities
+            .iter()
+            .find(|(candidate, _)| constant_time_eq(candidate.as_bytes(), token.as_bytes()))
+            .map(|(_, capability)| capability.clone())
+            .ok_or_else(|| {
+                AgentError::Forbidden("tool capability is invalid or expired".to_string())
+            })?;
+        Ok(matched)
+    }
+
+    pub async fn invoke_python_tool(
+        &self,
+        token: &str,
+        request: ToolInvokeRequest,
+    ) -> Result<ToolInvokeResponse, AgentError> {
+        validate_tool_request(&request)?;
+        let capability = self.authorize_tool_capability(token).await?;
+        if capability.session_id != request.session_id || capability.tenant_id != request.tenant_id
+        {
+            return Err(AgentError::Forbidden(
+                "tool capability does not match this session".to_string(),
+            ));
+        }
+        let row = self
+            .db
+            .get_agent_session(&request.session_id)
+            .await?
+            .ok_or_else(|| AgentError::NotFound("agent session not found".to_string()))?;
+        if matches!(
+            row.status.as_str(),
+            "succeeded" | "failed" | "budget_exhausted" | "timeout" | "cancelled"
+        ) {
+            return Err(AgentError::Approval(
+                "agent session is already terminal".to_string(),
+            ));
+        }
+        let version = self
+            .db
+            .get_agent_version(&row.agent_id, &row.agent_version)
+            .await?
+            .ok_or_else(|| AgentError::NotFound("agent version not found".to_string()))?;
+        let definition = parse_definition(&version)?;
+        let is_handoff = request.tool == "agent.handoff";
+        if is_handoff {
+            if definition.sub_agents.is_empty() {
+                return Err(AgentError::Forbidden(
+                    "AgentVersion declares no sub-agents".to_string(),
+                ));
+            }
+        } else if !definition.tools.iter().any(|tool| tool == &request.tool) {
+            return Err(AgentError::Forbidden(format!(
+                "tool `{}` is not declared by this agent version",
+                request.tool
+            )));
+        }
+        let risk = if is_handoff {
+            "medium"
+        } else {
+            tool_risk(&request.tool)
+        };
+        let expected_risk = if is_handoff {
+            "write"
+        } else {
+            python_tool_risk(risk)
+        };
+        if request.risk != expected_risk {
+            return Err(AgentError::Forbidden(format!(
+                "tool `{}` risk is `{expected_risk}`, request attempted `{}`",
+                request.tool, request.risk
+            )));
+        }
+        let request_hash = tool_request_hash(&request.tool, &request.arguments)?;
+        let idempotency_key = format!(
+            "agent:{}:{}:{request_hash}",
+            request.session_id, request.call_id
+        );
+        if let Some(existing) = self
+            .db
+            .get_agent_tool_call(&request.session_id, &request.call_id)
+            .await?
+        {
+            return Ok(cached_tool_response(&request, &existing));
+        }
+        if requires_approval(&definition, &request.tool, risk) {
+            let approval_id = capability.approval_id.as_deref().ok_or_else(|| {
+                AgentError::Forbidden(
+                    "tool requires an approved, call-bound capability".to_string(),
+                )
+            })?;
+            if capability.approval_call_id.as_deref() != Some(request.call_id.as_str())
+                || capability.approval_request_hash.as_deref() != Some(request_hash.as_str())
+            {
+                return Err(AgentError::Forbidden(
+                    "approval capability does not match this tool call".to_string(),
+                ));
+            }
+            let approval = self
+                .db
+                .get_agent_approval(approval_id)
+                .await?
+                .ok_or_else(|| AgentError::Approval("approval not found".to_string()))?;
+            if approval.session_id != request.session_id
+                || approval.tool_name != request.tool
+                || approval.status != "approved"
+                || tool_request_hash(
+                    &approval.tool_name,
+                    &serde_json::from_str::<Value>(&approval.args_json)?,
+                )? != request_hash
+            {
+                return Err(AgentError::Forbidden(
+                    "approval does not authorize this tool request".to_string(),
+                ));
+            }
+        }
+        let now = now_rfc3339();
+        let ledger = AgentToolCallRow {
+            session_id: request.session_id.clone(),
+            call_id: request.call_id.clone(),
+            idempotency_key,
+            tool_name: request.tool.clone(),
+            request_hash: request_hash.clone(),
+            status: "in_progress".to_string(),
+            response_json: None,
+            error: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        if !self.db.begin_agent_tool_call(&ledger).await? {
+            let existing = self
+                .db
+                .get_agent_tool_call(&request.session_id, &request.call_id)
+                .await?;
+            if let Some(existing) = existing {
+                return Ok(cached_tool_response(&request, &existing));
+            }
+            return Ok(tool_response(
+                &request.call_id,
+                "failed",
+                None,
+                Some("idempotency key is already in use".to_string()),
+            ));
+        }
+        if requires_approval(&definition, &request.tool, risk) {
+            let approval_id = capability
+                .approval_id
+                .as_deref()
+                .expect("approval capability was validated");
+            if !self
+                .db
+                .consume_agent_approval(approval_id, &now_rfc3339())
+                .await?
+            {
+                let response = tool_response(
+                    &request.call_id,
+                    "denied",
+                    None,
+                    Some("approval was already consumed".to_string()),
+                );
+                self.finish_tool_ledger(&request, &response).await?;
+                return Ok(response);
+            }
+        }
+        let response = if is_handoff {
+            match self.execute_python_handoff(&request, &definition).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tool_response(&request.call_id, "failed", None, Some(error.to_string()))
+                }
+            }
+        } else {
+            match self.execute_tool(&request.tool, &request.arguments).await {
+                Ok(outcome) => {
+                    let status = if outcome.is_error {
+                        "failed"
+                    } else {
+                        "succeeded"
+                    };
+                    tool_response(
+                        &request.call_id,
+                        status,
+                        Some(outcome.value),
+                        outcome
+                            .is_error
+                            .then(|| "tool reported an error".to_string()),
+                    )
+                }
+                Err(error) => {
+                    tool_response(&request.call_id, "failed", None, Some(error.to_string()))
+                }
+            }
+        };
+        self.finish_tool_ledger(&request, &response).await?;
+        Ok(response)
+    }
+
+    async fn execute_python_handoff(
+        &self,
+        request: &ToolInvokeRequest,
+        definition: &AgentDefinition,
+    ) -> Result<ToolInvokeResponse, AgentError> {
+        let parent_row = self
+            .db
+            .get_agent_session(&request.session_id)
+            .await?
+            .ok_or_else(|| AgentError::NotFound("parent Agent session not found".to_string()))?;
+        let parent_state = session_state(&parent_row)?;
+        let agent_id = request
+            .arguments
+            .get("agentId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentError::Tool("handoff requires agentId".to_string()))?;
+        if !definition
+            .sub_agents
+            .iter()
+            .any(|candidate| candidate == agent_id)
+        {
+            return Ok(tool_response(
+                &request.call_id,
+                "failed",
+                None,
+                Some(format!("agent `{agent_id}` is not declared as a sub-agent")),
+            ));
+        }
+        if parent_state.handoffs >= definition.limits.max_handoffs
+            || parent_state.depth >= definition.limits.max_depth
+        {
+            return Ok(tool_response(
+                &request.call_id,
+                "failed",
+                None,
+                Some("handoff budget or depth exhausted".to_string()),
+            ));
+        }
+        let mut remaining = remaining_limits(definition, &parent_state);
+        remaining.max_steps = remaining.max_steps.saturating_sub(1);
+        remaining.max_tool_calls = remaining.max_tool_calls.saturating_sub(1);
+        if remaining.max_steps == 0
+            || remaining.max_tool_calls == 0
+            || remaining.max_tokens == 0
+            || remaining.max_cost_usd <= 0.0
+        {
+            return Ok(tool_response(
+                &request.call_id,
+                "failed",
+                None,
+                Some("parent budget exhausted before handoff".to_string()),
+            ));
+        }
+        let child_input = request
+            .arguments
+            .get("input")
+            .cloned()
+            .unwrap_or_else(|| parent_state.input.clone());
+        let child = Box::pin(self.start(AgentStart {
+            agent_id: agent_id.to_string(),
+            version: None,
+            input: child_input,
+            parent_session_id: Some(request.session_id.clone()),
+            depth: parent_state.depth.saturating_add(1),
+            limit_override: Some(remaining),
+        }))
+        .await?;
+        let child_state = session_state(&child)?;
+        if child.status == AgentStatus::WaitingApproval.as_str() {
+            let _ = self.cancel(&child.id).await;
+        }
+        let succeeded = child.status == AgentStatus::Succeeded.as_str();
+        let result = json!({
+            "childSessionId": child.id,
+            "status": child.status,
+            "output": child_state.output,
+            "usage": {
+                "toolCalls": child_state.tool_calls,
+                "tokensIn": child_state.tokens_in,
+                "tokensOut": child_state.tokens_out,
+                "costUsd": child_state.cost_usd
+            }
+        });
+        Ok(tool_response(
+            &request.call_id,
+            if succeeded { "succeeded" } else { "failed" },
+            Some(result),
+            (!succeeded).then(|| "sub-agent did not complete successfully".to_string()),
+        ))
+    }
+
+    async fn finish_tool_ledger(
+        &self,
+        request: &ToolInvokeRequest,
+        response: &ToolInvokeResponse,
+    ) -> Result<(), AgentError> {
+        self.db
+            .finish_agent_tool_call(
+                &request.session_id,
+                &request.call_id,
+                &response.status,
+                Some(&serde_json::to_string(response)?),
+                response.error.as_deref(),
+                &now_rfc3339(),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn resume_approval(
         &self,
         session_id: &str,
@@ -1069,15 +1994,6 @@ impl AgentRuntime {
                 approval.status
             )));
         }
-        if !self
-            .db
-            .consume_agent_approval(&approval_id, &now_rfc3339())
-            .await?
-        {
-            return Err(AgentError::Approval(
-                "approval was already consumed".to_string(),
-            ));
-        }
         let version = self
             .db
             .get_agent_version(&row.agent_id, &row.agent_version)
@@ -1089,6 +2005,20 @@ impl AgentRuntime {
                 ))
             })?;
         let definition = parse_definition(&version)?;
+        if matches!(definition.planner, PlannerConfig::Python { .. }) {
+            return self
+                .resume_python_approval(session_id, &mut state, &definition, &approval_id)
+                .await;
+        }
+        if !self
+            .db
+            .consume_agent_approval(&approval_id, &now_rfc3339())
+            .await?
+        {
+            return Err(AgentError::Approval(
+                "approval was already consumed".to_string(),
+            ));
+        }
         let action = state
             .pending_action
             .clone()
@@ -1118,6 +2048,117 @@ impl AgentRuntime {
             .await
     }
 
+    async fn resume_python_approval(
+        &self,
+        session_id: &str,
+        state: &mut AgentSessionState,
+        definition: &AgentDefinition,
+        approval_id: &str,
+    ) -> Result<AgentSessionRow, AgentError> {
+        let action = state
+            .pending_action
+            .clone()
+            .ok_or_else(|| AgentError::Approval("pending tool action is missing".to_string()))?;
+        let PlanStep::Tool { tool, arguments } = action else {
+            return Err(AgentError::Approval(
+                "pending action is not a tool call".to_string(),
+            ));
+        };
+        let python = state.python.clone().ok_or_else(|| {
+            AgentError::Approval("Python checkpoint metadata is missing".to_string())
+        })?;
+        let call_id = python
+            .pending_call_id
+            .ok_or_else(|| AgentError::Approval("pending Python callId is missing".to_string()))?;
+        let request_hash = tool_request_hash(&tool, &arguments)?;
+        if python.pending_request_hash.as_deref() != Some(request_hash.as_str()) {
+            return Err(AgentError::Approval(
+                "pending Python tool request changed before approval".to_string(),
+            ));
+        }
+        let config = self.python.clone().ok_or_else(|| {
+            AgentError::Invalid("Python planner worker is not configured".to_string())
+        })?;
+        let budget = python_budget(definition, state)?;
+        let tool_token = self
+            .issue_tool_capability(
+                session_id,
+                &self.tenant_id,
+                Some((approval_id.to_string(), call_id, request_hash)),
+                python_capability_ttl(definition, state)?,
+            )
+            .await?;
+        let checkpoint = config.checkpoint_dir.join(format!("{session_id}.sqlite"));
+        let planner_mode =
+            std::env::var("HPA_AI_WORKER_PLANNER").unwrap_or_else(|_| "litellm".to_string());
+        let environment = config.environment(&self.tenant_id, &checkpoint, planner_mode);
+        let mut process = AiWorkerProcess::spawn(AiWorkerConfig {
+            executable: config.executable.clone(),
+            args: Vec::new(),
+            request_token: random_capability("hpa_worker")?,
+            environment,
+        })
+        .await
+        .map_err(|error| AgentError::Model(format!("cannot spawn Python worker: {error}")))?;
+        let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel(1);
+        self.active_python
+            .lock()
+            .await
+            .insert(session_id.to_string(), cancel_tx);
+        state.status = AgentStatus::Running;
+        state.stop_reason = None;
+        self.emit(
+            state,
+            session_id,
+            "agent.approval_resumed",
+            json!({"approvalId": approval_id, "decision": "approved", "tool": tool}),
+        )
+        .await?;
+        self.persist(session_id, state).await?;
+        let resumed = process
+            .resume(
+                session_id,
+                json!({
+                    "approved": true,
+                    "approver": "rust-agent-runtime",
+                    "approvalId": approval_id
+                }),
+                Some(budget),
+                Some(&tool_token),
+            )
+            .await;
+        let collected = match resumed {
+            Ok(()) => {
+                self.collect_python_events(
+                    &mut process,
+                    session_id,
+                    definition,
+                    state,
+                    &mut cancel_rx,
+                )
+                .await
+            }
+            Err(error) => Err(PythonRunError::Worker(error)),
+        };
+        self.active_python.lock().await.remove(session_id);
+        let shutdown = process.shutdown().await;
+        self.revoke_tool_capability(&tool_token).await;
+        if let Err(error) = collected {
+            self.finish_python_worker_error(session_id, state, error)
+                .await?;
+        } else if let Err(error) = shutdown
+            && !state.status.is_terminal()
+            && state.status != AgentStatus::WaitingApproval
+        {
+            self.finish_python_worker_error(session_id, state, PythonRunError::Worker(error))
+                .await?;
+        }
+        self.db
+            .get_agent_session(session_id)
+            .await?
+            .ok_or_else(|| AgentError::NotFound(session_id.to_string()))
+    }
+
     pub async fn cancel(&self, session_id: &str) -> Result<AgentSessionRow, AgentError> {
         let row = self
             .db
@@ -1141,6 +2182,10 @@ impl AgentRuntime {
         self.emit(&mut state, session_id, "agent.cancelled", json!({}))
             .await?;
         self.persist(session_id, &state).await?;
+        let sender = self.active_python.lock().await.get(session_id).cloned();
+        if let Some(sender) = sender {
+            let _ = sender.send("cancelled by control plane".to_string()).await;
+        }
         self.db
             .get_agent_session(session_id)
             .await?
@@ -1723,12 +2768,18 @@ impl AgentRuntime {
                     _ => json!({"type": "object", "additionalProperties": true}),
                 }
             };
+            let risk = tool_risk(tool);
             tools.push(json!({
                 "type": "function",
                 "function": {
                     "name": tool,
                     "description": format!("Agent tool `{tool}`"),
                     "parameters": schema,
+                    "x-hpa": {
+                        "risk": python_tool_risk(risk),
+                        "approvalRequired": requires_approval(definition, tool, risk),
+                        "idempotencyKeyTemplate": "{sessionId}/{step}/{callId}"
+                    }
                 }
             }));
         }
@@ -1745,12 +2796,240 @@ impl AgentRuntime {
                             "input": {"type": "object"}
                         },
                         "required": ["agentId"]
+                    },
+                    "x-hpa": {
+                        "risk": "write",
+                        "approvalRequired": false,
+                        "idempotencyKeyTemplate": "{sessionId}/{step}/{callId}"
                     }
                 }
             }));
         }
         Ok(tools)
     }
+}
+
+fn python_budget(
+    definition: &AgentDefinition,
+    state: &AgentSessionState,
+) -> Result<Value, AgentError> {
+    let elapsed_ms = now_ms().saturating_sub(state.started_ms);
+    let timeout_ms = definition.limits.timeout_ms.saturating_sub(elapsed_ms);
+    if timeout_ms == 0 {
+        return Err(AgentError::Budget("timeout".to_string()));
+    }
+    let remaining_steps = definition.limits.max_steps.saturating_sub(state.steps);
+    if remaining_steps == 0 {
+        return Err(AgentError::Budget("maxSteps".to_string()));
+    }
+    Ok(json!({
+        "maxSteps": remaining_steps,
+        "maxToolCalls": definition.limits.max_tool_calls.saturating_sub(state.tool_calls),
+        "timeoutSeconds": timeout_ms.div_ceil(1000).max(1),
+        "maxTokens": definition.limits.max_tokens.saturating_sub(state.tokens_in + state.tokens_out).max(1),
+        "maxCostUsd": (definition.limits.max_cost_usd - state.cost_usd).max(0.0)
+    }))
+}
+
+fn python_capability_ttl(
+    definition: &AgentDefinition,
+    state: &AgentSessionState,
+) -> Result<Duration, AgentError> {
+    let elapsed_ms = now_ms().saturating_sub(state.started_ms);
+    let remaining = definition.limits.timeout_ms.saturating_sub(elapsed_ms);
+    if remaining == 0 {
+        return Err(AgentError::Budget("timeout".to_string()));
+    }
+    Ok(Duration::from_secs(
+        remaining.div_ceil(1000).saturating_add(60).min(3_600),
+    ))
+}
+
+fn tool_request_hash(tool: &str, arguments: &Value) -> Result<String, AgentError> {
+    let encoded = serde_json::to_vec(&json!({
+        "tool": tool,
+        "arguments": arguments
+    }))?;
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn apply_python_usage(state: &mut AgentSessionState, usage: &Value) {
+    state.steps = usage
+        .get("steps")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(state.steps);
+    state.tool_calls = usage
+        .get("toolCalls")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(state.tool_calls);
+    state.tokens_in = usage
+        .get("promptTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(state.tokens_in);
+    state.tokens_out = usage
+        .get("completionTokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(state.tokens_out);
+    state.cost_usd = usage
+        .get("costUsd")
+        .and_then(Value::as_f64)
+        .unwrap_or(state.cost_usd);
+}
+
+fn apply_python_handoff(state: &mut AgentSessionState, result: &Value) -> Result<(), AgentError> {
+    let child_session_id = result
+        .get("childSessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AgentError::Tool("handoff result has no childSessionId".to_string()))?;
+    let child_usage = result.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let tool_calls = child_usage
+        .get("toolCalls")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0);
+    let tokens_in = child_usage
+        .get("tokensIn")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tokens_out = child_usage
+        .get("tokensOut")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cost_usd = child_usage
+        .get("costUsd")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let python = state
+        .python
+        .as_mut()
+        .ok_or_else(|| AgentError::Invalid("Python handoff state is missing".to_string()))?;
+    python.child_tool_calls = python.child_tool_calls.saturating_add(tool_calls);
+    python.child_tokens_in = python.child_tokens_in.saturating_add(tokens_in);
+    python.child_tokens_out = python.child_tokens_out.saturating_add(tokens_out);
+    python.child_cost_usd += cost_usd;
+    state.child_session_id = Some(child_session_id.to_string());
+    state.handoffs = state.handoffs.saturating_add(1);
+    if let Some(output) = result.get("output") {
+        state.last_output = output.clone();
+    }
+    Ok(())
+}
+
+fn random_capability(prefix: &str) -> Result<String, AgentError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| AgentError::Invalid(format!("secure random failed: {error}")))?;
+    Ok(format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(bytes)))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+fn validate_tool_request(request: &ToolInvokeRequest) -> Result<(), AgentError> {
+    for (name, value) in [
+        ("tenantId", request.tenant_id.as_str()),
+        ("sessionId", request.session_id.as_str()),
+        ("callId", request.call_id.as_str()),
+    ] {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':')
+            })
+        {
+            return Err(AgentError::Invalid(format!(
+                "{name} contains unsupported characters"
+            )));
+        }
+    }
+    if !request.arguments.is_object() {
+        return Err(AgentError::Invalid(
+            "tool arguments must be an object".to_string(),
+        ));
+    }
+    if request.idempotency_key.trim().is_empty() || request.idempotency_key.len() > 256 {
+        return Err(AgentError::Invalid(
+            "idempotencyKey must be between 1 and 256 bytes".to_string(),
+        ));
+    }
+    if !matches!(request.risk.as_str(), "read" | "write" | "external") {
+        return Err(AgentError::Invalid(
+            "risk must be read, write or external".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn tool_response(
+    call_id: &str,
+    status: &str,
+    result: Option<Value>,
+    error: Option<String>,
+) -> ToolInvokeResponse {
+    ToolInvokeResponse {
+        call_id: call_id.to_string(),
+        status: status.to_string(),
+        result,
+        error,
+        retryable: false,
+    }
+}
+
+fn cached_tool_response(
+    request: &ToolInvokeRequest,
+    existing: &AgentToolCallRow,
+) -> ToolInvokeResponse {
+    let current_hash = match tool_request_hash(&request.tool, &request.arguments) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return tool_response(&request.call_id, "failed", None, Some(error.to_string()));
+        }
+    };
+    if existing.tool_name != request.tool || existing.request_hash != current_hash {
+        return tool_response(
+            &request.call_id,
+            "failed",
+            None,
+            Some("callId was already used for a different tool request".to_string()),
+        );
+    }
+    if existing.status == "in_progress" {
+        return tool_response(
+            &request.call_id,
+            "failed",
+            None,
+            Some("tool call is still in progress; retry only after reconciliation".to_string()),
+        );
+    }
+    existing
+        .response_json
+        .as_deref()
+        .and_then(|response| serde_json::from_str::<ToolInvokeResponse>(response).ok())
+        .unwrap_or_else(|| {
+            tool_response(
+                &request.call_id,
+                "failed",
+                None,
+                Some(
+                    existing
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "stored tool result is missing or invalid".to_string()),
+                ),
+            )
+        })
 }
 
 fn prepare_messages(definition: &AgentDefinition, state: &mut AgentSessionState) {
@@ -1838,6 +3117,14 @@ pub fn validate_definition(definition: &AgentDefinition) -> Result<(), Vec<Strin
                 issues.push("planner.model is required".to_string());
             }
         }
+        PlannerConfig::Python { model } => {
+            if model
+                .as_deref()
+                .is_some_and(|model| model.trim().is_empty())
+            {
+                issues.push("planner.model cannot be empty".to_string());
+            }
+        }
     }
     if plan_len == 0 && matches!(definition.planner, PlannerConfig::Deterministic { .. }) {
         issues.push("deterministic planner requires a non-empty plan".to_string());
@@ -1876,6 +3163,13 @@ pub fn validate_definition(definition: &AgentDefinition) -> Result<(), Vec<Strin
 fn model_budget_exhausted(definition: &AgentDefinition, state: &AgentSessionState) -> bool {
     state.tokens_in + state.tokens_out > definition.limits.max_tokens
         || state.cost_usd > definition.limits.max_cost_usd
+}
+
+fn python_budget_exhausted(definition: &AgentDefinition, state: &AgentSessionState) -> bool {
+    state.steps > definition.limits.max_steps
+        || state.tool_calls > definition.limits.max_tool_calls
+        || state.handoffs > definition.limits.max_handoffs
+        || model_budget_exhausted(definition, state)
 }
 
 fn remaining_limits(definition: &AgentDefinition, state: &AgentSessionState) -> AgentLimits {
@@ -1933,6 +3227,14 @@ fn tool_risk(tool: &str) -> &'static str {
         "low"
     } else {
         "medium"
+    }
+}
+
+fn python_tool_risk(risk: &str) -> &'static str {
+    match risk {
+        "low" => "read",
+        "medium" => "write",
+        _ => "external",
     }
 }
 
@@ -2239,6 +3541,97 @@ mod tests {
     use super::*;
     use crate::db::AgentSessionRow;
 
+    async fn python_tool_runtime() -> (Db, AgentRuntime, String) {
+        let data_dir = std::env::temp_dir().join(format!("hpa-agent-tools-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&data_dir).expect("data dir");
+        let db = Db::open(&data_dir.join("hpa.db")).await.expect("db");
+        let config = json!({
+            "schemaVersion": AGENT_SCHEMA,
+            "id": "agent_tool_service",
+            "name": "Tool Service",
+            "version": "1.0.0",
+            "tools": ["workflow.list", "workflow.execute"],
+            "planner": {"kind": "python"},
+            "limits": {
+                "maxSteps": 4,
+                "maxToolCalls": 2,
+                "timeoutMs": 30000,
+                "maxTokens": 1000,
+                "maxCostUsd": 0.1,
+                "maxHandoffs": 1,
+                "maxDepth": 1
+            }
+        });
+        let (definition, hash) = canonical_agent_value(&config).expect("config");
+        let now = now_rfc3339();
+        db.upsert_agent_version(&AgentVersionRow {
+            agent_id: definition.id.clone(),
+            version: definition.version.clone(),
+            name: definition.name.clone(),
+            description: None,
+            config_json: serde_json::to_string(&definition).expect("config json"),
+            content_hash: hash,
+            status: "imported".to_string(),
+            created_at: now.clone(),
+            published_at: None,
+        })
+        .await
+        .expect("version");
+        let state = AgentSessionState {
+            schema_version: AGENT_SESSION_SCHEMA.to_string(),
+            agent_id: definition.id.clone(),
+            agent_version: definition.version.clone(),
+            status: AgentStatus::Running,
+            input: json!({}),
+            plan_index: 0,
+            plan_history: Vec::new(),
+            steps: 0,
+            tool_calls: 0,
+            handoffs: 0,
+            depth: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd: 0.0,
+            messages: Vec::new(),
+            last_output: Value::Null,
+            output: None,
+            pending_action: None,
+            pending_approval: None,
+            pending_tool_call_id: None,
+            child_session_id: None,
+            stop_reason: None,
+            error: None,
+            started_ms: now_ms(),
+            updated_at: now.clone(),
+            event_sequence: 0,
+            python: None,
+        };
+        db.insert_agent_session(&AgentSessionRow {
+            id: "agentsess_tools".to_string(),
+            agent_id: definition.id.clone(),
+            agent_version: definition.version.clone(),
+            status: "running".to_string(),
+            input_json: "{}".to_string(),
+            output_json: None,
+            state_json: serde_json::to_string(&state).expect("state"),
+            error_json: None,
+            parent_session_id: None,
+            depth: 0,
+            created_at: now.clone(),
+            updated_at: now,
+            finished_at: None,
+        })
+        .await
+        .expect("session");
+        let runtime = AgentRuntime::new(
+            SkillService::new(db.clone(), data_dir),
+            RuntimeManager::new(db.clone()),
+            crate::connector::ConnectorRuntime::new(db.clone()),
+        )
+        .with_tenant_id("tenant-1");
+        (db, runtime, "agentsess_tools".to_string())
+    }
+
     #[tokio::test]
     async fn interrupted_session_recovers_from_checkpoint() {
         let data_dir = std::env::temp_dir().join(format!("hpa-agent-recover-{}", Uuid::now_v7()));
@@ -2300,6 +3693,7 @@ mod tests {
             started_ms: now_ms(),
             updated_at: now.clone(),
             event_sequence: 0,
+            python: None,
         };
         let session_id = "agentsess_recover".to_string();
         db.insert_agent_session(&AgentSessionRow {
@@ -2339,5 +3733,87 @@ mod tests {
         let resumed_state = session_state(&resumed).expect("state");
         assert_eq!(resumed_state.output, Some(json!({"recovered": true})));
         assert!(resumed_state.event_sequence > 0);
+    }
+
+    #[tokio::test]
+    async fn python_tool_service_rejects_capability_scope_and_risk_downgrade() {
+        let (db, runtime, session_id) = python_tool_runtime().await;
+        let token = runtime
+            .issue_tool_capability(&session_id, "tenant-1", None, Duration::from_secs(60))
+            .await
+            .expect("capability");
+        let request = ToolInvokeRequest {
+            tenant_id: "tenant-1".to_string(),
+            session_id: session_id.clone(),
+            call_id: "call_list".to_string(),
+            tool: "workflow.list".to_string(),
+            arguments: json!({}),
+            idempotency_key: "call_list".to_string(),
+            risk: "read".to_string(),
+        };
+        let wrong_token = runtime.invoke_python_tool("wrong", request.clone()).await;
+        assert!(matches!(wrong_token, Err(AgentError::Forbidden(_))));
+
+        let wrong_tenant = ToolInvokeRequest {
+            tenant_id: "tenant-2".to_string(),
+            ..request.clone()
+        };
+        let result = runtime.invoke_python_tool(&token, wrong_tenant).await;
+        assert!(matches!(result, Err(AgentError::Forbidden(_))));
+
+        let undeclared = ToolInvokeRequest {
+            call_id: "call_get".to_string(),
+            tool: "execution.get".to_string(),
+            arguments: json!({"executionId": "exec_1"}),
+            idempotency_key: "call_get".to_string(),
+            ..request.clone()
+        };
+        let result = runtime.invoke_python_tool(&token, undeclared).await;
+        assert!(matches!(result, Err(AgentError::Forbidden(_))));
+
+        let downgraded = ToolInvokeRequest {
+            call_id: "call_workflow".to_string(),
+            tool: "workflow.execute".to_string(),
+            arguments: json!({
+                "workflowId": "wf_missing",
+                "version": "1.0.0",
+                "input": {}
+            }),
+            idempotency_key: "call_workflow".to_string(),
+            risk: "read".to_string(),
+            ..request.clone()
+        };
+        let result = runtime.invoke_python_tool(&token, downgraded).await;
+        assert!(matches!(result, Err(AgentError::Forbidden(_))));
+
+        let undeclared_handoff = ToolInvokeRequest {
+            call_id: "call_handoff".to_string(),
+            tool: "agent.handoff".to_string(),
+            arguments: json!({"agentId": "agent_not_declared", "input": {}}),
+            idempotency_key: "call_handoff".to_string(),
+            risk: "write".to_string(),
+            ..request.clone()
+        };
+        let result = runtime.invoke_python_tool(&token, undeclared_handoff).await;
+        assert!(matches!(result, Err(AgentError::Forbidden(_))));
+
+        let first = runtime
+            .invoke_python_tool(&token, request.clone())
+            .await
+            .expect("tool list");
+        assert_eq!(first.status, "succeeded");
+        assert_eq!(first.result, Some(json!({"workflows": []})));
+        let replay = runtime
+            .invoke_python_tool(&token, request)
+            .await
+            .expect("cached tool list");
+        assert_eq!(replay.call_id, first.call_id);
+        assert_eq!(replay.result, first.result);
+        let ledger = db
+            .get_agent_tool_call(&session_id, "call_list")
+            .await
+            .expect("ledger")
+            .expect("tool call");
+        assert_eq!(ledger.status, "succeeded");
     }
 }

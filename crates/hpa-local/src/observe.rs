@@ -44,6 +44,12 @@ async fn metrics_endpoint(State(state): State<EnterpriseState>, headers: HeaderM
 }
 
 async fn collect_tenant_gauges(state: &EnterpriseState) -> Result<(), ApiError> {
+    let mut workflows = 0i64;
+    let mut running = 0i64;
+    let mut waiting_approval = 0i64;
+    let mut succeeded = 0i64;
+    let mut failed = 0i64;
+    let mut enabled: BTreeMap<String, i64> = BTreeMap::new();
     for tenant in state.active_tenants().await? {
         let Ok(api) = state.tenant_api_state(&tenant).await else {
             continue;
@@ -51,45 +57,33 @@ async fn collect_tenant_gauges(state: &EnterpriseState) -> Result<(), ApiError> 
         let Ok(stats) = api.db.stats().await else {
             continue;
         };
-        metrics().set(
-            "hpa_workflows_total",
-            &[("tenant", &tenant)],
-            stats.workflows as f64,
-        );
-        metrics().set(
-            "hpa_executions_running",
-            &[("tenant", &tenant)],
-            stats.running as f64,
-        );
-        metrics().set(
-            "hpa_executions_waiting_approval",
-            &[("tenant", &tenant)],
-            stats.waiting_approval as f64,
-        );
-        metrics().set(
-            "hpa_executions_succeeded_total",
-            &[("tenant", &tenant)],
-            stats.succeeded as f64,
-        );
-        metrics().set(
-            "hpa_executions_failed_total",
-            &[("tenant", &tenant)],
-            stats.failed as f64,
-        );
+        workflows += stats.workflows;
+        running += stats.running;
+        waiting_approval += stats.waiting_approval;
+        succeeded += stats.succeeded;
+        failed += stats.failed;
         let Ok(triggers) = api.db.list_triggers().await else {
             continue;
         };
-        let mut enabled: BTreeMap<String, i64> = BTreeMap::new();
         for trigger in triggers.iter().filter(|trigger| trigger.enabled != 0) {
             *enabled.entry(trigger.kind.clone()).or_insert(0) += 1;
         }
-        for kind in ["schedule", "webhook", "event", "mcp"] {
-            metrics().set(
-                "hpa_triggers_enabled",
-                &[("tenant", &tenant), ("kind", kind)],
-                enabled.get(kind).copied().unwrap_or(0) as f64,
-            );
-        }
+    }
+    metrics().set("hpa_workflows_total", &[], workflows as f64);
+    metrics().set("hpa_executions_running", &[], running as f64);
+    metrics().set(
+        "hpa_executions_waiting_approval",
+        &[],
+        waiting_approval as f64,
+    );
+    metrics().set("hpa_executions_succeeded_total", &[], succeeded as f64);
+    metrics().set("hpa_executions_failed_total", &[], failed as f64);
+    for kind in ["schedule", "webhook", "event", "mcp"] {
+        metrics().set(
+            "hpa_triggers_enabled",
+            &[("kind", kind)],
+            enabled.get(kind).copied().unwrap_or(0) as f64,
+        );
     }
     Ok(())
 }

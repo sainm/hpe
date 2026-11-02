@@ -14,7 +14,6 @@
 | serde / serde_json | 1.0.229 | JSON/配置 |
 | saphyr | 0.3.3 | YAML 1.2/SourceMap |
 | jaq-core / jaq-std / jaq-json | 3.1.2 / 3.0.4 / 2.0.3 | jq 表达式 |
-| schemars | 1.2.3 | 节点/config schema |
 | jsonschema | 0.60.2 | IR 校验（禁用远程 ref） |
 | sqlx | 0.9.0（sqlite-bundled） | SQLite/迁移 |
 | tracing + tracing-subscriber | 0.1.44 | 日志/span |
@@ -22,7 +21,7 @@
 | rust-embed | 8.13.0 | 嵌入 Web UI |
 | clap | 4.6.7 | CLI |
 | uuid / time | 1.29.0 / 0.3.55 | ID/时间 |
-| utoipa | 6.0.0 | Local API OpenAPI（生成 TS 类型） |
+| 静态 OpenAPI/JSON Schema | 仓库契约 | `/api/openapi.json` 与契约门禁；当前 TS DTO 仍为手写 |
 
 不引入：Tonic/tonic-prost、Wasmtime、RMCP、Keyring（先用本地文件加密）、Temporal、Redis、MQ、Python。
 
@@ -54,9 +53,10 @@
 
 ### 契约
 
-- IR：`schema/ir/v1/*.json`（JSON Schema 2020-12）。
-- Local API：OpenAPI 3.1（utoipa 生成）。
-- TS 类型：`json-schema-to-typescript`（IR）+ `openapi-typescript`（API）。
+- IR：`schema/ir/v0.1/workflow.schema.json` 与 `node-registry.schema.json`（JSON Schema 2020-12）。
+- Local API：`schema/openapi/local-api.json`（OpenAPI 3.1 静态核心契约），运行时 `/api/openapi.json` 暴露；当前 TS DTO 手写。
+- 其他契约：`schema/events/v1/event.schema.json`、`schema/capabilities/v1/tool.schema.json`。
+- YAML SourceMap：`yaml_to_json_with_source_map` 返回 UTF-8 byte offset/line/column，并由 validation API 输出。
 - 事件：JSON/SSE；本地 SQLite。
 - 无 Proto/gRPC；本地单进程。
 
@@ -160,7 +160,7 @@
 
 ### 边界
 
-- 仅本地声明式插件；不执行 Node/TS handler；无远程 Marketplace、OCI、发布者账号/密钥轮换、CVE 扫描、DB/Git/MQ/S3 Connector 或租户隔离。
+- 基础 MVP 为声明式插件；P13 已增加远程/离线 Marketplace、发布者 key 轮换、DB/Git/MQ/S3 Connector、OSV 漏洞门禁和 key-based cosign/OCI digest provenance。仍未实现 Node/TS handler、Fulcio/Rekor keyless、OCI Registry attestation 拉取或当前 SQLite 生产模式的租户隔离切换。
 - 限流为进程内存；DNS 只校验一次；插件 permissions 不是通用运行时沙箱。
 
 ## 3f. Phase 6 本地 Enterprise 基座
@@ -189,7 +189,7 @@
 - 无 PostgreSQL RLS、HA/多节点、在线迁移、浏览器 SSO、远程/Hybrid Worker 派发、计费或租户暂停。
 - 固定角色粗粒度授权；成员目录不提供密码、组、会话或邀请。
 - 备份不含 `control.db`；恢复不重启进程；审计非 WORM/防篡改。
-- `/mcp` 与租户无关的 CLI 仍绑定 `local`。
+- `/mcp` 按 token 选择租户；`agent/skill/mcp/plugin/connector/run/doctor` CLI 仍直接操作本地租户。
 
 ## 3g. Phase 7 本地 VS Code & Copilot 集成
 
@@ -211,7 +211,7 @@
 ### 边界
 
 - 无模型驱动的 MCP `tools/call` 验证、浏览器 SSO、Custom Instructions/Agents、远程 Worker、Marketplace 发布或自动升级。
-- `/mcp` 仍只服务 `local` 租户；扩展宿主与 Runtime 必须共享文件系统。
+- `/mcp` 的租户由服务端 token 决定；扩展宿主与 Runtime 必须共享文件系统。
 - 固定 VS Code 1.143.1 实测；未建立跨版本矩阵。
 
 ## 3h. Phase 8 本地 Hybrid Worker
@@ -232,19 +232,19 @@
 ### 边界
 
 - 单节点 SQLite 控制面；无 Redis/多节点/HA/mTLS。
-- daemon 无持久 outbox；进程崩溃后依赖租约过期重排，副作用至少一次。
-- 远程审批 SLA 不自动超时；没有远程凭证注入/对象存储；不派发 Agent/Plugin 等非 Workflow 任务。
+- daemon 使用 `<data_dir>/worker-outbox.db` 持久化上报；已完成但尚未确认删除的结果在重启后重放，未完成执行仍依赖租约过期重排，副作用至少一次。
+- 控制面自动执行远程审批 SLA；没有远程凭证注入/对象存储；不派发 Agent/Plugin 等非 Workflow 任务。
 - Worker 与控制面版本必须匹配；能力当前为 `workflow`。
 
 ## 4. M0 构建/运行
 
 ```bash
 rustup toolchain install 1.99.1
-(cd apps/web && npm install && npm run build)
+(pnpm install --frozen-lockfile && pnpm --filter @hpa/web build)
 cargo run -p hpa-local -- serve
-(cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npm run dev)
+(pnpm --filter @hpa/web dev)
 cargo test --workspace
-(cd apps/web && npm test)
+(pnpm --filter @hpa/web test)
 hpa skill import fixtures/skills/invoice-audit
 hpa skill test skill_invoice_audit
 hpa skill run skill_invoice_audit --input '{"invoiceId":"inv_1","items":[]}'

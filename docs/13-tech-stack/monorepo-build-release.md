@@ -20,7 +20,7 @@ hisha/
 ├── .github/workflows/
 │
 ├── schema/
-│   ├── ir/v1/                  # Canonical IR JSON Schema
+│   ├── ir/v0.1/                # Canonical IR JSON Schema
 │   ├── node/v1/                # Node/Tool schema（生成 + 手写约束）
 │   ├── plugin/v1/              # Plugin manifest schema
 │   ├── connector/v1/
@@ -230,9 +230,9 @@ Jobs：
 | `docs` | links/Mermaid structure/required docs |
 | `release` | tag；构建/签名/公证/发布 |
 
-- Actions 固定 SHA；最小权限；环境 secrets；OIDC 发布；不打印 token。
+- 当前 CI 使用版本化 Action、`contents: read` 最小权限和冻结锁文件；正式发布应把 Action 再固定到受审 SHA，并接入 OIDC 发布与 environment secrets。不要在日志打印 token。
 - 缓存：sccache、pnpm store、uv cache、Cargo registry；缓存 key 包含 lockfile hash。
-- 分支保护：required checks；禁止跳过。
+- 分支保护是 GitHub 仓库外部配置：上线前应把 `CI / verify` 设为 required check 并禁止绕过。仓库文件本身不能证明该设置已启用。
 
 ## 7. 版本管理
 

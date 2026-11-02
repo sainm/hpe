@@ -1,0 +1,941 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "HPA Local API",
+    "version": "0.1.0",
+    "description": "Stable local API contract. Product-specific response fields remain documented in docs/08-platform/api-specification.md."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8787"
+    }
+  ],
+  "tags": [
+    { "name": "runtime" },
+    { "name": "workflows" },
+    { "name": "executions" },
+    { "name": "triggers" },
+    { "name": "agents" },
+    { "name": "mcp" },
+    { "name": "plugins" },
+    { "name": "enterprise" },
+    { "name": "scim" }
+  ],
+  "paths": {
+    "/api/health": {
+      "get": {
+        "tags": ["runtime"],
+        "summary": "Public health and build identity",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/ready": {
+      "get": {
+        "tags": ["runtime"],
+        "summary": "Dependency readiness probe",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "503": { "$ref": "#/components/responses/Json" }
+        }
+      }
+    },
+    "/api/nodes": {
+      "get": {
+        "tags": ["runtime"],
+        "summary": "Node Registry definitions",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/workflows/validate": {
+      "post": {
+        "tags": ["workflows"],
+        "summary": "Validate and canonicalize Workflow IR",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/workflows": {
+      "get": {
+        "tags": ["workflows"],
+        "summary": "List workflows",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "post": {
+        "tags": ["workflows"],
+        "summary": "Create or update a workflow draft",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/workflows/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["workflows"],
+        "summary": "Read a workflow",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "put": {
+        "tags": ["workflows"],
+        "summary": "Update a workflow draft",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/workflows/{id}/publish": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["workflows"],
+        "summary": "Publish an immutable workflow version",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/workflows/{id}/executions": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["executions"],
+        "summary": "Start a workflow execution",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "429": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/executions/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["executions"],
+        "summary": "Read execution state",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/executions/{id}/events": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["executions"],
+        "summary": "List persisted execution events",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/executions/{id}/events/stream": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["executions"],
+        "summary": "Stream execution events with Server-Sent Events",
+        "responses": { "200": { "description": "text/event-stream" } }
+      }
+    },
+    "/api/triggers": {
+      "get": {
+        "tags": ["triggers"],
+        "summary": "List persisted triggers",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/events/{topic}": {
+      "post": {
+        "tags": ["triggers"],
+        "summary": "Publish an event to matching event subscribers",
+        "parameters": [
+          {
+            "name": "topic",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$" }
+          }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "202": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/skills": {
+      "get": {
+        "tags": ["runtime"],
+        "summary": "List imported Skills",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/skills/{id}/versions/{version}/source": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Id" },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "tags": ["runtime"],
+        "summary": "Read text files from an immutable Skill version",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/skills/{id}/versions/{version}/draft": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Id" },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "tags": ["runtime"],
+        "summary": "Save edits as a new immutable Skill version",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/skills/{id}/versions/{version}/sign": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Id" },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "tags": ["runtime"],
+        "summary": "Sign a Skill snapshot with the local Ed25519 key",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/agents": {
+      "get": {
+        "tags": ["agents"],
+        "summary": "List Agents",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "post": {
+        "tags": ["agents"],
+        "summary": "Create an immutable AgentVersion",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/agents/{id}/run": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["agents"],
+        "summary": "Start an Agent session",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/agents/runtime": {
+      "get": {
+        "tags": ["agents"],
+        "summary": "Read available planners, default limits and authoritative tool risk labels",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/agents/tools": {
+      "get": {
+        "tags": ["agents"],
+        "summary": "List tools that can be declared by an AgentVersion",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/agents/sessions/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["agents"],
+        "summary": "Read an Agent session and its event log",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/agents/sessions/{id}/events": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["agents"],
+        "summary": "List ordered Agent session events",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/agents/sessions/{id}/continue": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["agents"],
+        "summary": "Recover an interrupted session from its persisted planner checkpoint",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/agents/sessions/{id}/cancel": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["agents"],
+        "summary": "Cancel a running Agent session and signal a live Python worker",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "404": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/agents/approvals/{id}/decide": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["agents"],
+        "summary": "Approve or reject a pending Agent tool call",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/internal/agent-tool-calls": {
+      "post": {
+        "tags": ["agents"],
+        "summary": "Internal session-bound tool execution endpoint for the Python Worker",
+        "description": "Requires a short-lived Bearer capability plus matching x-hpa-tenant-id. Rust independently checks AgentVersion declaration, risk, approval and idempotency.",
+        "parameters": [
+          {
+            "name": "x-hpa-tenant-id",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/mcp/overview": {
+      "get": {
+        "tags": ["mcp"],
+        "summary": "Read MCP Gateway runtime status",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/plugins": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List installed plugins",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/connections": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List Connector connections",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List local Marketplace listings",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/remote": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List verified packages from remote Marketplace sources",
+        "parameters": [
+          {
+            "name": "source",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/vulnerabilities/{id}/{version}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/Id" },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "get": {
+        "tags": ["plugins"],
+        "summary": "Query the configured OSV or offline vulnerability source for a plugin package",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/marketplace/events/latest": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "Read the latest persistent Marketplace event sequence",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/events/stream": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "Stream persistent Marketplace events with Last-Event-ID resume",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0 }
+          },
+          {
+            "name": "Last-Event-ID",
+            "in": "header",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Marketplace SSE stream",
+            "content": { "text/event-stream": { "schema": { "type": "string" } } }
+          }
+        }
+      }
+    },
+    "/api/marketplace/publishers": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List Marketplace publishers and registered signing keys",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Create or update a Marketplace publisher account",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/publishers/{id}/keys": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Register a publisher signing key",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "delete": {
+        "tags": ["plugins"],
+        "summary": "Revoke a publisher signing key",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/sources": {
+      "get": {
+        "tags": ["plugins"],
+        "summary": "List signed remote or offline Marketplace sources",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      },
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Configure a signed remote or offline Marketplace source",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/sources/{id}/rotate-key": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Rotate a Marketplace source index key",
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/sources/{id}/refresh": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Verify and refresh a Marketplace source",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/api/marketplace/remote/{source}/{id}/versions/{version}/install": {
+      "parameters": [
+        {
+          "name": "source",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        },
+        { "$ref": "#/components/parameters/Id" },
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "schema": { "type": "string" }
+        }
+      ],
+      "post": {
+        "tags": ["plugins"],
+        "summary": "Install an approved remote Marketplace package",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/mcp": {
+      "get": {
+        "tags": ["mcp"],
+        "summary": "Legacy MCP Server-Sent Events stream",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "description": "text/event-stream" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "post": {
+        "tags": ["mcp"],
+        "summary": "MCP JSON-RPC endpoint (modern or legacy)",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "delete": {
+        "tags": ["mcp"],
+        "summary": "Close a legacy MCP session",
+        "responses": { "204": { "description": "Session closed" } }
+      }
+    },
+    "/scim/v2/ServiceProviderConfig": {
+      "get": {
+        "tags": ["scim"],
+        "summary": "Read SCIM 2.0 service capabilities",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "401": { "$ref": "#/components/responses/ScimError" },
+          "403": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/ResourceTypes": {
+      "get": {
+        "tags": ["scim"],
+        "summary": "List SCIM resource types",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "401": { "$ref": "#/components/responses/ScimError" },
+          "403": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/Schemas": {
+      "get": {
+        "tags": ["scim"],
+        "summary": "List SCIM schemas",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "401": { "$ref": "#/components/responses/ScimError" },
+          "403": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/Users": {
+      "get": {
+        "tags": ["scim"],
+        "summary": "List or filter tenant SCIM Users",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "startIndex",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "default": 1 }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "maximum": 200 }
+          }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "400": { "$ref": "#/components/responses/ScimError" },
+          "401": { "$ref": "#/components/responses/ScimError" },
+          "403": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "post": {
+        "tags": ["scim"],
+        "summary": "Provision a tenant SCIM User",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "201": { "$ref": "#/components/responses/ScimJson" },
+          "400": { "$ref": "#/components/responses/ScimError" },
+          "401": { "$ref": "#/components/responses/ScimError" },
+          "403": { "$ref": "#/components/responses/ScimError" },
+          "409": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/Users/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["scim"],
+        "summary": "Read a SCIM User",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "404": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "put": {
+        "tags": ["scim"],
+        "summary": "Replace a SCIM User with If-Match support",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "409": { "$ref": "#/components/responses/ScimError" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "patch": {
+        "tags": ["scim"],
+        "summary": "Patch a SCIM User with RFC 7644 operations",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "409": { "$ref": "#/components/responses/ScimError" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "delete": {
+        "tags": ["scim"],
+        "summary": "Delete a SCIM User",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "204": { "description": "User deleted" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/Groups": {
+      "get": {
+        "tags": ["scim"],
+        "summary": "List or filter tenant SCIM Groups",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "400": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "post": {
+        "tags": ["scim"],
+        "summary": "Provision a SCIM Group and optional fixed role mapping",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "201": { "$ref": "#/components/responses/ScimJson" },
+          "409": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/scim/v2/Groups/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "get": {
+        "tags": ["scim"],
+        "summary": "Read a SCIM Group",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "404": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "put": {
+        "tags": ["scim"],
+        "summary": "Replace a SCIM Group with If-Match support",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "409": { "$ref": "#/components/responses/ScimError" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "patch": {
+        "tags": ["scim"],
+        "summary": "Patch SCIM Group attributes and membership",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Scim" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/ScimJson" },
+          "409": { "$ref": "#/components/responses/ScimError" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      },
+      "delete": {
+        "tags": ["scim"],
+        "summary": "Delete a SCIM Group and restore direct roles",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "204": { "description": "Group deleted" },
+          "412": { "$ref": "#/components/responses/ScimError" }
+        }
+      }
+    },
+    "/auth/oidc/login": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "Start browser OIDC Authorization Code + PKCE login",
+        "parameters": [
+          {
+            "name": "redirect",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "pattern": "^/" }
+          }
+        ],
+        "responses": {
+          "303": { "description": "Redirect to the configured identity provider" }
+        }
+      }
+    },
+    "/auth/oidc/callback": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "Complete browser OIDC login",
+        "responses": {
+          "303": { "description": "Set the HttpOnly browser session and redirect" }
+        }
+      }
+    },
+    "/auth/oidc/logout/callback": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "Validate RP-initiated logout state after the identity provider redirect",
+        "responses": {
+          "303": { "description": "Redirect to the logged-out browser route" }
+        }
+      }
+    },
+    "/auth/session": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "Read browser session, token expiry and refresh availability",
+        "responses": { "200": { "$ref": "#/components/responses/Json" } }
+      }
+    },
+    "/auth/refresh": {
+      "post": {
+        "tags": ["enterprise"],
+        "summary": "Rotate the browser session using the encrypted refresh token",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/auth/logout": {
+      "post": {
+        "tags": ["enterprise"],
+        "summary": "Revoke the browser session and return a validated RP-initiated logout URL",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/enterprise/oidc": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "Read OIDC bearer and browser SSO configuration",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      },
+      "put": {
+        "tags": ["enterprise"],
+        "summary": "Update OIDC bearer and browser SSO configuration",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "422": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/enterprise/tenants": {
+      "get": {
+        "tags": ["enterprise"],
+        "summary": "List enterprise tenants",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    },
+    "/api/enterprise/tenants/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "put": {
+        "tags": ["enterprise"],
+        "summary": "Suspend or reactivate a tenant",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "$ref": "#/components/requestBodies/Json" },
+        "responses": {
+          "200": { "$ref": "#/components/responses/Json" },
+          "401": { "$ref": "#/components/responses/Error" },
+          "403": { "$ref": "#/components/responses/Error" },
+          "409": { "$ref": "#/components/responses/Error" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "parameters": {
+      "Id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": { "type": "string" }
+      }
+    },
+    "requestBodies": {
+      "Json": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": { "type": "object", "additionalProperties": true }
+          }
+        }
+      },
+      "Scim": {
+        "required": true,
+        "content": {
+          "application/scim+json": {
+            "schema": { "type": "object", "additionalProperties": true }
+          }
+        }
+      }
+    },
+    "responses": {
+      "Json": {
+        "description": "JSON response",
+        "content": {
+          "application/json": {
+            "schema": { "type": "object", "additionalProperties": true }
+          }
+        }
+      },
+      "ScimJson": {
+        "description": "SCIM JSON response",
+        "content": {
+          "application/scim+json": {
+            "schema": { "type": "object", "additionalProperties": true }
+          }
+        }
+      },
+      "ScimError": {
+        "description": "SCIM structured error",
+        "content": {
+          "application/scim+json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Error": {
+        "description": "Structured API error",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": ["code", "message"],
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" },
+              "details": {}
+            },
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}
