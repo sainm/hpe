@@ -38,7 +38,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-02 分布式调度、租约与 outbox
 
-> 进度：**IN_PROGRESS**。PostgreSQL transactional outbox、tenant idempotency ledger、Topic Event outbox consumer、Scheduler fencing lease、实际 Scheduler leader 选举/续租/双进程强杀接管、execution owner lease/fenced state commit、Worker heartbeat/lease renewal/stale fencing/re-drive 已实现并通过并发、过期接管和死信测试；`HPA_POSTGRES_RUNTIME=1` 时 trigger facts 与 **Worker Job API（注册、心跳、租约、完成、取消、停用）**均走 PostgreSQL，`postgres_worker_registry` 断言 PostgreSQL 模式下 SQLite 注册表与任务表保持 0 行。多控制面滚动升级与跨节点 Worker 租约演练仍未验证。契约见 [分布式运行时原语](../08-platform/postgres-distributed-runtime.md)。
+> 进度：**IN_PROGRESS**。PostgreSQL transactional outbox、tenant idempotency ledger、Topic Event outbox consumer、Scheduler fencing lease、实际 Scheduler leader 选举/续租/双进程强杀接管、execution owner lease/fenced state commit、Worker heartbeat/lease renewal/stale fencing/re-drive 已实现并通过并发、过期接管和死信测试；`HPA_POSTGRES_RUNTIME=1` 时 trigger facts 与 **Worker Job API（注册、心跳、租约、完成、取消、停用）**均走 PostgreSQL，`postgres_worker_registry` 断言 PostgreSQL 模式下 SQLite 注册表与任务表保持 0 行。真实 Worker daemon 已在 PostgreSQL 控制面上完成租约→执行→写回（见下方证据）；多控制面滚动升级与跨节点 Worker 租约演练仍未验证。契约见 [分布式运行时原语](../08-platform/postgres-distributed-runtime.md)。
 
 交付：
 
@@ -199,6 +199,7 @@ Phase 13 必须保持以下不变量：
 - PostgreSQL ExecutionRuntime：真实 `hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 下完成 workflow snapshot/registry version 物化、execution insert/update、event 追加和 output artifact；PostgreSQL 中可直接核对 execution/events/artifact。强停并重启后 API 仍从 PostgreSQL 读取 execution 与 events。相同 workflow/version 的 IR 内容变化返回 `WorkflowSnapshotConflict`，跨租户查询为 0 行；remote execution marker 同库保存，本地 recovery 不接管远程执行；每日/并发配额也按 PostgreSQL execution 计数。
 - PostgreSQL WorkflowRepository：draft upsert、publish、current/list/version、workflow count 全部 PG；同版本变更失败关闭，新版本可追加，跨租户不可见。`hpa serve` E2E 证明发布版本不在 SQLite，API versions 与 Event Bus consumer 均从 PG 读取。
 - Execution Lease：每 step 前续租，state/events 提交匹配 holder/token/未过期 lease。lease 过期后节点 B 递增 token 接管，节点 A 的 save/release 失败；空 data_dir 节点可从 PG running execution + workflow snapshot 恢复完成并释放 lease。
+- Hybrid Worker + PostgreSQL 端到端：真实 `hpa worker` daemon 在 `HPA_POSTGRES_RUNTIME=1` 下从 PostgreSQL 领取任务、上报 `start`、执行完成并写回 `hpa_tenant.executions`/`events`，SQLite `enterprise_worker_jobs` 保持 0 行（`postgres_worker_daemon`）。该测试暴露并修复了一个只在 PostgreSQL 出现的缺陷：`remote_executions` 外键要求执行行先存在，而 worker `start` 原先在插入执行行之前就写远端标记，导致守护进程一直 500 重试。
 - PostgreSQL tokens & audit：`HPA_POSTGRES_RUNTIME=1` 时管理员令牌与审计事件均以 PostgreSQL 为权威——`hpa enterprise init` 写入 `hpa_control.tokens`，`/api/enterprise/tokens` 创建/列表/吊销与 Bearer 认证读同一张表，审计写入 `hpa_control.audit`。`postgres_token_store` 删除整个 data_dir 后用空目录重启，同一令牌仍通过认证、吊销在另一节点立即生效、SQLite `enterprise_tokens` 保持 0 行；未知租户的审计行回退为 NULL tenant，避免外键阻塞请求。
 - PostgreSQL 租户供给：`POST /api/enterprise/tenants` 在 PostgreSQL 模式下同步写入 `hpa_control.tenants`，避免新建租户注册 Worker 时触发 `workers_tenant_id_fkey`；`postgres_worker_registry` 每次运行使用独立租户并清理，重复执行结果一致。
 - PostgreSQL Worker registry：`HPA_POSTGRES_RUNTIME=1` 下 `POST /api/enterprise/workers`、worker 心跳与停用不再写入 SQLite 镜像，`enterprise_workers`/`enterprise_worker_jobs` 保持 0 行；任务租约（`/api/worker/lease`）从 PostgreSQL 领取并只改 PostgreSQL 行。该测试还暴露并修复了一个真实缺陷：`hpa_control.workers.max_concurrency` 是 `INTEGER`，此前按 `i64` 解码导致 `list/heartbeat/disable/lease` 全部 500。

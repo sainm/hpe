@@ -2630,13 +2630,6 @@ async fn persist_worker_state(
 ) -> Result<(), ApiError> {
     let entry = state.tenant_entry(&job.tenant_id).await?;
     let db = &entry.state.db;
-    if !db.is_remote_execution(&job.execution_id).await? {
-        db.mark_remote_execution(
-            &job.execution_id,
-            job.worker_id.as_deref().unwrap_or_default(),
-        )
-        .await?;
-    }
     let existing = db.get_execution(&job.execution_id).await?;
     if existing.is_none() {
         let start = events
@@ -2677,6 +2670,15 @@ async fn persist_worker_state(
         db.save_execution(execution_state, &rest).await?;
     } else {
         db.save_execution(execution_state, events).await?;
+    }
+    // Mark the execution as remote only after its row exists: PostgreSQL
+    // enforces the (tenant_id, execution_id) foreign key on remote_executions.
+    if !db.is_remote_execution(&job.execution_id).await? {
+        db.mark_remote_execution(
+            &job.execution_id,
+            job.worker_id.as_deref().unwrap_or_default(),
+        )
+        .await?;
     }
     if execution_state.status.is_terminal() {
         db.save_output_artifact(execution_state).await?;
