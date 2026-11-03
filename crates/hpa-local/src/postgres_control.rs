@@ -9,7 +9,9 @@ use serde_json::Value;
 use sqlx::Row;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::types::Json;
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +91,35 @@ pub struct MemberRecord {
     pub status: String,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScimMemberRecord {
+    pub id: String,
+    pub tenant_id: String,
+    pub subject: String,
+    pub user_name: Option<String>,
+    pub external_id: Option<String>,
+    pub display_name: String,
+    pub email: Option<String>,
+    pub role: String,
+    pub base_role: String,
+    pub scim_json: Value,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScimGroupRecord {
+    pub id: String,
+    pub tenant_id: String,
+    pub display_name: String,
+    pub external_id: Option<String>,
+    pub role: Option<String>,
+    pub scim_json: Value,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -634,6 +665,382 @@ impl PostgresControlStore {
             .collect()
     }
 
+    pub async fn scim_member_by_id(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> Result<Option<ScimMemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT id, tenant_id, subject, user_name, external_id, display_name, email,
+                    role, base_role, scim_json, status, created_at, updated_at
+             FROM hpa_control.members WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.as_ref().map(scim_member_from_row).transpose()
+    }
+
+    pub async fn scim_member_for_identity(
+        &self,
+        tenant_id: &str,
+        subject: &str,
+        email: Option<&str>,
+    ) -> Result<Option<ScimMemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT id, tenant_id, subject, user_name, external_id, display_name, email,
+                    role, base_role, scim_json, status, created_at, updated_at
+             FROM hpa_control.members
+             WHERE tenant_id = $1
+               AND (subject = $2
+                    OR ($3::text IS NOT NULL AND email IS NOT NULL
+                        AND lower(email) = lower($3)))
+             ORDER BY CASE WHEN subject = $2 THEN 0 ELSE 1 END
+             LIMIT 1",
+        )
+        .bind(tenant_id)
+        .bind(subject)
+        .bind(email)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.as_ref().map(scim_member_from_row).transpose()
+    }
+
+    pub async fn scim_list_members(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<ScimMemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, subject, user_name, external_id, display_name, email,
+                    role, base_role, scim_json, status, created_at, updated_at
+             FROM hpa_control.members WHERE tenant_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.iter().map(scim_member_from_row).collect()
+    }
+
+    pub async fn scim_create_member(&self, member: &ScimMemberRecord) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.members
+             (id, tenant_id, subject, user_name, external_id, display_name, email, role,
+              base_role, scim_json, status, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        )
+        .bind(&member.id)
+        .bind(&member.tenant_id)
+        .bind(&member.subject)
+        .bind(member.user_name.as_deref())
+        .bind(member.external_id.as_deref())
+        .bind(&member.display_name)
+        .bind(member.email.as_deref())
+        .bind(&member.role)
+        .bind(&member.base_role)
+        .bind(Json(member.scim_json.clone()))
+        .bind(&member.status)
+        .bind(parse_scim_time(&member.created_at)?)
+        .bind(parse_scim_time(&member.updated_at)?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scim_update_member(&self, member: &ScimMemberRecord) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "UPDATE hpa_control.members
+             SET subject = $1, user_name = $2, external_id = $3, display_name = $4,
+                 email = $5, role = $6, base_role = $7, scim_json = $8, status = $9,
+                 updated_at = $10
+             WHERE tenant_id = $11 AND id = $12",
+        )
+        .bind(&member.subject)
+        .bind(member.user_name.as_deref())
+        .bind(member.external_id.as_deref())
+        .bind(&member.display_name)
+        .bind(member.email.as_deref())
+        .bind(&member.role)
+        .bind(&member.base_role)
+        .bind(Json(member.scim_json.clone()))
+        .bind(&member.status)
+        .bind(parse_scim_time(&member.updated_at)?)
+        .bind(&member.tenant_id)
+        .bind(&member.id)
+        .execute(&mut *transaction)
+        .await?;
+        sync_member_role(&mut transaction, &member.tenant_id, &member.id).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scim_delete_member(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> Result<bool, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let deleted =
+            sqlx::query("DELETE FROM hpa_control.members WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+        transaction.commit().await?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    pub async fn revoke_tenant_tokens(&self, tenant_id: &str) -> Result<usize, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let revoked = sqlx::query(
+            "UPDATE hpa_control.tokens SET revoked_at = now(), updated_at = now()
+             WHERE tenant_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(tenant_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(revoked.rows_affected() as usize)
+    }
+
+    pub async fn scim_member_any_id(
+        &self,
+        id: &str,
+    ) -> Result<Option<ScimMemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT id, tenant_id, subject, user_name, external_id, display_name, email,
+                    role, base_role, scim_json, status, created_at, updated_at
+             FROM hpa_control.members WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.as_ref().map(scim_member_from_row).transpose()
+    }
+
+    pub async fn scim_delete_member_any_id(&self, id: &str) -> Result<bool, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let deleted = sqlx::query("DELETE FROM hpa_control.members WHERE id = $1")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    pub async fn scim_member_groups(
+        &self,
+        tenant_id: &str,
+        member_id: &str,
+    ) -> Result<Vec<(String, String)>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT g.id, g.display_name
+             FROM hpa_control.scim_groups g
+             JOIN hpa_control.scim_group_members gm
+               ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
+             WHERE gm.tenant_id = $1 AND gm.member_id = $2
+             ORDER BY lower(g.display_name)",
+        )
+        .bind(tenant_id)
+        .bind(member_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.iter()
+            .map(|row| Ok((row.try_get("id")?, row.try_get("display_name")?)))
+            .collect()
+    }
+
+    pub async fn scim_group_roles_for_member(
+        &self,
+        tenant_id: &str,
+        member_id: &str,
+    ) -> Result<Vec<String>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let roles = sqlx::query_scalar(
+            "SELECT DISTINCT g.role
+             FROM hpa_control.scim_groups g
+             JOIN hpa_control.scim_group_members gm
+               ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
+             WHERE gm.tenant_id = $1 AND gm.member_id = $2 AND g.role IS NOT NULL
+             ORDER BY g.role",
+        )
+        .bind(tenant_id)
+        .bind(member_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(roles)
+    }
+
+    pub async fn scim_group_by_id(
+        &self,
+        tenant_id: &str,
+        id: &str,
+    ) -> Result<Option<ScimGroupRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let row = sqlx::query(
+            "SELECT id, tenant_id, display_name, external_id, role, scim_json,
+                    created_at, updated_at
+             FROM hpa_control.scim_groups WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.as_ref().map(scim_group_from_row).transpose()
+    }
+
+    pub async fn scim_list_groups(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<ScimGroupRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, display_name, external_id, role, scim_json,
+                    created_at, updated_at
+             FROM hpa_control.scim_groups WHERE tenant_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.iter().map(scim_group_from_row).collect()
+    }
+
+    pub async fn scim_group_members(
+        &self,
+        tenant_id: &str,
+        group_id: &str,
+    ) -> Result<Vec<ScimMemberRecord>, ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let rows = sqlx::query(
+            "SELECT m.id, m.tenant_id, m.subject, m.user_name, m.external_id,
+                    m.display_name, m.email, m.role, m.base_role, m.scim_json,
+                    m.status, m.created_at, m.updated_at
+             FROM hpa_control.members m
+             JOIN hpa_control.scim_group_members gm
+               ON gm.member_id = m.id AND gm.tenant_id = m.tenant_id
+             WHERE gm.tenant_id = $1 AND gm.group_id = $2
+             ORDER BY lower(m.display_name)",
+        )
+        .bind(tenant_id)
+        .bind(group_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.iter().map(scim_member_from_row).collect()
+    }
+
+    pub async fn scim_create_group(
+        &self,
+        group: &ScimGroupRecord,
+        members: &BTreeSet<String>,
+    ) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        sqlx::query(
+            "INSERT INTO hpa_control.scim_groups
+             (id, tenant_id, display_name, external_id, role, scim_json, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&group.id)
+        .bind(&group.tenant_id)
+        .bind(&group.display_name)
+        .bind(group.external_id.as_deref())
+        .bind(group.role.as_deref())
+        .bind(Json(group.scim_json.clone()))
+        .bind(parse_scim_time(&group.created_at)?)
+        .bind(parse_scim_time(&group.updated_at)?)
+        .execute(&mut *transaction)
+        .await?;
+        replace_group_members(&mut transaction, &group.tenant_id, &group.id, members).await?;
+        for member_id in members {
+            sync_member_role(&mut transaction, &group.tenant_id, member_id).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scim_update_group(
+        &self,
+        group: &ScimGroupRecord,
+        members: &BTreeSet<String>,
+    ) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let before: Vec<String> = sqlx::query_scalar(
+            "SELECT member_id FROM hpa_control.scim_group_members
+             WHERE tenant_id = $1 AND group_id = $2",
+        )
+        .bind(&group.tenant_id)
+        .bind(&group.id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE hpa_control.scim_groups
+             SET display_name = $1, external_id = $2, role = $3, scim_json = $4,
+                 updated_at = $5
+             WHERE tenant_id = $6 AND id = $7",
+        )
+        .bind(&group.display_name)
+        .bind(group.external_id.as_deref())
+        .bind(group.role.as_deref())
+        .bind(Json(group.scim_json.clone()))
+        .bind(parse_scim_time(&group.updated_at)?)
+        .bind(&group.tenant_id)
+        .bind(&group.id)
+        .execute(&mut *transaction)
+        .await?;
+        replace_group_members(&mut transaction, &group.tenant_id, &group.id, members).await?;
+        let mut affected: BTreeSet<String> = before.into_iter().collect();
+        affected.extend(members.iter().cloned());
+        for member_id in affected {
+            sync_member_role(&mut transaction, &group.tenant_id, &member_id).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn scim_delete_group(
+        &self,
+        tenant_id: &str,
+        group_id: &str,
+    ) -> Result<(), ControlError> {
+        let mut transaction = self.begin_admin().await?;
+        let affected: Vec<String> = sqlx::query_scalar(
+            "SELECT member_id FROM hpa_control.scim_group_members
+             WHERE tenant_id = $1 AND group_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(group_id)
+        .fetch_all(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM hpa_control.scim_groups WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id)
+            .bind(group_id)
+            .execute(&mut *transaction)
+            .await?;
+        for member_id in affected {
+            sync_member_role(&mut transaction, tenant_id, &member_id).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     /// Audit must never fail the request it describes. If the tenant is not yet
     /// known to PostgreSQL the row is retried with a NULL tenant instead of
     /// letting the foreign key reject it.
@@ -672,6 +1079,138 @@ impl PostgresControlStore {
         transaction.commit().await?;
         Ok(())
     }
+}
+
+fn scim_member_from_row(row: &PgRow) -> Result<ScimMemberRecord, ControlError> {
+    Ok(ScimMemberRecord {
+        id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
+        subject: row.try_get("subject")?,
+        user_name: row.try_get("user_name")?,
+        external_id: row.try_get("external_id")?,
+        display_name: row.try_get("display_name")?,
+        email: row.try_get("email")?,
+        role: row.try_get("role")?,
+        base_role: row.try_get("base_role")?,
+        scim_json: row.try_get("scim_json")?,
+        status: row.try_get("status")?,
+        created_at: format_scim_time(row.try_get("created_at")?),
+        updated_at: format_scim_time(row.try_get("updated_at")?),
+    })
+}
+
+fn scim_group_from_row(row: &PgRow) -> Result<ScimGroupRecord, ControlError> {
+    Ok(ScimGroupRecord {
+        id: row.try_get("id")?,
+        tenant_id: row.try_get("tenant_id")?,
+        display_name: row.try_get("display_name")?,
+        external_id: row.try_get("external_id")?,
+        role: row.try_get("role")?,
+        scim_json: row.try_get("scim_json")?,
+        created_at: format_scim_time(row.try_get("created_at")?),
+        updated_at: format_scim_time(row.try_get("updated_at")?),
+    })
+}
+
+fn parse_scim_time(value: &str) -> Result<OffsetDateTime, ControlError> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map_err(|error| ControlError::Invalid(format!("invalid timestamp `{value}`: {error}")))
+}
+
+fn format_scim_time(value: OffsetDateTime) -> String {
+    value.format(&Rfc3339).unwrap_or_default()
+}
+
+async fn replace_group_members(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+    group_id: &str,
+    members: &BTreeSet<String>,
+) -> Result<(), ControlError> {
+    for member_id in members {
+        let exists: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM hpa_control.members WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(member_id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if exists.is_none() {
+            return Err(ControlError::Invalid(format!(
+                "group member `{member_id}` does not exist in this tenant"
+            )));
+        }
+    }
+    sqlx::query(
+        "DELETE FROM hpa_control.scim_group_members WHERE tenant_id = $1 AND group_id = $2",
+    )
+    .bind(tenant_id)
+    .bind(group_id)
+    .execute(&mut **transaction)
+    .await?;
+    let now = OffsetDateTime::now_utc();
+    for member_id in members {
+        sqlx::query(
+            "INSERT INTO hpa_control.scim_group_members
+             (tenant_id, group_id, member_id, created_at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant_id)
+        .bind(group_id)
+        .bind(member_id)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn sync_member_role(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant_id: &str,
+    member_id: &str,
+) -> Result<(), ControlError> {
+    let base_role: Option<String> = sqlx::query_scalar(
+        "SELECT base_role FROM hpa_control.members WHERE tenant_id = $1 AND id = $2",
+    )
+    .bind(tenant_id)
+    .bind(member_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(base_role) = base_role else {
+        return Err(ControlError::Invalid(format!(
+            "member `{member_id}` does not exist"
+        )));
+    };
+    let roles: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT g.role
+         FROM hpa_control.scim_groups g
+         JOIN hpa_control.scim_group_members gm
+           ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
+         WHERE gm.tenant_id = $1 AND gm.member_id = $2 AND g.role IS NOT NULL
+         ORDER BY g.role",
+    )
+    .bind(tenant_id)
+    .bind(member_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if roles.len() > 1 {
+        return Err(ControlError::Invalid(
+            "member belongs to SCIM Groups mapped to different roles".to_string(),
+        ));
+    }
+    let effective_role = roles.first().cloned().unwrap_or(base_role);
+    sqlx::query(
+        "UPDATE hpa_control.members SET role = $1, updated_at = $2
+         WHERE tenant_id = $3 AND id = $4",
+    )
+    .bind(effective_role)
+    .bind(OffsetDateTime::now_utc())
+    .bind(tenant_id)
+    .bind(member_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 fn token_from_row(row: PgRow) -> Result<TokenRecord, ControlError> {

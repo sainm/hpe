@@ -1,6 +1,6 @@
 # PostgreSQL 控制面基线
 
-> 状态：**P13-01 IN_PROGRESS**。schema、SQLx migration、角色分离、RLS、SQLite 导入、Workflow/Execution/Trigger Repository 已在 PostgreSQL 18 执行通过；`HPA_POSTGRES_RUNTIME=1` 时 workflow/version、execution/event/artifact、trigger_state/trigger_fires、execution lease 和 remote marker 已切换并可跨进程重启读取。Enterprise/Worker Job 和多数 Agent/Skill 元数据仍使用 SQLite，不能宣称生产控制面已整体切换。
+> 状态：**P13-01 IN_PROGRESS**。schema、SQLx migration、角色分离、RLS、SQLite 导入、Workflow/Execution/Trigger Repository 已在 PostgreSQL 18 执行通过；`HPA_POSTGRES_RUNTIME=1` 时 workflow/version、execution/event/artifact、trigger_state/trigger_fires、execution lease、remote marker、Worker Job、平台令牌/审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group 与 Agent 版本/会话/事件/审批/工具调用已切换并可跨进程读取；SQLite 控制表作为可重建缓存。Skill 元数据仍使用 SQLite，不能宣称生产控制面已整体切换。
 
 ## 1. 边界
 
@@ -105,7 +105,7 @@ export HPA_POSTGRES_RUNTIME=1
 hpa serve --port 8787
 ```
 
-启动时校验 `hpa_tenant.executions` schema。第一次访问租户时把 SQLite 控制库中的 tenant id/name/status/timestamps 幂等同步到 `hpa_control.tenants`，随后该租户的以下操作进入 PostgreSQL：
+启动时校验 `hpa_tenant.executions` schema，并从 PostgreSQL 重建本机 SQLite 控制缓存（租户/配额/成员）；API 不再把 SQLite 写回 PostgreSQL。随后以下操作进入 PostgreSQL：
 
 - API 创建 execution、RuntimeManager 读取/保存 state 与 events。
 - Workflow draft upsert、publish、版本冻结、列表和详情读写。
@@ -120,7 +120,7 @@ hpa serve --port 8787
 
 API 不接受请求体切换 tenant：`tenantId` 若存在必须等于认证租户，否则返回 400 `TENANT_MISMATCH`；Repository 再次校验 state 内嵌 tenant，防止绕过 API 的伪造。
 
-执行模式中的 `remote_executions` marker 同步写入 PostgreSQL；Hybrid Worker 写入 execution 后，本地 recovery 不会接管该远程执行。Workflow draft/current row 与 frozen version 均写 PostgreSQL。当前限制：Enterprise 控制库、Worker Job API 和大多数 Agent/Skill 元数据仍未切换。此模式不证明 P13-01 完成。
+执行模式中的 `remote_executions` marker 同步写入 PostgreSQL；Hybrid Worker 写入 execution 后，本地 recovery 不会接管该远程执行。Workflow draft/current row 与 frozen version 均写 PostgreSQL。当前限制：Skill 元数据与部分 Agent 工具实现仍依赖 SQLite；跨节点 Agent 使用 Skill 前需在目标节点导入 Skill。此模式不证明 P13-01 完成。
 
 Execution owner 使用 `HPA_NODE_ID`、`HPA_EXECUTION_LEASE_TTL_SECONDS`（默认 30 秒）和 `HPA_EXECUTION_RECOVERY_TICK_MS`（默认 5000）。每个 step 前续租，state/events 更新必须匹配 holder + fencing token 且 lease 未过期。节点故障后其他控制面扫描 running execution，lease 过期后递增 token 接管；旧 owner 的后续 commit/release 失败。
 
@@ -180,7 +180,7 @@ Phase 13 基线不提供自动 down migration。企业数据删除不可逆，�
 
 ## 9. 尚未完成
 
-- Workflow/Execution/Event/Artifact/Trigger Repository 已有显式 PostgreSQL 路由并验证重启读取与 topic fan-out；Enterprise/Worker Job/Agent 等其余生产 API 仍使用 SQLite。
-- SQLite→PostgreSQL 数据导入已有幂等实现；自动切换、存量执行双写对账和整库切换演练尚未实现。
+- Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS 与 Agent 版本/会话/事件/审批/工具调用已有显式 PostgreSQL 路由并验证跨节点读取；Skill 等其余元数据仍使用 SQLite。
+- SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；Skill 整库迁移与真实 HA 演练尚未实现。
 - 对象存储、只读副本、在线 PITR、连接重试和多控制面部署属于后续 P13-02/P13-06。
 - 本文件中的 PASS 只适用于 schema/RLS/migration 基线，不适用于完整 P13-01 或 Phase 13。

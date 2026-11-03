@@ -1,5 +1,6 @@
-//! `hpa db verify-mirror` must report real drift between the SQLite control
-//! plane and its PostgreSQL mirror, and stay quiet when both agree.
+//! `hpa db verify-mirror` must report real drift between the authoritative
+//! PostgreSQL control plane and the rebuildable SQLite cache, and stay quiet
+//! when both agree.
 //!
 //! Skipped when `HPA_POSTGRES_TEST_URL` is absent.
 
@@ -149,18 +150,21 @@ async fn verify_mirror_detects_and_clears_drift() {
     let member: Value = member.json().await.expect("member json");
     let member_id = member["id"].as_str().expect("member id").to_string();
 
-    // In-sync state reports zero drift.
-    let (ok, stdout) = run_cli(&data_dir, &["db", "verify-mirror"], &database_url);
-    let report: Value = serde_json::from_str(&stdout).expect("verify json");
-    assert!(ok, "verify-mirror should succeed without drift: {report}");
-    assert_eq!(
-        report["drift"]["total"],
-        json!(0),
-        "unexpected drift: {report}"
-    );
+    // PostgreSQL is authoritative; the SQLite cache converges on the next refresh.
+    let mut in_sync = None;
+    for _ in 0..100 {
+        let (ok, stdout) = run_cli(&data_dir, &["db", "verify-mirror"], &database_url);
+        let report: Value = serde_json::from_str(&stdout).expect("verify json");
+        if ok && report["drift"]["total"] == json!(0) {
+            in_sync = Some(report);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let report = in_sync.unwrap_or_else(|| panic!("SQLite cache did not converge"));
     assert_eq!(report["counts"]["tenants"]["sqlite"], json!(2));
 
-    // A SQLite-only change (what SCIM does) must be reported as drift.
+    // A SQLite-cache change must be reported as drift.
     let control_db = data_dir.join("control.db");
     let sqlite = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)

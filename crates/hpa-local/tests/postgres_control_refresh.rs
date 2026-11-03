@@ -1,5 +1,5 @@
-//! SCIM writes still land in SQLite, so the periodic control-plane mirror must
-//! carry them into PostgreSQL without a restart.
+//! SCIM writes PostgreSQL directly; the periodic PG→SQLite cache rebuild must
+//! keep local rows and the shared database in step without a restart.
 //!
 //! Skipped when `HPA_POSTGRES_TEST_URL` is absent.
 
@@ -111,7 +111,7 @@ impl Drop for Server {
 }
 
 #[tokio::test]
-async fn periodic_mirror_carries_scim_members_into_postgres() {
+async fn scim_members_are_authoritative_and_cache_converges() {
     let Ok(database_url) = std::env::var("HPA_POSTGRES_TEST_URL") else {
         eprintln!("skipped: HPA_POSTGRES_TEST_URL is not set");
         return;
@@ -140,7 +140,7 @@ async fn periodic_mirror_carries_scim_members_into_postgres() {
     let tenant: Value = tenant.json().await.expect("tenant json");
     let tenant_id = tenant["id"].as_str().expect("tenant id").to_string();
 
-    // SCIM writes the member through the SQLite path only.
+    // SCIM writes PostgreSQL directly; the row must be visible without a restart.
     let user_name = format!("mirror-{}@example.test", uuid::Uuid::now_v7().simple());
     let created = server
         .client
@@ -166,7 +166,7 @@ async fn periodic_mirror_carries_scim_members_into_postgres() {
         .await
         .expect("connect postgres");
 
-    // The periodic mirror should carry the row in within a few intervals.
+    // The shared row is authoritative and independent of the local cache.
     let mut mirrored = false;
     for _ in 0..100 {
         let found: Option<String> =

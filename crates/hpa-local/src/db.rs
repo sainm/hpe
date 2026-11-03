@@ -1,6 +1,10 @@
 use std::path::Path;
 
 use hpa_core::runtime::{ExecutionEvent, ExecutionState, ExecutionStatus};
+use hpa_local::postgres_agent::{
+    AgentApprovalRecord, AgentEventRecord, AgentSessionRecord, AgentSummaryRecord,
+    AgentToolCallRecord, AgentVersionRecord, PostgresAgentError, PostgresAgentStore,
+};
 use hpa_local::postgres_execution::{
     ArtifactRecord, ExecutionLeaseRecord, ExecutionRecord, PostgresExecutionError,
     PostgresExecutionStore, WorkflowRecord, WorkflowVersionRecord,
@@ -33,6 +37,8 @@ pub enum DbError {
     PostgresExecution(String),
     #[error("PostgreSQL trigger error: {0}")]
     PostgresTrigger(String),
+    #[error("PostgreSQL agent error: {0}")]
+    PostgresAgent(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -42,6 +48,7 @@ pub struct Db {
     pub pool: SqlitePool,
     postgres_execution: Option<PostgresExecutionStore>,
     postgres_trigger: Option<PostgresTriggerStore>,
+    postgres_agent: Option<PostgresAgentStore>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -311,6 +318,166 @@ pub struct AgentToolCallRow {
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl From<AgentSummaryRecord> for AgentSummaryRow {
+    fn from(record: AgentSummaryRecord) -> Self {
+        Self {
+            id: record.id,
+            name: record.name,
+            latest_version: record.latest_version,
+            status: record.status,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<&AgentVersionRow> for AgentVersionRecord {
+    fn from(row: &AgentVersionRow) -> Self {
+        Self {
+            agent_id: row.agent_id.clone(),
+            version: row.version.clone(),
+            name: row.name.clone(),
+            description: row.description.clone(),
+            config_json: row.config_json.clone(),
+            content_hash: row.content_hash.clone(),
+            status: row.status.clone(),
+            created_at: row.created_at.clone(),
+            published_at: row.published_at.clone(),
+        }
+    }
+}
+
+impl From<AgentVersionRecord> for AgentVersionRow {
+    fn from(record: AgentVersionRecord) -> Self {
+        Self {
+            agent_id: record.agent_id,
+            version: record.version,
+            name: record.name,
+            description: record.description,
+            config_json: record.config_json,
+            content_hash: record.content_hash,
+            status: record.status,
+            created_at: record.created_at,
+            published_at: record.published_at,
+        }
+    }
+}
+
+impl From<&AgentSessionRow> for AgentSessionRecord {
+    fn from(row: &AgentSessionRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            agent_id: row.agent_id.clone(),
+            agent_version: row.agent_version.clone(),
+            status: row.status.clone(),
+            input_json: row.input_json.clone(),
+            output_json: row.output_json.clone(),
+            state_json: row.state_json.clone(),
+            error_json: row.error_json.clone(),
+            parent_session_id: row.parent_session_id.clone(),
+            depth: row.depth,
+            created_at: row.created_at.clone(),
+            updated_at: row.updated_at.clone(),
+            finished_at: row.finished_at.clone(),
+        }
+    }
+}
+
+impl From<AgentSessionRecord> for AgentSessionRow {
+    fn from(record: AgentSessionRecord) -> Self {
+        Self {
+            id: record.id,
+            agent_id: record.agent_id,
+            agent_version: record.agent_version,
+            status: record.status,
+            input_json: record.input_json,
+            output_json: record.output_json,
+            state_json: record.state_json,
+            error_json: record.error_json,
+            parent_session_id: record.parent_session_id,
+            depth: record.depth,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            finished_at: record.finished_at,
+        }
+    }
+}
+
+impl From<&AgentEventRow> for AgentEventRecord {
+    fn from(row: &AgentEventRow) -> Self {
+        Self {
+            session_id: row.session_id.clone(),
+            sequence: row.sequence,
+            at: row.at.clone(),
+            kind: row.kind.clone(),
+            data_json: row.data_json.clone(),
+        }
+    }
+}
+
+impl From<AgentEventRecord> for AgentEventRow {
+    fn from(record: AgentEventRecord) -> Self {
+        Self {
+            session_id: record.session_id,
+            sequence: record.sequence,
+            at: record.at,
+            kind: record.kind,
+            data_json: record.data_json,
+        }
+    }
+}
+
+impl From<AgentApprovalRecord> for AgentApprovalRow {
+    fn from(record: AgentApprovalRecord) -> Self {
+        Self {
+            id: record.id,
+            session_id: record.session_id,
+            tool_name: record.tool_name,
+            args_json: record.args_json,
+            risk: record.risk,
+            status: record.status,
+            created_at: record.created_at,
+            expires_at: record.expires_at,
+            decided_at: record.decided_at,
+            used_at: record.used_at,
+        }
+    }
+}
+
+impl From<AgentToolCallRow> for AgentToolCallRecord {
+    fn from(row: AgentToolCallRow) -> Self {
+        Self {
+            session_id: row.session_id,
+            call_id: row.call_id,
+            idempotency_key: row.idempotency_key,
+            tool_name: row.tool_name,
+            request_hash: row.request_hash,
+            status: row.status,
+            response_json: row.response_json,
+            error: row.error,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+impl From<AgentToolCallRecord> for AgentToolCallRow {
+    fn from(record: AgentToolCallRecord) -> Self {
+        Self {
+            session_id: record.session_id,
+            call_id: record.call_id,
+            idempotency_key: record.idempotency_key,
+            tool_name: record.tool_name,
+            request_hash: record.request_hash,
+            status: record.status,
+            response_json: record.response_json,
+            error: record.error,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -984,6 +1151,7 @@ impl Db {
             pool,
             postgres_execution: None,
             postgres_trigger: None,
+            postgres_agent: None,
         })
     }
 
@@ -994,6 +1162,7 @@ impl Db {
     ) -> Self {
         let tenant_id = tenant_id.into();
         self.postgres_execution = Some(PostgresExecutionStore::new(pool.clone(), &tenant_id));
+        self.postgres_agent = Some(PostgresAgentStore::new(pool.clone(), &tenant_id));
         self.postgres_trigger = Some(PostgresTriggerStore::new(pool, tenant_id));
         self
     }
@@ -1004,6 +1173,15 @@ impl Db {
 
     fn map_postgres_trigger(error: PostgresTriggerError) -> DbError {
         DbError::PostgresTrigger(error.to_string())
+    }
+
+    fn map_postgres_agent(error: PostgresAgentError) -> DbError {
+        match error {
+            PostgresAgentError::VersionFrozen { agent_id, version } => {
+                DbError::AgentVersionFrozen { agent_id, version }
+            }
+            other => DbError::PostgresAgent(other.to_string()),
+        }
     }
 
     pub async fn upsert_workflow(&self, row: &WorkflowRow) -> DbResult<()> {
@@ -2317,6 +2495,12 @@ impl Db {
     }
 
     pub async fn upsert_agent_version(&self, row: &AgentVersionRow) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .upsert_agent_version(&AgentVersionRecord::from(row))
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT content_hash FROM agent_versions WHERE agent_id = ? AND version = ?",
         )
@@ -2368,7 +2552,38 @@ impl Db {
         Ok(true)
     }
 
+    pub async fn agent_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store.count_agents().await.map_err(Self::map_postgres_agent);
+        }
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agents")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub async fn agent_sessions_on(&self, day: &str) -> DbResult<i64> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .count_agent_sessions_on(day)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM agent_sessions WHERE created_at LIKE ?")
+                .bind(format!("{day}%"))
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn list_agents(&self) -> DbResult<Vec<AgentSummaryRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .list_agents()
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentSummaryRow>(
             "SELECT id, name, latest_version, status, created_at, updated_at
              FROM agents ORDER BY updated_at DESC",
@@ -2378,6 +2593,13 @@ impl Db {
     }
 
     pub async fn get_agent(&self, id: &str) -> DbResult<Option<AgentSummaryRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .get_agent(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentSummaryRow>(
             "SELECT id, name, latest_version, status, created_at, updated_at
              FROM agents WHERE id = ?",
@@ -2392,6 +2614,13 @@ impl Db {
         agent_id: &str,
         version: &str,
     ) -> DbResult<Option<AgentVersionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .get_agent_version(agent_id, version)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentVersionRow>(
             "SELECT agent_id, version, name, description, config_json, content_hash, status,
                     created_at, published_at
@@ -2404,6 +2633,13 @@ impl Db {
     }
 
     pub async fn list_agent_versions(&self, agent_id: &str) -> DbResult<Vec<AgentVersionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .list_agent_versions(agent_id)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentVersionRow>(
             "SELECT agent_id, version, name, description, config_json, content_hash, status,
                     created_at, published_at
@@ -2418,6 +2654,13 @@ impl Db {
         &self,
         agent_id: &str,
     ) -> DbResult<Option<AgentVersionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .latest_published_agent_version(agent_id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentVersionRow>(
             "SELECT agent_id, version, name, description, config_json, content_hash, status,
                     created_at, published_at
@@ -2435,6 +2678,12 @@ impl Db {
         version: &str,
         published_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .publish_agent_version(agent_id, version, published_at)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE agent_versions SET status = 'published', published_at = ?
@@ -2459,6 +2708,12 @@ impl Db {
     }
 
     pub async fn insert_agent_session(&self, row: &AgentSessionRow) -> DbResult<()> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .insert_agent_session(&AgentSessionRecord::from(row))
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         sqlx::query(
             "INSERT INTO agent_sessions
              (id, agent_id, agent_version, status, input_json, output_json, state_json, error_json,
@@ -2484,6 +2739,12 @@ impl Db {
     }
 
     pub async fn update_agent_session(&self, row: &AgentSessionRow) -> DbResult<()> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .update_agent_session(&AgentSessionRecord::from(row))
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         sqlx::query(
             "UPDATE agent_sessions SET status = ?, output_json = ?, state_json = ?, error_json = ?,
                     updated_at = ?, finished_at = ? WHERE id = ?",
@@ -2501,6 +2762,13 @@ impl Db {
     }
 
     pub async fn get_agent_session(&self, id: &str) -> DbResult<Option<AgentSessionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .get_agent_session(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentSessionRow>(
             "SELECT id, agent_id, agent_version, status, input_json, output_json, state_json,
                     error_json, parent_session_id, depth, created_at, updated_at, finished_at
@@ -2516,6 +2784,13 @@ impl Db {
         agent_id: Option<&str>,
         limit: i64,
     ) -> DbResult<Vec<AgentSessionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .list_agent_sessions(agent_id, limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         let limit = limit.clamp(1, 200);
         match agent_id {
             Some(agent_id) => Ok(sqlx::query_as::<_, AgentSessionRow>(
@@ -2539,6 +2814,13 @@ impl Db {
     }
 
     pub async fn running_agent_sessions(&self) -> DbResult<Vec<AgentSessionRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .running_agent_sessions()
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentSessionRow>(
             "SELECT id, agent_id, agent_version, status, input_json, output_json, state_json,
                     error_json, parent_session_id, depth, created_at, updated_at, finished_at
@@ -2549,6 +2831,16 @@ impl Db {
     }
 
     pub async fn append_agent_events(&self, events: &[AgentEventRow]) -> DbResult<()> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            let records = events
+                .iter()
+                .map(AgentEventRecord::from)
+                .collect::<Vec<_>>();
+            return store
+                .append_agent_events(&records)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let mut tx = self.pool.begin().await?;
         for event in events {
             sqlx::query(
@@ -2572,6 +2864,13 @@ impl Db {
         session_id: &str,
         limit: i64,
     ) -> DbResult<Vec<AgentEventRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .list_agent_events(session_id, limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentEventRow>(
             "SELECT session_id, sequence, at, kind, data_json FROM agent_events
              WHERE session_id = ? ORDER BY sequence ASC LIMIT ?",
@@ -2592,6 +2891,15 @@ impl Db {
         created_at: &str,
         expires_at: &str,
     ) -> DbResult<AgentApprovalRow> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .create_agent_approval(
+                    session_id, tool_name, args_json, risk, created_at, expires_at,
+                )
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres_agent);
+        }
         let id = format!("agentappr_{}", uuid::Uuid::now_v7());
         sqlx::query(
             "INSERT INTO agent_approvals
@@ -2613,6 +2921,13 @@ impl Db {
     }
 
     pub async fn get_agent_approval(&self, id: &str) -> DbResult<Option<AgentApprovalRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .get_agent_approval(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentApprovalRow>(
             "SELECT id, session_id, tool_name, args_json, risk, status, created_at, expires_at,
                     decided_at, used_at
@@ -2628,6 +2943,13 @@ impl Db {
         status: Option<&str>,
         limit: i64,
     ) -> DbResult<Vec<AgentApprovalRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .list_agent_approvals(status, limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_agent);
+        }
         let limit = limit.clamp(1, 200);
         match status {
             Some(status) => Ok(sqlx::query_as::<_, AgentApprovalRow>(
@@ -2656,6 +2978,12 @@ impl Db {
         status: &str,
         decided_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .decide_agent_approval(id, status, decided_at)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let result = sqlx::query(
             "UPDATE agent_approvals SET status = ?, decided_at = ?
              WHERE id = ? AND status = 'pending'",
@@ -2669,6 +2997,12 @@ impl Db {
     }
 
     pub async fn consume_agent_approval(&self, id: &str, used_at: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .consume_agent_approval(id, used_at)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let result = sqlx::query(
             "UPDATE agent_approvals SET used_at = ?
              WHERE id = ? AND status = 'approved' AND used_at IS NULL",
@@ -2681,6 +3015,12 @@ impl Db {
     }
 
     pub async fn expire_agent_approvals(&self, now: &str) -> DbResult<u64> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .expire_agent_approvals(now)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let result = sqlx::query(
             "UPDATE agent_approvals SET status = 'expired'
              WHERE status = 'pending' AND expires_at < ?",
@@ -2696,6 +3036,13 @@ impl Db {
         session_id: &str,
         call_id: &str,
     ) -> DbResult<Option<AgentToolCallRow>> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .get_agent_tool_call(session_id, call_id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_agent);
+        }
         Ok(sqlx::query_as::<_, AgentToolCallRow>(
             "SELECT session_id, call_id, idempotency_key, tool_name, request_hash, status,
                     response_json, error, created_at, updated_at
@@ -2708,6 +3055,12 @@ impl Db {
     }
 
     pub async fn begin_agent_tool_call(&self, row: &AgentToolCallRow) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .begin_agent_tool_call(&AgentToolCallRecord::from(row.clone()))
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let result = sqlx::query(
             "INSERT INTO agent_tool_calls
              (session_id, call_id, idempotency_key, tool_name, request_hash, status,
@@ -2736,6 +3089,19 @@ impl Db {
         error: Option<&str>,
         updated_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .finish_agent_tool_call(
+                    session_id,
+                    call_id,
+                    status,
+                    response_json,
+                    error,
+                    updated_at,
+                )
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
         let result = sqlx::query(
             "UPDATE agent_tool_calls
              SET status = ?, response_json = ?, error = ?, updated_at = ?

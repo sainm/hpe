@@ -14,7 +14,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::enterprise_ops::{OidcPrincipal, OpsError, OpsService};
-use hpa_local::postgres_control::{PostgresControlStore, SessionRecord};
+use hpa_local::postgres_control::{ControlError, PostgresControlStore, SessionRecord};
 
 const SESSION_COOKIE: &str = "hpa_session";
 const FLOW_TTL_MS: i64 = 600_000;
@@ -1176,6 +1176,17 @@ impl BrowserAuth {
     }
 
     async fn ensure_active_tenant(&self, tenant_id: &str) -> Result<(), BrowserAuthError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            let active = postgres
+                .tenant(tenant_id)
+                .await
+                .map_err(browser_control_error)?
+                .is_some_and(|tenant| tenant.status == "active");
+            if !active {
+                return Err(BrowserAuthError::Forbidden("tenant_inactive".to_string()));
+            }
+            return Ok(());
+        }
         let status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM enterprise_tenants WHERE id = ? AND status = 'active'",
         )
@@ -1194,6 +1205,17 @@ impl BrowserAuth {
         subject: &str,
         email: Option<&str>,
     ) -> Result<Option<MemberRecord>, BrowserAuthError> {
+        if let Some(postgres) = self.postgres.as_ref() {
+            let member = postgres
+                .scim_member_for_identity(tenant_id, subject, email)
+                .await
+                .map_err(browser_control_error)?;
+            return Ok(member.map(|member| MemberRecord {
+                display_name: member.display_name,
+                role: member.role,
+                status: member.status,
+            }));
+        }
         let row = sqlx::query(
             "SELECT display_name, role, status FROM enterprise_members
              WHERE tenant_id = ?
@@ -1466,6 +1488,15 @@ pub fn clear_cookie(secure: bool) -> String {
         cookie.push_str("; Secure");
     }
     cookie
+}
+
+fn browser_control_error(error: ControlError) -> BrowserAuthError {
+    match error {
+        ControlError::Db(error) => BrowserAuthError::Db(error),
+        ControlError::Json(error) => BrowserAuthError::Json(error),
+        ControlError::Invalid(message) => BrowserAuthError::Invalid(message),
+        ControlError::NotFound(message) => BrowserAuthError::NotFound(message),
+    }
 }
 
 fn browser_ops_error(error: OpsError) -> BrowserAuthError {

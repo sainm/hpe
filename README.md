@@ -29,7 +29,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 
 **Phase 1 至 Phase 12 的本地 MVP 子集已实现并通过当前自动化验收。** 这不等于原路线图的全部企业/云端退出标准；逐项差异见 [实现状态与验收边界](docs/10-quality/implementation-status.md)。产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
 
-**当前目标：Phase 13“生产级补全”（IN_PROGRESS）**，范围与退出标准见 [Phase 13 路线图](docs/11-roadmap/phase-13-production-completion.md)。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、66 张租户表的 FORCE RLS、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease 和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Worker 注册/心跳/停用与 Worker Job API 也已切到 PostgreSQL（PostgreSQL 模式下 SQLite 注册表保持 0 行）；企业平台令牌与审计事件也已切到 PostgreSQL（丢失 data_dir 后同一令牌仍可用）；Enterprise 租户/成员/配额/SCIM/浏览器会话与 Agent 仍以 SQLite 为权威，不能视为整阶段完成。
+**当前目标：Phase 13“生产级补全”（IN_PROGRESS）**，范围与退出标准见 [Phase 13 路线图](docs/11-roadmap/phase-13-production-completion.md)。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、66 张租户表的 FORCE RLS、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease 和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Worker 注册/心跳/停用与 Worker Job API、平台令牌、审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group 与 Agent 版本/会话/事件/审批/工具调用均已切到 PostgreSQL（PostgreSQL 模式下对应 SQLite 表保持 0 行或仅作缓存）；Skill 包/版本元数据仍以 SQLite 为权威，不能视为整阶段完成。
 
 - Rust Core：Canonical Workflow IR、JSON Schema 校验、Saphyr YAML 解析/输出、jaq 表达式、编译器与执行计划；Schema/静态/表达式/依赖/权限与执行策略五类校验；Node Registry（13 类节点、`typeVersion` 解析、旧版 `http.request@0.9.0` 迁移）。
 - Runtime：顺序/条件/多路分支/循环/并行节点、重试/退避、节点超时、错误回退、人工审批暂停与恢复、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。
@@ -323,7 +323,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npx -y pnpm@12.16.1 dev
 - 确定性回放仅覆盖 deterministic planner 的 trace replay；模型 planner 的响应与 token/成本仅审计，不承诺跨会话重新生成相同输出。
 - 高风险 `workflow.execute`、`mcp.*` 固定需要 Agent 审批；Agent 审批不代替 Workflow 审批。子 Agent 需要审批时父 handoff 失败关闭，必须显式处理子会话或调整审批配置。
 - 本地进程重启将 running 会话标记为 interrupted 并可从检查点继续；崩溃瞬间的外部副作用按至少一次语义处理。等待审批的会话与审批记录跨重启保留。
-- 会话与事件保存在本地 SQLite；没有云端 Control Plane、Marketplace、多租户隔离或远程 Agent 调度。
+- Agent 版本/会话/事件/审批/工具调用在本地模式保存在 SQLite；`HPA_POSTGRES_RUNTIME=1` 时切到 PostgreSQL，可跨节点读取、恢复与取消。没有云端 Control Plane、Marketplace、多租户隔离或远程 Agent 调度。
 
 ## Phase 5 行为边界
 

@@ -38,7 +38,8 @@ use crate::plugin::PluginService;
 use crate::skills::SkillService;
 use crate::worker::{WorkerAuth, WorkerError, WorkerErrorKind, WorkerJob};
 use hpa_local::postgres_control::{
-    AuditEntry, MemberRecord, PostgresControlStore, QuotaRecord, TenantRecord, TokenRecord,
+    AuditEntry, ControlError, MemberRecord, PostgresControlStore, QuotaRecord, ScimMemberRecord,
+    TenantRecord, TokenRecord,
 };
 
 #[path = "scim.rs"]
@@ -152,6 +153,7 @@ impl EnterpriseState {
     pub fn with_postgres_execution(mut self, pool: sqlx::postgres::PgPool) -> Self {
         self.workers = self.workers.clone().with_postgres(pool.clone());
         self.browser_auth = self.browser_auth.clone().with_postgres(pool.clone());
+        self.oauth = self.oauth.clone().with_postgres(pool.clone());
         self.postgres_execution = Some(pool);
         self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         self
@@ -347,8 +349,6 @@ impl EnterpriseState {
         Ok(true)
     }
 
-    /// Keeps the PostgreSQL mirror in step with control-plane tables that are
-    /// still written to SQLite (SCIM group changes, direct member updates).
     pub fn spawn_control_mirror(
         &self,
         interval: std::time::Duration,
@@ -357,98 +357,178 @@ impl EnterpriseState {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick fires immediately; startup already mirrored.
             ticker.tick().await;
             loop {
                 ticker.tick().await;
                 match state.sync_postgres_control().await {
                     Ok(count) => {
-                        tracing::debug!(rows = count, "control plane mirror refreshed");
+                        tracing::debug!(rows = count, "control plane cache refreshed");
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error.message, "control plane mirror refresh failed");
+                        tracing::warn!(error = %error.message, "control plane cache refresh failed");
                     }
                 }
             }
         })
     }
 
-    /// Mirrors the SQLite control plane (tenants, quotas, members) into
-    /// PostgreSQL. Idempotent; runs once per start in PostgreSQL mode so that
-    /// quota reads and foreign keys work for tenants created before the switch.
     pub(crate) async fn sync_postgres_control(&self) -> Result<usize, ApiError> {
         let Some(control) = self.control_store() else {
             return Ok(0);
         };
-        let mut synced = 0usize;
-        let tenants =
-            sqlx::query("SELECT id, name, status, created_at, updated_at FROM enterprise_tenants")
-                .fetch_all(&self.control)
+        let tenants = control.list_tenants().await.map_err(control_error)?;
+        if tenants.is_empty() {
+            return Ok(0);
+        }
+        let mut quotas = Vec::new();
+        let mut members = Vec::new();
+        for tenant in &tenants {
+            if let Some(quota) = control.quota(&tenant.id).await.map_err(control_error)? {
+                quotas.push((tenant.id.clone(), quota));
+            }
+            members.extend(
+                control
+                    .scim_list_members(&tenant.id)
+                    .await
+                    .map_err(control_error)?,
+            );
+        }
+        let tenant_ids = tenants
+            .iter()
+            .map(|tenant| tenant.id.clone())
+            .collect::<Vec<_>>();
+        let quota_ids = quotas
+            .iter()
+            .map(|(tenant_id, _)| tenant_id.clone())
+            .collect::<Vec<_>>();
+        let member_ids = members
+            .iter()
+            .map(|member| member.id.clone())
+            .collect::<Vec<_>>();
+        let mut transaction = self.control.begin().await.map_err(internal)?;
+        for tenant in &tenants {
+            sqlx::query(
+                "INSERT INTO enterprise_tenants (id, name, status, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&tenant.id)
+            .bind(&tenant.name)
+            .bind(&tenant.status)
+            .bind(tenant.created_at.format(&Rfc3339).unwrap_or_default())
+            .bind(tenant.updated_at.format(&Rfc3339).unwrap_or_default())
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        for (tenant_id, quota) in &quotas {
+            sqlx::query(
+                "INSERT INTO enterprise_quotas
+                 (tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
+                  max_plugins, max_connections, max_concurrent_runs)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(tenant_id) DO UPDATE SET
+                    max_workflows = excluded.max_workflows,
+                    max_executions_per_day = excluded.max_executions_per_day,
+                    max_skills = excluded.max_skills,
+                    max_agents = excluded.max_agents,
+                    max_plugins = excluded.max_plugins,
+                    max_connections = excluded.max_connections,
+                    max_concurrent_runs = excluded.max_concurrent_runs",
+            )
+            .bind(tenant_id)
+            .bind(quota.max_workflows)
+            .bind(quota.max_executions_per_day)
+            .bind(quota.max_skills)
+            .bind(quota.max_agents)
+            .bind(quota.max_plugins)
+            .bind(quota.max_connections)
+            .bind(quota.max_concurrent_runs)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        for member in &members {
+            sqlx::query(
+                "INSERT INTO enterprise_members
+                 (id, tenant_id, subject, user_name, external_id, display_name, email,
+                  role, base_role, scim_json, status, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    tenant_id = excluded.tenant_id,
+                    subject = excluded.subject,
+                    user_name = excluded.user_name,
+                    external_id = excluded.external_id,
+                    display_name = excluded.display_name,
+                    email = excluded.email,
+                    role = excluded.role,
+                    base_role = excluded.base_role,
+                    scim_json = excluded.scim_json,
+                    status = excluded.status,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&member.id)
+            .bind(&member.tenant_id)
+            .bind(&member.subject)
+            .bind(member.user_name.as_deref())
+            .bind(member.external_id.as_deref())
+            .bind(&member.display_name)
+            .bind(member.email.as_deref())
+            .bind(&member.role)
+            .bind(&member.base_role)
+            .bind(serde_json::to_string(&member.scim_json).unwrap_or_else(|_| "{}".to_string()))
+            .bind(&member.status)
+            .bind(&member.created_at)
+            .bind(&member.updated_at)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        let sqlite_tenants: Vec<String> = sqlx::query_scalar("SELECT id FROM enterprise_tenants")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        for tenant_id in sqlite_tenants {
+            if tenant_id != LOCAL_TENANT && !tenant_ids.contains(&tenant_id) {
+                sqlx::query("DELETE FROM enterprise_tenants WHERE id = ?")
+                    .bind(&tenant_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
+        let sqlite_quotas: Vec<String> =
+            sqlx::query_scalar("SELECT tenant_id FROM enterprise_quotas")
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(internal)?;
-        for row in &tenants {
-            let tenant = TenantRecord {
-                id: row.get("id"),
-                name: row.get("name"),
-                status: row.get("status"),
-                created_at: parse_rfc3339(row.get::<String, _>("created_at").as_str())?,
-                updated_at: parse_rfc3339(row.get::<String, _>("updated_at").as_str())?,
-            };
-            control
-                .upsert_tenant(&tenant)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-            synced += 1;
+        for tenant_id in sqlite_quotas {
+            if !quota_ids.contains(&tenant_id) {
+                sqlx::query("DELETE FROM enterprise_quotas WHERE tenant_id = ?")
+                    .bind(&tenant_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(internal)?;
+            }
         }
-        let quotas = sqlx::query(
-            "SELECT tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
-                    max_plugins, max_connections, max_concurrent_runs FROM enterprise_quotas",
-        )
-        .fetch_all(&self.control)
-        .await
-        .map_err(internal)?;
-        for row in &quotas {
-            let tenant_id: String = row.get("tenant_id");
-            let quota = QuotaRecord {
-                max_workflows: row.get("max_workflows"),
-                max_executions_per_day: row.get("max_executions_per_day"),
-                max_skills: row.get("max_skills"),
-                max_agents: row.get("max_agents"),
-                max_plugins: row.get("max_plugins"),
-                max_connections: row.get("max_connections"),
-                max_concurrent_runs: row.get("max_concurrent_runs"),
-            };
-            control
-                .upsert_quota(&tenant_id, &quota)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
+        let sqlite_members: Vec<String> = sqlx::query_scalar("SELECT id FROM enterprise_members")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        for member_id in sqlite_members {
+            if !member_ids.contains(&member_id) {
+                sqlx::query("DELETE FROM enterprise_members WHERE id = ?")
+                    .bind(&member_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(internal)?;
+            }
         }
-        let members = sqlx::query(
-            "SELECT id, tenant_id, subject, display_name, email, role, status,
-                    created_at, updated_at FROM enterprise_members",
-        )
-        .fetch_all(&self.control)
-        .await
-        .map_err(internal)?;
-        for row in &members {
-            let member = MemberRecord {
-                id: row.get("id"),
-                tenant_id: row.get("tenant_id"),
-                subject: row.get("subject"),
-                display_name: row.get("display_name"),
-                email: row.get::<Option<String>, _>("email"),
-                role: row.get("role"),
-                status: row.get("status"),
-                created_at: parse_rfc3339(row.get::<String, _>("created_at").as_str())?,
-                updated_at: parse_rfc3339(row.get::<String, _>("updated_at").as_str())?,
-            };
-            control
-                .upsert_member(&member)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-            synced += 1;
-        }
-        Ok(synced)
+        transaction.commit().await.map_err(internal)?;
+        Ok(tenants.len() + quotas.len() + members.len())
     }
 
     pub(crate) async fn control_ping(&self) -> Result<(), ApiError> {
@@ -582,17 +662,30 @@ impl EnterpriseState {
     ) -> Result<Value, ApiError> {
         validate_tenant_id(tenant_id)?;
         validate_role(role)?;
-        let tenant: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
-        )
-        .bind(tenant_id)
-        .fetch_optional(&self.control)
-        .await
-        .map_err(internal)?;
-        if tenant.is_none() {
-            return Err(ApiError::not_found(format!(
-                "tenant `{tenant_id}` not found"
-            )));
+        if let Some(control) = self.control_store() {
+            let active = control
+                .tenant(tenant_id)
+                .await
+                .map_err(control_error)?
+                .is_some_and(|tenant| tenant.status == "active");
+            if !active {
+                return Err(ApiError::not_found(format!(
+                    "tenant `{tenant_id}` not found"
+                )));
+            }
+        } else {
+            let tenant: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+            )
+            .bind(tenant_id)
+            .fetch_optional(&self.control)
+            .await
+            .map_err(internal)?;
+            if tenant.is_none() {
+                return Err(ApiError::not_found(format!(
+                    "tenant `{tenant_id}` not found"
+                )));
+            }
         }
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes)
@@ -601,7 +694,6 @@ impl EnterpriseState {
         let hash = hash_token(&token);
         let now = OffsetDateTime::now_utc();
         if let Some(control) = self.control_store() {
-            self.ensure_postgres_tenant(tenant_id).await?;
             let expires_at =
                 expires_in_days.map(|days| now + time::Duration::days(days.clamp(1, 3650)));
             let record = control
@@ -1080,11 +1172,7 @@ impl EnterpriseState {
                 quota.max_skills,
             )
         } else if method == "POST" && path == "/agents" {
-            (
-                "agents",
-                count_query(db, "SELECT COUNT(*) FROM agents").await?,
-                quota.max_agents,
-            )
+            ("agents", db.agent_count().await?, quota.max_agents)
         } else if method == "POST" && path == "/plugins/install" {
             (
                 "plugins",
@@ -1110,12 +1198,7 @@ impl EnterpriseState {
         } else if method == "POST" && path.starts_with("/agents/") && path.ends_with("/run") {
             (
                 "agentSessionsToday",
-                count_like(
-                    db,
-                    "SELECT COUNT(*) FROM agent_sessions WHERE created_at LIKE ?",
-                    &format!("{}%", today_prefix()),
-                )
-                .await?,
+                db.agent_sessions_on(&today_prefix()).await?,
                 quota.max_executions_per_day,
             )
         } else {
@@ -1266,6 +1349,16 @@ async fn list_tenants(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        let tenants = control.list_tenants().await.map_err(control_error)?;
+        return Ok(Json(json!({
+            "tenants": tenants
+                .iter()
+                .filter(|tenant| tenant.status != "deleted")
+                .map(tenant_record_value)
+                .collect::<Vec<_>>(),
+        })));
+    }
     let rows = sqlx::query(
         "SELECT id, name, status, created_at, updated_at FROM enterprise_tenants
          WHERE status != 'deleted' ORDER BY created_at ASC",
@@ -1297,6 +1390,39 @@ async fn create_tenant(
     }
     let id = format!("ten_{}", Uuid::now_v7().simple());
     let now = now_rfc3339();
+    if let Some(control) = state.control_store() {
+        let tenant = TenantRecord {
+            id: id.clone(),
+            name: request.name.trim().to_string(),
+            status: "active".to_string(),
+            created_at: parse_rfc3339(&now)?,
+            updated_at: parse_rfc3339(&now)?,
+        };
+        control
+            .upsert_tenant(&tenant)
+            .await
+            .map_err(control_error)?;
+        control
+            .upsert_quota(&id, &default_quota())
+            .await
+            .map_err(control_error)?;
+        tokio::fs::create_dir_all(state.tenant_dir(&id))
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        state
+            .audit(
+                Some(&id),
+                Some(&admin.token_id),
+                "token",
+                "tenant.create",
+                "tenant",
+                "allow",
+                None,
+                json!({"name": request.name}),
+            )
+            .await;
+        return Ok(Json(tenant_record_value(&tenant)));
+    }
     sqlx::query(
         "INSERT INTO enterprise_tenants (id, name, status, created_at, updated_at)
          VALUES (?, ?, 'active', ?, ?)",
@@ -1367,6 +1493,37 @@ async fn get_tenant(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        let tenant = control
+            .tenant(&id)
+            .await
+            .map_err(control_error)?
+            .filter(|tenant| tenant.status != "deleted")
+            .ok_or_else(|| ApiError::not_found(format!("tenant `{id}` not found")))?;
+        let quota = state.quota(&id).await?;
+        let workers = state
+            .ops
+            .list_workers(Some(&id))
+            .await
+            .map_err(ops_error)?
+            .into_iter()
+            .map(normalize_worker)
+            .collect::<Vec<_>>();
+        let backups = state
+            .ops
+            .list_backups(Some(&id))
+            .await
+            .map_err(ops_error)?
+            .into_iter()
+            .map(normalize_backup)
+            .collect::<Vec<_>>();
+        return Ok(Json(json!({
+            "tenant": tenant_record_value(&tenant),
+            "quotas": quota_value(&id, &quota),
+            "workers": workers,
+            "backups": backups,
+        })));
+    }
     let row = sqlx::query(
         "SELECT id, name, status, created_at, updated_at FROM enterprise_tenants WHERE id = ?",
     )
@@ -1431,6 +1588,39 @@ async fn update_tenant_status(
         ));
     }
     let now = now_rfc3339();
+    if let Some(control) = state.control_store() {
+        let tenant = control
+            .tenant(&id)
+            .await
+            .map_err(control_error)?
+            .filter(|tenant| tenant.status != "deleted")
+            .ok_or_else(|| ApiError::not_found(format!("tenant `{id}` not found")))?;
+        let updated = TenantRecord {
+            status: request.status.clone(),
+            updated_at: parse_rfc3339(&now)?,
+            ..tenant
+        };
+        control
+            .upsert_tenant(&updated)
+            .await
+            .map_err(control_error)?;
+        if request.status == "suspended" {
+            let _ = state.browser_auth.revoke_tenant_sessions(&id).await;
+        }
+        state
+            .audit(
+                Some(&id),
+                Some(&admin.token_id),
+                "token",
+                "tenant.status",
+                "tenant",
+                "allow",
+                None,
+                json!({"status": request.status}),
+            )
+            .await;
+        return Ok(Json(tenant_record_value(&updated)));
+    }
     let updated = sqlx::query(
         "UPDATE enterprise_tenants SET status = ?, updated_at = ?
          WHERE id = ? AND status != 'deleted'",
@@ -1491,6 +1681,43 @@ async fn delete_tenant(
         ));
     }
     let now = now_rfc3339();
+    if let Some(control) = state.control_store() {
+        let tenant = control
+            .tenant(&id)
+            .await
+            .map_err(control_error)?
+            .filter(|tenant| tenant.status != "deleted")
+            .ok_or_else(|| ApiError::not_found(format!("tenant `{id}` not found")))?;
+        let updated = TenantRecord {
+            status: "deleted".to_string(),
+            updated_at: parse_rfc3339(&now)?,
+            ..tenant
+        };
+        control
+            .upsert_tenant(&updated)
+            .await
+            .map_err(control_error)?;
+        let _ = control.revoke_tenant_tokens(&id).await;
+        let _ = state.browser_auth.revoke_tenant_sessions(&id).await;
+        let dir = state.tenant_dir(&id);
+        if dir.exists() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        state.cache.lock().await.remove(&id);
+        state
+            .audit(
+                Some(&id),
+                Some(&admin.token_id),
+                "token",
+                "tenant.delete",
+                "tenant",
+                "allow",
+                None,
+                json!({}),
+            )
+            .await;
+        return Ok(Json(json!({"deleted": true})));
+    }
     let updated = sqlx::query(
         "UPDATE enterprise_tenants SET status = 'deleted', updated_at = ? WHERE id = ?",
     )
@@ -1692,6 +1919,16 @@ async fn list_members(
     Query(query): Query<TenantQuery>,
 ) -> Result<Json<Value>, ApiError> {
     state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        let mut members = control
+            .list_members(query.tenant_id.as_deref())
+            .await
+            .map_err(control_error)?;
+        members.reverse();
+        return Ok(Json(json!({
+            "members": members.iter().map(member_record_value).collect::<Vec<_>>(),
+        })));
+    }
     let rows = match query.tenant_id.as_deref() {
         Some(tenant_id) => {
             sqlx::query(
@@ -1737,17 +1974,20 @@ async fn create_member(
     let admin = state.require_admin(&headers).await?;
     validate_tenant_id(&request.tenant_id)?;
     validate_role(&request.role)?;
-    let tenant: Option<String> =
-        sqlx::query_scalar("SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'")
-            .bind(&request.tenant_id)
-            .fetch_optional(&state.control)
-            .await
-            .map_err(internal)?;
-    if tenant.is_none() {
-        return Err(ApiError::not_found(format!(
-            "tenant `{}` not found",
-            request.tenant_id
-        )));
+    if state.control_store().is_none() {
+        let tenant: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM enterprise_tenants WHERE id = ? AND status = 'active'",
+        )
+        .bind(&request.tenant_id)
+        .fetch_optional(&state.control)
+        .await
+        .map_err(internal)?;
+        if tenant.is_none() {
+            return Err(ApiError::not_found(format!(
+                "tenant `{}` not found",
+                request.tenant_id
+            )));
+        }
     }
     let subject = request.subject.trim();
     if subject.is_empty() || subject.len() > 200 {
@@ -1772,6 +2012,53 @@ async fn create_member(
     let user_name = email.clone().unwrap_or_else(|| subject.to_string());
     let now = now_rfc3339();
     let id = format!("entmem_{}", Uuid::now_v7());
+    if let Some(control) = state.control_store() {
+        let tenant = control
+            .tenant(&request.tenant_id)
+            .await
+            .map_err(control_error)?
+            .filter(|tenant| tenant.status == "active")
+            .ok_or_else(|| {
+                ApiError::not_found(format!("tenant `{}` not found", request.tenant_id))
+            })?;
+        let member = ScimMemberRecord {
+            id: id.clone(),
+            tenant_id: tenant.id,
+            subject: subject.to_string(),
+            user_name: Some(user_name),
+            external_id: None,
+            display_name: display_name.to_string(),
+            email,
+            role: request.role.clone(),
+            base_role: request.role.clone(),
+            scim_json: json!({}),
+            status: "active".to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        control
+            .scim_create_member(&member)
+            .await
+            .map_err(control_error)?;
+        state
+            .audit(
+                Some(&request.tenant_id),
+                Some(&admin.token_id),
+                "token",
+                "member.create",
+                "enterprise_member",
+                "allow",
+                None,
+                json!({"memberId": id, "role": request.role}),
+            )
+            .await;
+        let stored = control
+            .scim_member_by_id(&request.tenant_id, &id)
+            .await
+            .map_err(control_error)?
+            .ok_or_else(|| ApiError::internal("member was not persisted"))?;
+        return Ok(Json(scim_member_value(&stored)));
+    }
     let inserted = sqlx::query(
         "INSERT INTO enterprise_members
          (id, tenant_id, subject, user_name, display_name, email, role, base_role,
@@ -1850,6 +2137,9 @@ async fn update_member(
     Json(request): Json<UpdateMemberRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        return update_member_postgres(&state, &control, &admin, &id, request).await;
+    }
     let row = sqlx::query(
         "SELECT tenant_id, display_name, email, role, base_role, status
          FROM enterprise_members WHERE id = ?",
@@ -1965,12 +2255,139 @@ async fn update_member(
     Ok(Json(member_value(&row)))
 }
 
+async fn update_member_postgres(
+    state: &EnterpriseState,
+    control: &PostgresControlStore,
+    admin: &Principal,
+    id: &str,
+    request: UpdateMemberRequest,
+) -> Result<Json<Value>, ApiError> {
+    let member = control
+        .scim_member_any_id(id)
+        .await
+        .map_err(control_error)?
+        .ok_or_else(|| ApiError::not_found(format!("member `{id}` not found")))?;
+    if request.display_name.is_none()
+        && request.email.is_none()
+        && request.role.is_none()
+        && request.status.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "MEMBER_UPDATE_EMPTY",
+            "at least one member field must be provided",
+        ));
+    }
+    let display_name = match request.display_name.as_deref().map(str::trim) {
+        Some("") => {
+            return Err(ApiError::bad_request(
+                "MEMBER_NAME_INVALID",
+                "member display name cannot be empty",
+            ));
+        }
+        Some(value) if value.len() > 200 => {
+            return Err(ApiError::bad_request(
+                "MEMBER_NAME_INVALID",
+                "member display name must be at most 200 characters",
+            ));
+        }
+        Some(value) => value.to_string(),
+        None => member.display_name,
+    };
+    let email = match request.email.as_deref() {
+        Some(value) => normalize_member_email(Some(value))?,
+        None => member.email,
+    };
+    let requested_role = match request.role.as_deref() {
+        Some(value) => {
+            validate_role(value)?;
+            Some(value.to_string())
+        }
+        None => None,
+    };
+    let mapped_roles = control
+        .scim_group_roles_for_member(&member.tenant_id, id)
+        .await
+        .map_err(control_error)?;
+    if requested_role.is_some() && !mapped_roles.is_empty() {
+        return Err(ApiError::conflict(
+            "MEMBER_ROLE_MANAGED_BY_GROUP",
+            "member role is managed by a SCIM Group; remove the group mapping first",
+        ));
+    }
+    let base_role = requested_role
+        .clone()
+        .unwrap_or_else(|| member.base_role.clone());
+    let role = requested_role.unwrap_or_else(|| member.role.clone());
+    let status = match request.status.as_deref() {
+        Some(value) => {
+            validate_member_status(value)?;
+            value.to_string()
+        }
+        None => member.status,
+    };
+    let updated = ScimMemberRecord {
+        display_name,
+        email,
+        role,
+        base_role,
+        status,
+        updated_at: now_rfc3339(),
+        ..member
+    };
+    control
+        .scim_update_member(&updated)
+        .await
+        .map_err(control_error)?;
+    state
+        .audit(
+            Some(&updated.tenant_id),
+            Some(&admin.token_id),
+            "token",
+            "member.update",
+            "enterprise_member",
+            "allow",
+            None,
+            json!({"memberId": id, "role": updated.role, "status": updated.status}),
+        )
+        .await;
+    let stored = control
+        .scim_member_by_id(&updated.tenant_id, id)
+        .await
+        .map_err(control_error)?
+        .ok_or_else(|| ApiError::not_found(format!("member `{id}` not found")))?;
+    Ok(Json(scim_member_value(&stored)))
+}
+
 async fn delete_member(
     State(state): State<EnterpriseState>,
     AxumPath(id): AxumPath<String>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let admin = state.require_admin(&headers).await?;
+    if let Some(control) = state.control_store() {
+        let member = control
+            .scim_member_any_id(&id)
+            .await
+            .map_err(control_error)?
+            .ok_or_else(|| ApiError::not_found(format!("member `{id}` not found")))?;
+        control
+            .scim_delete_member_any_id(&id)
+            .await
+            .map_err(control_error)?;
+        state
+            .audit(
+                Some(&member.tenant_id),
+                Some(&admin.token_id),
+                "token",
+                "member.delete",
+                "enterprise_member",
+                "allow",
+                None,
+                json!({"memberId": id}),
+            )
+            .await;
+        return Ok(Json(json!({"deleted": true})));
+    }
     let tenant_id: Option<String> =
         sqlx::query_scalar("SELECT tenant_id FROM enterprise_members WHERE id = ?")
             .bind(&id)
@@ -3884,6 +4301,28 @@ fn validate_tenant_id(tenant_id: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn tenant_record_value(record: &TenantRecord) -> Value {
+    json!({
+        "id": record.id,
+        "name": record.name,
+        "status": record.status,
+        "createdAt": record.created_at.format(&Rfc3339).unwrap_or_default(),
+        "updatedAt": record.updated_at.format(&Rfc3339).unwrap_or_default(),
+    })
+}
+
+fn default_quota() -> QuotaRecord {
+    QuotaRecord {
+        max_workflows: 100,
+        max_executions_per_day: 1000,
+        max_skills: 100,
+        max_agents: 100,
+        max_plugins: 50,
+        max_connections: 100,
+        max_concurrent_runs: 8,
+    }
+}
+
 fn tenant_value(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
         "id": row.get::<String, _>("id"),
@@ -3983,6 +4422,55 @@ fn member_value(row: &sqlx::sqlite::SqliteRow) -> Value {
     })
 }
 
+fn member_record_value(member: &MemberRecord) -> Value {
+    json!({
+        "id": member.id,
+        "tenantId": member.tenant_id,
+        "subject": member.subject,
+        "displayName": member.display_name,
+        "email": member.email,
+        "role": member.role,
+        "status": member.status,
+        "createdAt": member.created_at.format(&Rfc3339).unwrap_or_default(),
+        "updatedAt": member.updated_at.format(&Rfc3339).unwrap_or_default(),
+    })
+}
+
+fn scim_member_value(member: &ScimMemberRecord) -> Value {
+    json!({
+        "id": member.id,
+        "tenantId": member.tenant_id,
+        "subject": member.subject,
+        "displayName": member.display_name,
+        "email": member.email,
+        "role": member.role,
+        "status": member.status,
+        "createdAt": member.created_at,
+        "updatedAt": member.updated_at,
+    })
+}
+
+fn control_error(error: ControlError) -> ApiError {
+    match error {
+        ControlError::Db(error) => {
+            if error
+                .as_database_error()
+                .is_some_and(|database| database.is_unique_violation())
+            {
+                ApiError::conflict(
+                    "MEMBER_IDENTITY_EXISTS",
+                    "member subject, userName or email already exists in this tenant",
+                )
+            } else {
+                internal(error)
+            }
+        }
+        ControlError::Json(error) => internal(error),
+        ControlError::Invalid(message) => ApiError::bad_request("MEMBER_INVALID", message),
+        ControlError::NotFound(message) => ApiError::not_found(message),
+    }
+}
+
 fn quota_value(tenant_id: &str, quota: &Quota) -> Value {
     json!({
         "tenantId": tenant_id,
@@ -4048,14 +4536,6 @@ async fn audit_rows(
 
 async fn count_query(db: &Db, query: &'static str) -> Result<i64, ApiError> {
     sqlx::query_scalar(query)
-        .fetch_one(&db.pool)
-        .await
-        .map_err(internal)
-}
-
-async fn count_like(db: &Db, query: &'static str, prefix: &str) -> Result<i64, ApiError> {
-    sqlx::query_scalar(query)
-        .bind(prefix)
         .fetch_one(&db.pool)
         .await
         .map_err(internal)

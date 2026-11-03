@@ -1,17 +1,17 @@
 # 企业控制面的 PostgreSQL 迁移（Phase 13 / P13-01）
 
-> 状态：**IN_PROGRESS**。本文件记录“整库切换”的现状、镜像设计与剩余步骤。
+> 状态：**IN_PROGRESS**。本文件记录控制面切换后的权威边界、SQLite 缓存与剩余项。
 > 相关契约：[PostgreSQL 控制面基线](postgres-control-plane.md)、[分布式运行时原语](postgres-distributed-runtime.md)。
 
-## 1. 为什么不是一次切换
+## 1. 当前形态
 
-企业控制面在 SQLite 时代由三张互相引用的表构成：`enterprise_tenants` → `enterprise_quotas` / `enterprise_members`，成员又被 SCIM 的 Group 映射与浏览器会话引用。把它们同时切走意味着一次改动 80 余处查询、并让 SCIM/SSO 两条链路同时失去回滚点。
+企业控制面已经完成“镜像先行、读取切换、权威翻转”：
 
-因此采用**镜像先行、读取逐条切换、最后翻转权威**的三步走：
+1. **镜像（历史）**：SQLite 权威，写穿到 PostgreSQL。该阶段代码已移除。
+2. **读取切换（完成）**：配额、租户、成员、SCIM、浏览器会话、OAuth AS 在 PG 模式全部读 PostgreSQL。
+3. **权威翻转（完成）**：Enterprise API 与 SCIM 的租户/配额/成员/Group 写入、OAuth AS 状态、浏览器会话与平台令牌均只写 PostgreSQL；SQLite 对应表降级为可重建缓存，周期任务从 PostgreSQL 重建。
 
-1. **镜像（已完成）**：SQLite 仍是权威，但每一次租户/配额/成员变更都同步写入 PostgreSQL。
-2. **读取切换（部分完成）**：配额读取已经在 PostgreSQL 模式下走 PostgreSQL。
-3. **权威翻转（未开始）**：SQLite 停止写入，PostgreSQL 成为唯一事实源，再删除镜像代码。
+剩余差异是真实企业 IdP/SCIM/Vault/HA 的外部验收；Agent 版本/会话/事件/审批/工具调用已在 PG 模式切换为 PostgreSQL 权威。
 
 ## 2. 现状矩阵
 
@@ -22,53 +22,57 @@
 | Worker Job / 租约 | 不写 | **权威** | `postgres_worker_daemon` |
 | 平台令牌 | 不写 | **权威** | `postgres_token_store` |
 | 审计 | 不写 | **权威** | 未知租户回退 NULL tenant |
-| 租户 | **权威** | 镜像 + **读取** | 存在性/状态解析已在 PG 模式走 PostgreSQL，未命中回退并自愈 |
-| 配额 | 缓存 | **权威** | 读与写都以 PostgreSQL 为准；SQLite 仅作单节点缓存，写失败不回滚 PG |
-| 成员 | **权威** | 镜像（写穿） | 创建/更新/删除同步到 PG |
-| SCIM Group / 映射 | **权威** | 未镜像 | 依赖成员表，翻转时一起处理 |
+| 租户 | 缓存 | **权威** | list/get/create/status/delete 走 PostgreSQL；缓存可重建 |
+| 配额 | 缓存 | **权威** | 读写都以 PostgreSQL 为准 |
+| 成员 | 缓存 | **权威** | Enterprise/SCIM/browser_auth 读写 PostgreSQL |
+| SCIM Group / 映射 | 不写 | **权威** | 角色重算在同一 PG 事务 |
 | 浏览器会话 | 不写 | **权威** | 读/写/轮换/登出/按租户吊销全部走 PostgreSQL |
-| OAuth AS 状态（clients/codes/tokens） | **权威** | 未迁移 | 含签名密钥与授权码，需单独迁移 |
+| OAuth AS 状态（clients/codes/tokens/consents/signing keys） | 不写 | **权威** | `postgres_oauth_cross_node` |
+| Agent 会话 / 版本 / 事件 / 审批 / 工具调用 | 不写 | **权威** | `postgres_agent_cross_node`；Skill 元数据仍为 SQLite |
 
-## 3. 镜像实现
+## 3. 权威写入与缓存
 
-### 3.1 启动镜像 + 周期刷新
+### 3.1 启动缓存重建 + 周期刷新
 
-`hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 时执行一次 `sync_postgres_control()`：把 SQLite 的租户、配额、成员全量 upsert 进 `hpa_control.tenants/quotas/members`。它是幂等的，失败会让启动失败（避免“以为在跑 PostgreSQL，实际只有半套数据”）。
+`hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 时执行一次 `sync_postgres_control()`：从 `hpa_control.tenants/quotas/members` 读取权威数据，重建本机 `enterprise_*` SQLite 缓存并删除 PostgreSQL 已不存在的行。它不再把 SQLite 写回 PostgreSQL。
 
-启动之后，同一个函数由后台任务周期性重跑（默认 30 秒，`HPA_CONTROL_SYNC_INTERVAL_MS` 可调，最小 50ms），把仍然只写 SQLite 的路径（SCIM 的成员/组变更、部分直连 `enterprise_members` 的写入）收敛进 PostgreSQL。刷新失败只记 `warn`，不影响请求——它是对账，不是请求路径。
+启动之后同一函数由后台任务周期性重跑（默认 30 秒，`HPA_CONTROL_SYNC_INTERVAL_MS` 可调，最小 50ms）。刷新失败只记 `warn`，不影响请求路径；PostgreSQL 始终是唯一事实源。
 
-### 3.2 写穿
+### 3.2 权威写入
 
-| 操作 | 镜像动作 |
+| 操作 | PG 模式行为 |
 | --- | --- |
-| `POST /api/enterprise/tenants` | 写 PG 租户 + 默认配额（`upsert_tenant` / `upsert_quota`） |
-| `PUT /api/enterprise/quotas/{tenant}` | `upsert_quota` |
-| `POST /api/enterprise/members` | `upsert_member` |
-| `PUT /api/enterprise/members/{id}` | `upsert_member` |
-| `DELETE /api/enterprise/members/{id}` | `delete_member` |
+| `POST/PUT/DELETE /api/enterprise/tenants` | 只写 PostgreSQL；租户目录与缓存行由本地目录/周期重建维护 |
+| `PUT /api/enterprise/quotas/{tenant}` | 先写 `hpa_control.quotas`，失败即请求失败；SQLite 缓存可稍后重建 |
+| `POST/PUT/DELETE /api/enterprise/members` | 只写 PostgreSQL 成员表（含 SCIM 字段） |
+| SCIM User/Group | 只写 PostgreSQL；Group 成员与 effective role 在同一事务 |
+| OAuth AS | clients/requests/codes/tokens/consents/signing keys 只写 `hpa_control` |
+| 管理员令牌 / 审计 / 浏览器会话 | 只写 PostgreSQL |
 
-镜像失败只记 `warn`，不阻断 SQLite 写入；这是“SQLite 仍为权威”阶段的刻意取舍——翻转权威后同样的错误必须变成硬失败。
+PostgreSQL 写入失败会直接返回错误；不会出现“本地成功、共享状态没变”。
 
-### 3.3 读取切换
+### 3.3 读取
 
 | 读取 | 行为 |
 | --- | --- |
-| `quota()` | PG 模式先读 `hpa_control.quotas`，未命中回退 SQLite |
-| `tenant_is_active()` | PG 模式先读 `hpa_control.tenants`；PG 无行时回退 SQLite 并**自愈**（顺手 `ensure_postgres_tenant`） |
-| `active_tenants()` | PG 有租户行时以 `hpa_control.tenants` 为准，否则回退 SQLite（调度器与 `/metrics` 用） |
-| `ensure_postgres_tenant()` | PG 已有该租户即跳过，避免“没见过的租户”在镜像阶段返回 404 |
+| 租户 list/get/status | PG 模式读 `hpa_control.tenants`；空节点立即可见其他节点创建的租户 |
+| 配额 | 读 `hpa_control.quotas` |
+| 成员 / SCIM Users/Groups | 读 `hpa_control.members/scim_groups/scim_group_members` |
+| 浏览器登录成员覆盖 | `BrowserAuth` 读 PostgreSQL 成员 |
+| 租户 active 检查 | 读 PostgreSQL 状态；仅升级窗口在 PG 无行时回退 SQLite 并自愈 |
+| `active_tenants()` | PG 有租户行时以 `hpa_control.tenants` 为准，否则回退 SQLite |
 
-回退路径在权威翻转时必须删除。`postgres_control_mirror` 已覆盖跨节点读取：空 data dir 的节点能为它从未见过的租户注册 Worker（租户解析来自 PostgreSQL），未知租户仍 404。
+`postgres_control_mirror` 已覆盖跨节点读取：空 data dir 的节点能为它从未见过的租户注册 Worker（租户解析来自 PostgreSQL），未知租户仍 404。
 
-## 4. 剩余步骤
+## 4. 完成状态
 
-按依赖顺序，每一步都应独立提交并带 PG 集成测试：
+1. ~~租户读取切 PG~~（完成）。
+2. ~~配额权威翻转~~（完成）。
+3. ~~成员与 SCIM~~（完成）：Enterprise 成员 API、SCIM User/Group、Group 角色映射与 `browser_auth::find_member` 在 PG 模式全部读写 PostgreSQL；SQLite 成员/组不再由 API 写入。
+4. ~~浏览器会话与 OAuth AS~~（完成）：session 与 OAuth clients/codes/tokens/consents/signing keys 全部走 PostgreSQL。
+5. ~~停止双写~~（完成）：API 不再写 SQLite 权威行；`sync_postgres_control` 只做 PG→SQLite 缓存重建，不再反向覆盖 PostgreSQL。
 
-1. ~~**租户读取切 PG**~~（已完成）：`ensure_tenant` / `active_tenants` 的存在性与状态判断改读 `hpa_control.tenants`；写入仍走 SQLite + 镜像。
-2. ~~**配额权威翻转**~~（已完成）：`PUT /quotas` 先写 PostgreSQL（失败即请求失败），SQLite 降级为本地缓存并允许 upsert（不再要求本机已有租户行）；读取仍以 PG 优先。回退读取路径保留到第 5 步统一切除。
-3. **成员与 SCIM**：`scim.rs` 的 12 处成员查询、Group 映射、`browser_auth::find_member` 一起切；SCIM E2E 必须在 PG 模式下重跑（`pnpm test:scim-e2e`）。
-4. ~~**浏览器会话**~~（已完成）：`hpa_control.sessions` 承接读取、创建、`last_seen` 触碰、refresh 轮换（保留 token_hash + version 双重围栏）、登出、按 id/租户吊销；SQLite 只在 PG 无该行时作为升级窗口回退。**OAuth AS 状态**（`oauth_clients/codes/tokens/consents/signing_keys`）仍未迁移，那是第 4 步剩下的部分。
-5. **停止双写**：删除 SQLite 控制面写入与 `sync_postgres_control`，`enterprise_*` 表只作为历史备份保留。关闭前先用 `hpa db verify-mirror` 确认零漂移（见下节）。
+剩余：Skill 元数据仍以租户 SQLite 为权威；真实企业 SCIM/IdP、HA/read replica 与外部 Vault/CA 仍未验收。
 
 ### 3.4 会话（已完成）
 
@@ -107,9 +111,9 @@
 | `shared-revocation` | A 吊销令牌后 B 立即 401 |
 | `late-node-joins` | 后启动的第三个节点直接可用 |
 
-### 4.2 周期镜像
+### 4.2 缓存重建
 
-`HPA_CONTROL_SYNC_INTERVAL_MS`（默认 `30000`）控制后台对账间隔。测试 `postgres_control_refresh` 用 100ms 间隔启动节点，通过 `/scim/v2/Users` 创建成员（只写 SQLite），断言该成员在不重启的前提下出现在 `hpa_control.members`。
+`HPA_CONTROL_SYNC_INTERVAL_MS`（默认 `30000`）控制 PG→SQLite 缓存重建间隔。测试 `postgres_control_refresh` 用 100ms 间隔启动节点，通过 `/scim/v2/Users` 创建成员（直接写 PostgreSQL），断言该成员无需重启即出现在 `hpa_control.members`，并在缓存中收敛。
 
 ## 4.3 漂移检查
 
@@ -118,16 +122,16 @@ HPA_POSTGRES_URL=postgresql://user@host:5432/db \
   hpa --data-dir <data-dir> db verify-mirror
 ```
 
-比较 SQLite 控制面与 PostgreSQL 镜像，输出 `counts` 与 `drift.items`：
+比较 PostgreSQL 权威与 SQLite 缓存，输出 `counts` 与 `drift.items`：
 
 | 漂移类型 | 含义 |
 | --- | --- |
-| `tenant.missingInPostgres` / `tenant.statusMismatch` | 租户未镜像或状态不一致 |
-| `quota.missingInPostgres` / `quota.mismatch` | 配额缺失或字段不一致 |
-| `member.missingInPostgres` / `member.attrMismatch` | 成员缺失，或 `role`/`status` 不一致 |
-| `*.extraInPostgres` | 镜像里存在 SQLite 已删除的行（例如 SCIM 删除尚未收敛） |
+| `tenant.missingInPostgres` / `tenant.statusMismatch` | PostgreSQL 无租户，或状态不一致 |
+| `quota.missingInPostgres` / `quota.mismatch` | PostgreSQL 配额缺失或字段不一致 |
+| `member.missingInPostgres` / `member.attrMismatch` | PostgreSQL 成员缺失，或 `role`/`status` 不一致 |
+| `*.extraInPostgres` | PostgreSQL 有权威行、SQLite 缓存尚未重建 |
 
-存在漂移时命令以非零退出码结束，便于放进发布门禁。`postgres_mirror_verify` 覆盖：一致时为零、直接改 SQLite 后报 `member.attrMismatch`、周期镜像修复后回到零。
+存在漂移时命令以非零退出码结束，便于放进发布门禁。`postgres_mirror_verify` 覆盖：缓存收敛后为零、直接改 SQLite 后报 `member.attrMismatch`、PG→SQLite 缓存重建后回到零。
 
 **用途**：这是第 5 步「停止双写」的前置条件——没有零漂移就不该关掉 SQLite 写入。
 
@@ -135,15 +139,25 @@ HPA_POSTGRES_URL=postgresql://user@host:5432/db \
 
 ```bash
 HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db \
-  cargo test -p hpa-local --test postgres_control_mirror   # 本文件所述镜像与配额读取
-HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_worker_registry --test postgres_token_store
+  cargo test -p hpa-local --test postgres_control_mirror
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_oauth_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_scim_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_member_authority
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_mirror_verify
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_agent_cross_node
 node scripts/scim-e2e.mjs                                  # 需要运行中的服务与管理员令牌
 ```
 
-`postgres_control_mirror` 覆盖：启动镜像出本地租户与配额、API 建租户写 PG、配额更新与成员创建写穿、以及**删掉整个 data dir 后用空目录启动的节点仍能从 PostgreSQL 读到同一配额**。
+- `postgres_oauth_cross_node`：A 注册/授权/同意，B 兑换、JWKS、refresh 轮换、复用吊销、revoke/内省；两节点 SQLite OAuth 表 0 行。
+- `postgres_scim_cross_node`：A 创建 User/Group，B 读取角色映射与成员；SQLite SCIM 表 0 行。
+- `postgres_member_authority`：A 建租户/成员，B 立即可见；目录角色覆盖 session；disabled 成员与 suspended 租户使 B 的 session 失效；SQLite 无权威行。
+- `postgres_agent_cross_node`：A 建/发布 Agent，B 读取版本；B 恢复 interrupted 会话为 succeeded、取消 running 会话；审批与工具调用跨节点可见，重复 begin 幂等；两节点 SQLite Agent 表 0 行。
+- `postgres_control_mirror`：跨节点配额与租户读取、空 data dir 节点为未见租户注册 Worker。
 
 ## 6. 风险
 
-- 双写窗口内 SQLite 与 PG 可能不一致，且目前只有启动镜像做兜底对账；翻转前应加一个“差异检查”命令（比对三张表的行数与关键字段）。
-- 成员镜像的即时性：`enterprise.rs` 的四条写路径是同步写穿；SCIM 直接写 `enterprise_members`，其变更依赖周期镜像（默认 30 秒）才会出现在 PG 里，最大滞后一个间隔。
-- `hpa_control.members` 有 `(tenant_id, subject)` 唯一约束与 `user_name` / `external_id` 两个部分唯一索引；翻转时若历史 SQLite 数据存在重复，会在这里首次暴露。
+- SQLite 缓存有最多一个刷新间隔的滞后；PG 模式的 API 读取已全部走 PostgreSQL，只有历史/诊断路径读缓存。
+- `hpa_control.members` 有 `(tenant_id, subject)`、email、user_name、external_id 唯一约束；历史重复数据在首次写入/导入时会失败关闭，需先清理。
+- SCIM Group 的 SQLite 表在 PG 模式不再写入；依赖 SQLite 直读的自定义脚本应改用 SCIM/PostgreSQL。
+- 删除租户只标记 `deleted` 并吊销 PG token/session；历史 SQLite 行由缓存重建清理，租户业务库目录由删除流程移除。
+- Agent 版本/会话/事件/审批/工具调用在 PG 模式走 `hpa_tenant.agent_*`，跨节点发布、恢复、取消、审批与工具幂等由 `postgres_agent_cross_node` 验证；Agent 配额也按 PostgreSQL 行计数。Skill 包/版本元数据仍为 SQLite 权威，跨节点 Agent 使用 Skill 时需先导入目标节点；`hpa agent ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。Agent 主动执行尚无 owner lease，多个控制面同时启动时 `recover` 可能把其他节点的 running 会话标记为 interrupted；生产部署需单写者或后续 owner lease。

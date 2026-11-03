@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use hpa_local::postgres_control::{ControlError, ScimGroupRecord, ScimMemberRecord};
+
 use super::{EnterpriseState, Principal};
 
 const USER_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
@@ -106,6 +108,27 @@ impl ScimError {
             None,
             "SCIM storage operation failed",
         )
+    }
+
+    fn from_control(error: ControlError) -> Self {
+        match error {
+            ControlError::Db(error) => Self::database(error),
+            ControlError::Invalid(message)
+                if message == "member belongs to SCIM Groups mapped to different roles" =>
+            {
+                Self::new(StatusCode::CONFLICT, Some("invalidValue"), message)
+            }
+            ControlError::Invalid(message) => Self::invalid(message),
+            ControlError::NotFound(message) => Self::not_found(message),
+            ControlError::Json(error) => {
+                tracing::error!(error = %error, "SCIM JSON operation failed");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    None,
+                    "SCIM storage operation failed",
+                )
+            }
+        }
     }
 
     fn from_api(error: crate::api::ApiError) -> Self {
@@ -466,39 +489,82 @@ fn member_record(row: &sqlx::sqlite::SqliteRow) -> MemberRecord {
     }
 }
 
+impl From<ScimMemberRecord> for MemberRecord {
+    fn from(record: ScimMemberRecord) -> Self {
+        Self {
+            id: record.id,
+            tenant_id: record.tenant_id,
+            subject: record.subject,
+            user_name: record.user_name,
+            external_id: record.external_id,
+            display_name: record.display_name,
+            email: record.email,
+            role: record.role,
+            base_role: record.base_role,
+            scim_json: record.scim_json,
+            status: record.status,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 const MEMBER_COLUMNS: &str = "id, tenant_id, subject, user_name, external_id, display_name, \
                               email, role, base_role, scim_json, status, created_at, updated_at";
 
 async fn load_member(
-    pool: &SqlitePool,
+    state: &EnterpriseState,
     tenant_id: &str,
     id: &str,
 ) -> Result<Option<MemberRecord>, ScimError> {
+    if let Some(control) = state.control_store() {
+        let member = control
+            .scim_member_by_id(tenant_id, id)
+            .await
+            .map_err(ScimError::from_control)?;
+        return Ok(member.map(MemberRecord::from));
+    }
     let sql =
         format!("SELECT {MEMBER_COLUMNS} FROM enterprise_members WHERE tenant_id = ? AND id = ?");
     let row = sqlx::query(AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&state.control)
         .await
         .map_err(ScimError::database)?;
     Ok(row.as_ref().map(member_record))
 }
 
 async fn user_resource(state: &EnterpriseState, member: &MemberRecord) -> Result<Value, ScimError> {
-    let groups = sqlx::query(
-        "SELECT g.id, g.display_name
-         FROM enterprise_scim_groups g
-         JOIN enterprise_scim_group_members gm
-           ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
-         WHERE gm.tenant_id = ? AND gm.member_id = ?
-         ORDER BY lower(g.display_name)",
-    )
-    .bind(&member.tenant_id)
-    .bind(&member.id)
-    .fetch_all(&state.control)
-    .await
-    .map_err(ScimError::database)?;
+    let groups = if let Some(control) = state.control_store() {
+        control
+            .scim_member_groups(&member.tenant_id, &member.id)
+            .await
+            .map_err(ScimError::from_control)?
+    } else {
+        let rows = sqlx::query(
+            "SELECT g.id, g.display_name
+             FROM enterprise_scim_groups g
+             JOIN enterprise_scim_group_members gm
+               ON gm.group_id = g.id AND gm.tenant_id = g.tenant_id
+             WHERE gm.tenant_id = ? AND gm.member_id = ?
+             ORDER BY lower(g.display_name)",
+        )
+        .bind(&member.tenant_id)
+        .bind(&member.id)
+        .fetch_all(&state.control)
+        .await
+        .map_err(ScimError::database)?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.get::<String, _>("id"),
+                    row.get::<String, _>("display_name"),
+                ))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(ScimError::database)?
+    };
     let mut resource = member.scim_json.clone();
     let object = resource
         .as_object_mut()
@@ -538,11 +604,11 @@ async fn user_resource(state: &EnterpriseState, member: &MemberRecord) -> Result
             Value::Array(
                 groups
                     .iter()
-                    .map(|group| {
+                    .map(|(id, display_name)| {
                         json!({
-                            "value": group.get::<String, _>("id"),
-                            "display": group.get::<String, _>("display_name"),
-                            "$ref": format!("/scim/v2/Groups/{}", group.get::<String, _>("id"))
+                            "value": id,
+                            "display": display_name,
+                            "$ref": format!("/scim/v2/Groups/{id}")
                         })
                     })
                     .collect(),
@@ -576,6 +642,48 @@ async fn list_users(
     let principal = authorize(&state, &headers).await?;
     let filter = user_filter(query.filter.as_deref())?;
     let (start, count, offset) = page(&query);
+    if let Some(control) = state.control_store() {
+        let members = control
+            .scim_list_members(&principal.tenant_id)
+            .await
+            .map_err(ScimError::from_control)?
+            .into_iter()
+            .map(MemberRecord::from)
+            .filter(|member| match &filter {
+                None => true,
+                Some(UserFilter::Id(value)) => member.id == *value,
+                Some(UserFilter::UserName(value)) => member
+                    .user_name
+                    .as_deref()
+                    .unwrap_or(&member.subject)
+                    .eq_ignore_ascii_case(value),
+                Some(UserFilter::ExternalId(value)) => {
+                    member.external_id.as_deref() == Some(value.as_str())
+                }
+                Some(UserFilter::Active(value)) => (member.status == "active") == *value,
+            })
+            .collect::<Vec<_>>();
+        let total = members.len() as i64;
+        let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut resources = Vec::new();
+        if count != 0 {
+            for member in members.into_iter().skip(skip).take(take) {
+                resources.push(user_resource(&state, &member).await?);
+            }
+        }
+        return Ok(scim_response(
+            StatusCode::OK,
+            json!({
+                "schemas": [LIST_SCHEMA],
+                "totalResults": total,
+                "itemsPerPage": resources.len(),
+                "startIndex": start,
+                "Resources": resources
+            }),
+            None,
+        ));
+    }
     let (where_clause, bind_value) = match filter {
         None => (" WHERE tenant_id = ?".to_string(), None),
         Some(UserFilter::Id(value)) => (" WHERE tenant_id = ? AND id = ?".to_string(), Some(value)),
@@ -930,42 +1038,64 @@ async fn create_user(
         .external_id
         .clone()
         .unwrap_or_else(|| input.user_name.clone());
-    ensure_email_available(
-        &state.control,
-        &principal.tenant_id,
-        input.email.as_deref(),
-        None,
-    )
-    .await?;
     let id = format!("entmem_{}", Uuid::now_v7());
     let now = super::now_rfc3339();
     let status = if input.active { "active" } else { "disabled" };
-    let inserted = sqlx::query(
-        "INSERT INTO enterprise_members
-         (id, tenant_id, subject, user_name, external_id, display_name, email, role,
-          base_role, scim_json, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(&principal.tenant_id)
-    .bind(&subject)
-    .bind(&input.user_name)
-    .bind(&input.external_id)
-    .bind(&input.display_name)
-    .bind(&input.email)
-    .bind(&input.base_role)
-    .bind(&input.base_role)
-    .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
-        ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
-    })?)
-    .bind(status)
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.control)
-    .await
-    .map_err(ScimError::database)?;
-    if inserted.rows_affected() != 1 {
-        return Err(ScimError::conflict("SCIM User was not created"));
+    if let Some(control) = state.control_store() {
+        let record = ScimMemberRecord {
+            id: id.clone(),
+            tenant_id: principal.tenant_id.clone(),
+            subject,
+            user_name: Some(input.user_name.clone()),
+            external_id: input.external_id.clone(),
+            display_name: input.display_name.clone(),
+            email: input.email.clone(),
+            role: input.base_role.clone(),
+            base_role: input.base_role.clone(),
+            scim_json: input.scim_json.clone(),
+            status: status.to_string(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        control
+            .scim_create_member(&record)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        ensure_email_available(
+            &state.control,
+            &principal.tenant_id,
+            input.email.as_deref(),
+            None,
+        )
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO enterprise_members
+             (id, tenant_id, subject, user_name, external_id, display_name, email, role,
+              base_role, scim_json, status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&principal.tenant_id)
+        .bind(&subject)
+        .bind(&input.user_name)
+        .bind(&input.external_id)
+        .bind(&input.display_name)
+        .bind(&input.email)
+        .bind(&input.base_role)
+        .bind(&input.base_role)
+        .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
+            ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
+        })?)
+        .bind(status)
+        .bind(&now)
+        .bind(&now)
+        .execute(&state.control)
+        .await
+        .map_err(ScimError::database)?;
+        if inserted.rows_affected() != 1 {
+            return Err(ScimError::conflict("SCIM User was not created"));
+        }
     }
     state
         .audit(
@@ -979,7 +1109,7 @@ async fn create_user(
             json!({"memberId": id, "userName": input.user_name, "role": input.base_role}),
         )
         .await;
-    let member = load_member(&state.control, &principal.tenant_id, &id)
+    let member = load_member(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found("SCIM User was not created"))?;
     let version = version_for(&member.id, &member.updated_at);
@@ -997,7 +1127,7 @@ async fn get_user(
     headers: HeaderMap,
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
-    let member = load_member(&state.control, &principal.tenant_id, &id)
+    let member = load_member(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("User `{id}` not found")))?;
     let version = version_for(&member.id, &member.updated_at);
@@ -1016,7 +1146,7 @@ async fn replace_user(
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
     let value = scim_json_body(payload)?;
-    let member = load_member(&state.control, &principal.tenant_id, &id)
+    let member = load_member(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("User `{id}` not found")))?;
     ensure_if_match(&headers, &member)?;
@@ -1037,7 +1167,7 @@ async fn patch_user(
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
     let value = scim_json_body(payload)?;
-    let member = load_member(&state.control, &principal.tenant_id, &id)
+    let member = load_member(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("User `{id}` not found")))?;
     ensure_if_match(&headers, &member)?;
@@ -1061,38 +1191,60 @@ async fn update_user(
         .clone()
         .unwrap_or_else(|| input.user_name.clone());
     let status = if input.active { "active" } else { "disabled" };
-    let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
-    ensure_email_available(
-        &state.control,
-        &principal.tenant_id,
-        input.email.as_deref(),
-        Some(&member.id),
-    )
-    .await?;
-    sqlx::query(
-        "UPDATE enterprise_members
-         SET subject = ?, user_name = ?, external_id = ?, display_name = ?, email = ?,
-             base_role = ?, scim_json = ?, status = ?, updated_at = ?
-         WHERE tenant_id = ? AND id = ?",
-    )
-    .bind(&subject)
-    .bind(&input.user_name)
-    .bind(&input.external_id)
-    .bind(&input.display_name)
-    .bind(&input.email)
-    .bind(&input.base_role)
-    .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
-        ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
-    })?)
-    .bind(status)
-    .bind(super::now_rfc3339())
-    .bind(&principal.tenant_id)
-    .bind(&member.id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(ScimError::database)?;
-    sync_member_role(&mut transaction, &principal.tenant_id, &member.id).await?;
-    transaction.commit().await.map_err(ScimError::database)?;
+    if let Some(control) = state.control_store() {
+        let record = ScimMemberRecord {
+            id: member.id.clone(),
+            tenant_id: member.tenant_id.clone(),
+            subject,
+            user_name: Some(input.user_name.clone()),
+            external_id: input.external_id.clone(),
+            display_name: input.display_name.clone(),
+            email: input.email.clone(),
+            role: member.role.clone(),
+            base_role: input.base_role.clone(),
+            scim_json: input.scim_json.clone(),
+            status: status.to_string(),
+            created_at: member.created_at.clone(),
+            updated_at: super::now_rfc3339(),
+        };
+        control
+            .scim_update_member(&record)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
+        ensure_email_available(
+            &state.control,
+            &principal.tenant_id,
+            input.email.as_deref(),
+            Some(&member.id),
+        )
+        .await?;
+        sqlx::query(
+            "UPDATE enterprise_members
+             SET subject = ?, user_name = ?, external_id = ?, display_name = ?, email = ?,
+                 base_role = ?, scim_json = ?, status = ?, updated_at = ?
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(&subject)
+        .bind(&input.user_name)
+        .bind(&input.external_id)
+        .bind(&input.display_name)
+        .bind(&input.email)
+        .bind(&input.base_role)
+        .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
+            ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
+        })?)
+        .bind(status)
+        .bind(super::now_rfc3339())
+        .bind(&principal.tenant_id)
+        .bind(&member.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ScimError::database)?;
+        sync_member_role(&mut transaction, &principal.tenant_id, &member.id).await?;
+        transaction.commit().await.map_err(ScimError::database)?;
+    }
     state
         .audit(
             Some(&principal.tenant_id),
@@ -1105,7 +1257,7 @@ async fn update_user(
             json!({"memberId": member.id, "userName": input.user_name, "active": input.active}),
         )
         .await;
-    let updated = load_member(&state.control, &principal.tenant_id, &member.id)
+    let updated = load_member(state, &principal.tenant_id, &member.id)
         .await?
         .ok_or_else(|| ScimError::not_found("SCIM User no longer exists"))?;
     let version = version_for(&updated.id, &updated.updated_at);
@@ -1428,7 +1580,7 @@ async fn delete_user(
     headers: HeaderMap,
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
-    let member = load_member(&state.control, &principal.tenant_id, &id)
+    let member = load_member(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("User `{id}` not found")))?;
     ensure_if_match(&headers, &member)?;
@@ -1436,12 +1588,19 @@ async fn delete_user(
         &principal,
         &[member.base_role.as_str(), member.role.as_str()],
     )?;
-    sqlx::query("DELETE FROM enterprise_members WHERE tenant_id = ? AND id = ?")
-        .bind(&principal.tenant_id)
-        .bind(&id)
-        .execute(&state.control)
-        .await
-        .map_err(ScimError::database)?;
+    if let Some(control) = state.control_store() {
+        control
+            .scim_delete_member(&principal.tenant_id, &id)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        sqlx::query("DELETE FROM enterprise_members WHERE tenant_id = ? AND id = ?")
+            .bind(&principal.tenant_id)
+            .bind(&id)
+            .execute(&state.control)
+            .await
+            .map_err(ScimError::database)?;
+    }
     state
         .audit(
             Some(&principal.tenant_id),
@@ -1483,21 +1642,42 @@ fn group_record(row: &sqlx::sqlite::SqliteRow) -> GroupRecord {
     }
 }
 
+impl From<ScimGroupRecord> for GroupRecord {
+    fn from(record: ScimGroupRecord) -> Self {
+        Self {
+            id: record.id,
+            display_name: record.display_name,
+            external_id: record.external_id,
+            role: record.role,
+            scim_json: record.scim_json,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
 const GROUP_COLUMNS: &str =
     "id, display_name, external_id, role, scim_json, created_at, updated_at";
 
 async fn load_group(
-    pool: &SqlitePool,
+    state: &EnterpriseState,
     tenant_id: &str,
     id: &str,
 ) -> Result<Option<GroupRecord>, ScimError> {
+    if let Some(control) = state.control_store() {
+        let group = control
+            .scim_group_by_id(tenant_id, id)
+            .await
+            .map_err(ScimError::from_control)?;
+        return Ok(group.map(GroupRecord::from));
+    }
     let sql = format!(
         "SELECT {GROUP_COLUMNS} FROM enterprise_scim_groups WHERE tenant_id = ? AND id = ?"
     );
     let row = sqlx::query(AssertSqlSafe(sql))
         .bind(tenant_id)
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(&state.control)
         .await
         .map_err(ScimError::database)?;
     Ok(row.as_ref().map(group_record))
@@ -1508,6 +1688,15 @@ async fn group_member_rows(
     tenant_id: &str,
     group_id: &str,
 ) -> Result<Vec<MemberRecord>, ScimError> {
+    if let Some(control) = state.control_store() {
+        return Ok(control
+            .scim_group_members(tenant_id, group_id)
+            .await
+            .map_err(ScimError::from_control)?
+            .into_iter()
+            .map(MemberRecord::from)
+            .collect());
+    }
     let sql = "SELECT m.id, m.tenant_id, m.subject, m.user_name, m.external_id, m.display_name,
                 m.email, m.role, m.base_role, m.scim_json, m.status, m.created_at, m.updated_at
          FROM enterprise_members m
@@ -1584,6 +1773,45 @@ async fn list_groups(
     let principal = authorize(&state, &headers).await?;
     let filter = group_filter(query.filter.as_deref())?;
     let (start, count, offset) = page(&query);
+    if let Some(control) = state.control_store() {
+        let groups = control
+            .scim_list_groups(&principal.tenant_id)
+            .await
+            .map_err(ScimError::from_control)?
+            .into_iter()
+            .map(GroupRecord::from)
+            .filter(|group| match &filter {
+                None => true,
+                Some(GroupFilter::Id(value)) => group.id == *value,
+                Some(GroupFilter::DisplayName(value)) => {
+                    group.display_name.eq_ignore_ascii_case(value)
+                }
+                Some(GroupFilter::ExternalId(value)) => {
+                    group.external_id.as_deref() == Some(value.as_str())
+                }
+            })
+            .collect::<Vec<_>>();
+        let total = groups.len() as i64;
+        let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+        let take = usize::try_from(count).unwrap_or(usize::MAX);
+        let mut resources = Vec::new();
+        if count != 0 {
+            for group in groups.into_iter().skip(skip).take(take) {
+                resources.push(group_resource(&state, &principal.tenant_id, &group).await?);
+            }
+        }
+        return Ok(scim_response(
+            StatusCode::OK,
+            json!({
+                "schemas": [LIST_SCHEMA],
+                "totalResults": total,
+                "itemsPerPage": resources.len(),
+                "startIndex": start,
+                "Resources": resources
+            }),
+            None,
+        ));
+    }
     let (where_clause, bind_value) = match filter {
         None => (" WHERE tenant_id = ?".to_string(), None),
         Some(GroupFilter::Id(value)) => {
@@ -1725,28 +1953,45 @@ async fn create_group(
     }
     let id = format!("scimgrp_{}", Uuid::now_v7());
     let now = super::now_rfc3339();
-    let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
-    sqlx::query(
-        "INSERT INTO enterprise_scim_groups
-         (id, tenant_id, display_name, external_id, role, scim_json, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&id)
-    .bind(&principal.tenant_id)
-    .bind(&input.display_name)
-    .bind(&input.external_id)
-    .bind(&input.role)
-    .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
-        ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
-    })?)
-    .bind(&now)
-    .bind(&now)
-    .execute(&mut *transaction)
-    .await
-    .map_err(ScimError::database)?;
-    replace_group_members(&mut transaction, &principal.tenant_id, &id, &input.members).await?;
-    sync_group_members(&mut transaction, &principal.tenant_id, &id).await?;
-    transaction.commit().await.map_err(ScimError::database)?;
+    if let Some(control) = state.control_store() {
+        let record = ScimGroupRecord {
+            id: id.clone(),
+            tenant_id: principal.tenant_id.clone(),
+            display_name: input.display_name.clone(),
+            external_id: input.external_id.clone(),
+            role: input.role.clone(),
+            scim_json: input.scim_json.clone(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        control
+            .scim_create_group(&record, &input.members)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
+        sqlx::query(
+            "INSERT INTO enterprise_scim_groups
+             (id, tenant_id, display_name, external_id, role, scim_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&principal.tenant_id)
+        .bind(&input.display_name)
+        .bind(&input.external_id)
+        .bind(&input.role)
+        .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
+            ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
+        })?)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ScimError::database)?;
+        replace_group_members(&mut transaction, &principal.tenant_id, &id, &input.members).await?;
+        sync_group_members(&mut transaction, &principal.tenant_id, &id).await?;
+        transaction.commit().await.map_err(ScimError::database)?;
+    }
     state
         .audit(
             Some(&principal.tenant_id),
@@ -1759,7 +2004,7 @@ async fn create_group(
             json!({"groupId": id, "role": input.role, "members": input.members.len()}),
         )
         .await;
-    let group = load_group(&state.control, &principal.tenant_id, &id)
+    let group = load_group(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found("SCIM Group was not created"))?;
     let version = version_for(&group.id, &group.updated_at);
@@ -1780,7 +2025,7 @@ async fn get_group(
     headers: HeaderMap,
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
-    let group = load_group(&state.control, &principal.tenant_id, &id)
+    let group = load_group(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("Group `{id}` not found")))?;
     let version = version_for(&group.id, &group.updated_at);
@@ -1799,7 +2044,7 @@ async fn replace_group(
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
     let value = scim_json_body(payload)?;
-    let group = load_group(&state.control, &principal.tenant_id, &id)
+    let group = load_group(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("Group `{id}` not found")))?;
     ensure_group_if_match(&headers, &group)?;
@@ -1821,7 +2066,7 @@ async fn patch_group(
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
     let value = scim_json_body(payload)?;
-    let group = load_group(&state.control, &principal.tenant_id, &id)
+    let group = load_group(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("Group `{id}` not found")))?;
     ensure_group_if_match(&headers, &group)?;
@@ -1996,40 +2241,57 @@ async fn update_group(
     input: GroupInput,
 ) -> Result<Response, ScimError> {
     let affected_before = group_member_rows(state, &principal.tenant_id, &group.id).await?;
-    let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
-    sqlx::query(
-        "UPDATE enterprise_scim_groups
-         SET display_name = ?, external_id = ?, role = ?, scim_json = ?, updated_at = ?
-         WHERE tenant_id = ? AND id = ?",
-    )
-    .bind(&input.display_name)
-    .bind(&input.external_id)
-    .bind(&input.role)
-    .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
-        ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
-    })?)
-    .bind(super::now_rfc3339())
-    .bind(&principal.tenant_id)
-    .bind(&group.id)
-    .execute(&mut *transaction)
-    .await
-    .map_err(ScimError::database)?;
-    replace_group_members(
-        &mut transaction,
-        &principal.tenant_id,
-        &group.id,
-        &input.members,
-    )
-    .await?;
-    let mut affected: BTreeSet<String> = affected_before
-        .into_iter()
-        .map(|member| member.id)
-        .collect();
-    affected.extend(input.members.iter().cloned());
-    for member_id in affected {
-        sync_member_role(&mut transaction, &principal.tenant_id, &member_id).await?;
+    if let Some(control) = state.control_store() {
+        let record = ScimGroupRecord {
+            id: group.id.clone(),
+            tenant_id: principal.tenant_id.clone(),
+            display_name: input.display_name.clone(),
+            external_id: input.external_id.clone(),
+            role: input.role.clone(),
+            scim_json: input.scim_json.clone(),
+            created_at: group.created_at.clone(),
+            updated_at: super::now_rfc3339(),
+        };
+        control
+            .scim_update_group(&record, &input.members)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
+        sqlx::query(
+            "UPDATE enterprise_scim_groups
+             SET display_name = ?, external_id = ?, role = ?, scim_json = ?, updated_at = ?
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(&input.display_name)
+        .bind(&input.external_id)
+        .bind(&input.role)
+        .bind(serde_json::to_string(&input.scim_json).map_err(|error| {
+            ScimError::invalid(format!("cannot serialize SCIM attributes: {error}"))
+        })?)
+        .bind(super::now_rfc3339())
+        .bind(&principal.tenant_id)
+        .bind(&group.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(ScimError::database)?;
+        replace_group_members(
+            &mut transaction,
+            &principal.tenant_id,
+            &group.id,
+            &input.members,
+        )
+        .await?;
+        let mut affected: BTreeSet<String> = affected_before
+            .into_iter()
+            .map(|member| member.id)
+            .collect();
+        affected.extend(input.members.iter().cloned());
+        for member_id in affected {
+            sync_member_role(&mut transaction, &principal.tenant_id, &member_id).await?;
+        }
+        transaction.commit().await.map_err(ScimError::database)?;
     }
-    transaction.commit().await.map_err(ScimError::database)?;
     state
         .audit(
             Some(&principal.tenant_id),
@@ -2042,7 +2304,7 @@ async fn update_group(
             json!({"groupId": group.id, "role": input.role, "members": input.members.len()}),
         )
         .await;
-    let updated = load_group(&state.control, &principal.tenant_id, &group.id)
+    let updated = load_group(state, &principal.tenant_id, &group.id)
         .await?
         .ok_or_else(|| ScimError::not_found("SCIM Group no longer exists"))?;
     let version = version_for(&updated.id, &updated.updated_at);
@@ -2059,7 +2321,7 @@ async fn delete_group(
     headers: HeaderMap,
 ) -> Result<Response, ScimError> {
     let principal = authorize(&state, &headers).await?;
-    let group = load_group(&state.control, &principal.tenant_id, &id)
+    let group = load_group(&state, &principal.tenant_id, &id)
         .await?
         .ok_or_else(|| ScimError::not_found(format!("Group `{id}` not found")))?;
     ensure_group_if_match(&headers, &group)?;
@@ -2067,17 +2329,24 @@ async fn delete_group(
         ensure_owner_record_change_allowed(&principal, &[role])?;
     }
     let affected = group_member_rows(&state, &principal.tenant_id, &id).await?;
-    let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
-    sqlx::query("DELETE FROM enterprise_scim_groups WHERE tenant_id = ? AND id = ?")
-        .bind(&principal.tenant_id)
-        .bind(&id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(ScimError::database)?;
-    for member in affected {
-        sync_member_role(&mut transaction, &principal.tenant_id, &member.id).await?;
+    if let Some(control) = state.control_store() {
+        control
+            .scim_delete_group(&principal.tenant_id, &id)
+            .await
+            .map_err(ScimError::from_control)?;
+    } else {
+        let mut transaction = state.control.begin().await.map_err(ScimError::database)?;
+        sqlx::query("DELETE FROM enterprise_scim_groups WHERE tenant_id = ? AND id = ?")
+            .bind(&principal.tenant_id)
+            .bind(&id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(ScimError::database)?;
+        for member in affected {
+            sync_member_role(&mut transaction, &principal.tenant_id, &member.id).await?;
+        }
+        transaction.commit().await.map_err(ScimError::database)?;
     }
-    transaction.commit().await.map_err(ScimError::database)?;
     state
         .audit(
             Some(&principal.tenant_id),

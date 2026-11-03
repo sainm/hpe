@@ -196,6 +196,7 @@ pub struct OauthService {
     control: SqlitePool,
     base_url: String,
     alg: SigningAlg,
+    postgres: Option<sqlx::postgres::PgPool>,
 }
 
 impl OauthService {
@@ -204,7 +205,28 @@ impl OauthService {
             control,
             base_url: base_url.trim_end_matches('/').to_string(),
             alg: SigningAlg::from_env(),
+            postgres: None,
         }
+    }
+
+    pub fn with_postgres(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.postgres = Some(pool);
+        self
+    }
+
+    fn pg(&self) -> Option<&sqlx::postgres::PgPool> {
+        self.postgres.as_ref()
+    }
+
+    async fn pg_begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, OauthError> {
+        let pool = self
+            .pg()
+            .ok_or_else(|| OauthError::Db(sqlx::Error::PoolClosed))?;
+        let mut transaction = pool.begin().await?;
+        sqlx::query("SET LOCAL ROLE hpa_platform_admin")
+            .execute(&mut *transaction)
+            .await?;
+        Ok(transaction)
     }
 
     pub fn issuer(&self) -> &str {
@@ -349,7 +371,6 @@ impl OauthService {
         for statement in statements {
             sqlx::query(statement).execute(&self.control).await?;
         }
-        self.ensure_signing_key().await?;
         Ok(())
     }
 
@@ -380,7 +401,25 @@ impl OauthService {
     }
 
     pub async fn jwks(&self) -> Result<Value, OauthError> {
+        self.ensure_signing_key().await?;
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let rows = sqlx::query(
+                "SELECT public_jwk FROM hpa_control.oauth_signing_keys
+                 WHERE deleted_at IS NULL AND (retired_at IS NULL OR retired_at > $1)
+                 ORDER BY created_at DESC",
+            )
+            .bind(now - RETIRED_KEY_TTL_MS)
+            .fetch_all(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            let keys = rows
+                .iter()
+                .filter_map(|row| row.try_get::<Value, _>("public_jwk").ok())
+                .collect::<Vec<_>>();
+            return Ok(json!({"keys": keys}));
+        }
         let rows = sqlx::query(
             "SELECT public_jwk FROM oauth_signing_keys
              WHERE deleted_at IS NULL AND (retired_at IS NULL OR retired_at > ?)
@@ -401,6 +440,29 @@ impl OauthService {
 
     async fn ensure_signing_key(&self) -> Result<(), OauthError> {
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_signing_keys SET deleted_at = $1
+                 WHERE deleted_at IS NULL AND retired_at IS NOT NULL AND retired_at <= $2",
+            )
+            .bind(now)
+            .bind(now - RETIRED_KEY_TTL_MS)
+            .execute(&mut *transaction)
+            .await?;
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT kid FROM hpa_control.oauth_signing_keys
+                 WHERE retired_at IS NULL AND deleted_at IS NULL LIMIT 1",
+            )
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            if existing.is_some() {
+                return Ok(());
+            }
+            self.create_key(self.alg).await?;
+            return Ok(());
+        }
         sqlx::query(
             "UPDATE oauth_signing_keys SET deleted_at = ?
              WHERE deleted_at IS NULL AND retired_at IS NOT NULL AND retired_at <= ?",
@@ -472,6 +534,28 @@ impl OauthService {
                 (seed.to_vec(), jwk)
             }
         };
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_signing_keys
+                 (kid, alg, secret, public_jwk, created_at, retired_at, deleted_at)
+                 VALUES ($1, $2, $3, $4, $5, NULL, NULL)",
+            )
+            .bind(&kid)
+            .bind(alg.name())
+            .bind(URL_SAFE_NO_PAD.encode(&secret))
+            .bind(sqlx::types::Json(public_jwk.clone()))
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(StoredKey {
+                kid,
+                alg,
+                secret,
+                public_jwk,
+            });
+        }
         sqlx::query(
             "INSERT INTO oauth_signing_keys (kid, alg, secret, public_jwk, created_at, retired_at, deleted_at)
              VALUES (?, ?, ?, ?, ?, NULL, NULL)",
@@ -492,7 +576,25 @@ impl OauthService {
     }
 
     pub async fn rotate_signing_key(&self) -> Result<Value, OauthError> {
+        self.ensure_signing_key().await?;
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_signing_keys SET retired_at = $1
+                 WHERE retired_at IS NULL AND deleted_at IS NULL",
+            )
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            let key = self.create_key(self.alg).await?;
+            return Ok(json!({
+                "kid": key.kid,
+                "alg": key.alg.name(),
+                "rotatedAt": now,
+            }));
+        }
         sqlx::query(
             "UPDATE oauth_signing_keys SET retired_at = ?
              WHERE retired_at IS NULL AND deleted_at IS NULL",
@@ -509,6 +611,21 @@ impl OauthService {
     }
 
     async fn active_key(&self) -> Result<StoredKey, OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT kid, alg, secret, public_jwk FROM hpa_control.oauth_signing_keys
+                 WHERE retired_at IS NULL AND deleted_at IS NULL
+                 ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            let Some(row) = row else {
+                return self.create_key(self.alg).await;
+            };
+            return key_from_pg_row(&row);
+        }
         let row = sqlx::query(
             "SELECT kid, alg, secret, public_jwk FROM oauth_signing_keys
              WHERE retired_at IS NULL AND deleted_at IS NULL
@@ -523,6 +640,21 @@ impl OauthService {
     }
 
     async fn key_by_kid(&self, kid: &str) -> Result<Option<StoredKey>, OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT kid, alg, secret, public_jwk FROM hpa_control.oauth_signing_keys
+                 WHERE kid = $1 AND deleted_at IS NULL",
+            )
+            .bind(kid)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return match row {
+                Some(row) => Ok(Some(key_from_pg_row(&row)?)),
+                None => Ok(None),
+            };
+        }
         let row = sqlx::query(
             "SELECT kid, alg, secret, public_jwk FROM oauth_signing_keys
              WHERE kid = ? AND deleted_at IS NULL",
@@ -645,6 +777,54 @@ impl OauthService {
             .get("jti")
             .and_then(Value::as_str)
             .ok_or_else(|| OauthError::InvalidRequest("token has no jti".to_string()))?;
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT revoked_at, expires_at FROM hpa_control.oauth_tokens
+                 WHERE jti = $1 AND kind = 'access'",
+            )
+            .bind(jti)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            let Some(row) = row else {
+                return Err(OauthError::InvalidRequest(
+                    "token is not recognized".to_string(),
+                ));
+            };
+            let revoked_at: Option<i64> = row.get("revoked_at");
+            let stored_expires: i64 = row.get("expires_at");
+            if revoked_at.is_some() || stored_expires <= now_ms() {
+                return Err(OauthError::InvalidRequest("token is revoked".to_string()));
+            }
+            let scope = object.get("scope").and_then(Value::as_str).unwrap_or("");
+            return Ok(OauthAccessToken {
+                jti: jti.to_string(),
+                client_id: object
+                    .get("client_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                tenant_id: object
+                    .get("tenant_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                subject: object
+                    .get("sub")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                role: object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("viewer")
+                    .to_string(),
+                scopes: split_scopes(scope),
+                audience: audience.to_string(),
+                expires_at: exp,
+            });
+        }
         let row = sqlx::query(
             "SELECT revoked_at, expires_at FROM oauth_tokens WHERE jti = ? AND kind = 'access'",
         )
@@ -735,6 +915,36 @@ impl OauthService {
         };
         let secret_hash = secret.as_deref().map(|value| sha256_hex(value.as_bytes()));
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_clients
+                 (id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash, origin,
+                  tenant_id, created_at, updated_at, disabled_at, last_used_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, $9, $10, NULL, NULL)",
+            )
+            .bind(&id)
+            .bind(name)
+            .bind(sqlx::types::Json(redirect_uris.to_vec()))
+            .bind(sqlx::types::Json(vec![
+                "authorization_code".to_string(),
+                "refresh_token".to_string(),
+            ]))
+            .bind(serde_json::to_string(&scopes)?)
+            .bind(auth_method)
+            .bind(secret_hash)
+            .bind(origin)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            let client = self
+                .client(&id)
+                .await?
+                .ok_or_else(|| OauthError::NotFound("client was not persisted".to_string()))?;
+            return Ok((client, secret));
+        }
         sqlx::query(
             "INSERT INTO oauth_clients
              (id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash, origin,
@@ -764,6 +974,19 @@ impl OauthService {
     }
 
     pub async fn client(&self, id: &str) -> Result<Option<OauthClient>, OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash,
+                        origin, created_at, updated_at, disabled_at, last_used_at
+                 FROM hpa_control.oauth_clients WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(row.as_ref().map(client_from_pg_row));
+        }
         let row = sqlx::query(
             "SELECT id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash,
                     origin, created_at, updated_at, disabled_at, last_used_at
@@ -776,6 +999,18 @@ impl OauthService {
     }
 
     pub async fn list_clients(&self) -> Result<Vec<OauthClient>, OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let rows = sqlx::query(
+                "SELECT id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash,
+                        origin, created_at, updated_at, disabled_at, last_used_at
+                 FROM hpa_control.oauth_clients ORDER BY created_at DESC",
+            )
+            .fetch_all(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(rows.iter().map(client_from_pg_row).collect());
+        }
         let rows = sqlx::query(
             "SELECT id, name, redirect_uris, grant_types, scopes, auth_method, secret_hash,
                     origin, created_at, updated_at, disabled_at, last_used_at
@@ -788,21 +1023,45 @@ impl OauthService {
 
     pub async fn disable_client(&self, id: &str) -> Result<(), OauthError> {
         let now = now_ms();
-        let updated =
+        let affected = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let updated = sqlx::query(
+                "UPDATE hpa_control.oauth_clients
+                 SET disabled_at = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            updated.rows_affected()
+        } else {
             sqlx::query("UPDATE oauth_clients SET disabled_at = ?, updated_at = ? WHERE id = ?")
                 .bind(now)
                 .bind(now)
                 .bind(id)
                 .execute(&self.control)
-                .await?;
-        if updated.rows_affected() == 0 {
+                .await?
+                .rows_affected()
+        };
+        if affected == 0 {
             return Err(OauthError::NotFound(format!("client `{id}` was not found")));
         }
         self.revoke_client_tokens(id, "client_disabled").await?;
-        sqlx::query("DELETE FROM oauth_consents WHERE client_id = ?")
-            .bind(id)
-            .execute(&self.control)
-            .await?;
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query("DELETE FROM hpa_control.oauth_consents WHERE client_id = $1")
+                .bind(id)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+        } else {
+            sqlx::query("DELETE FROM oauth_consents WHERE client_id = ?")
+                .bind(id)
+                .execute(&self.control)
+                .await?;
+        }
         Ok(())
     }
 
@@ -821,8 +1080,23 @@ impl OauthService {
             ));
         }
         let secret = format!("hpa_cs_{}", random_token()?);
+        let hash = sha256_hex(secret.as_bytes());
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_clients SET secret_hash = $1, updated_at = $2
+                 WHERE id = $3",
+            )
+            .bind(&hash)
+            .bind(now_ms())
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(secret);
+        }
         sqlx::query("UPDATE oauth_clients SET secret_hash = ?, updated_at = ? WHERE id = ?")
-            .bind(sha256_hex(secret.as_bytes()))
+            .bind(&hash)
             .bind(now_ms())
             .bind(id)
             .execute(&self.control)
@@ -849,11 +1123,22 @@ impl OauthService {
                         "client authentication is required".to_string(),
                     ));
                 };
-                let row: Option<String> =
+                let row: Option<String> = if self.pg().is_some() {
+                    let mut transaction = self.pg_begin().await?;
+                    let value = sqlx::query_scalar(
+                        "SELECT secret_hash FROM hpa_control.oauth_clients WHERE id = $1",
+                    )
+                    .bind(client_id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+                    transaction.commit().await?;
+                    value
+                } else {
                     sqlx::query_scalar("SELECT secret_hash FROM oauth_clients WHERE id = ?")
                         .bind(client_id)
                         .fetch_optional(&self.control)
-                        .await?;
+                        .await?
+                };
                 let Some(stored) = row else {
                     return Err(OauthError::InvalidClient("client is unknown".to_string()));
                 };
@@ -885,6 +1170,43 @@ impl OauthService {
     ) -> Result<OauthPendingRequest, OauthError> {
         let id = format!("hpa_req_{}", random_token()?);
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_requests
+                 (id, client_id, redirect_uri, scope, state, resource, code_challenge, tenant_id,
+                  subject, role, platform_admin, created_at, expires_at, consumed_at, decision)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL)",
+            )
+            .bind(&id)
+            .bind(&client.id)
+            .bind(redirect_uri)
+            .bind(scope)
+            .bind(state)
+            .bind(resource)
+            .bind(code_challenge)
+            .bind(&owner.tenant_id)
+            .bind(&owner.subject)
+            .bind(&owner.role)
+            .bind(owner.platform_admin)
+            .bind(now)
+            .bind(now + REQUEST_TTL_MS)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(OauthPendingRequest {
+                id,
+                client_id: client.id.clone(),
+                client_name: client.name.clone(),
+                redirect_uri: redirect_uri.to_string(),
+                scope: scope.to_string(),
+                state: state.map(str::to_string),
+                resource: resource.map(str::to_string),
+                tenant_id: owner.tenant_id.clone(),
+                subject: owner.subject.clone(),
+                expires_at: now + REQUEST_TTL_MS,
+            });
+        }
         sqlx::query(
             "INSERT INTO oauth_requests
              (id, client_id, redirect_uri, scope, state, resource, code_challenge, tenant_id,
@@ -921,41 +1243,95 @@ impl OauthService {
     }
 
     pub async fn pending_request(&self, id: &str) -> Result<OauthPendingRequest, OauthError> {
-        let row = sqlx::query(
-            "SELECT r.id, r.client_id, c.name AS client_name, r.redirect_uri, r.scope, r.state,
-                    r.resource, r.tenant_id, r.subject, r.expires_at, r.consumed_at
-             FROM oauth_requests r JOIN oauth_clients c ON c.id = r.client_id
-             WHERE r.id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.control)
-        .await?;
+        struct PendingRow {
+            id: String,
+            client_id: String,
+            client_name: String,
+            redirect_uri: String,
+            scope: String,
+            state: Option<String>,
+            resource: Option<String>,
+            tenant_id: String,
+            subject: String,
+            expires_at: i64,
+            consumed_at: Option<i64>,
+        }
+        let row: Option<PendingRow> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT r.id, r.client_id, c.name AS client_name, r.redirect_uri, r.scope,
+                        r.state, r.resource, r.tenant_id, r.subject, r.expires_at, r.consumed_at
+                 FROM hpa_control.oauth_requests r
+                 JOIN hpa_control.oauth_clients c ON c.id = r.client_id
+                 WHERE r.id = $1",
+            )
+            .bind(id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            row.map(|row| PendingRow {
+                id: row.get("id"),
+                client_id: row.get("client_id"),
+                client_name: row.get("client_name"),
+                redirect_uri: row.get("redirect_uri"),
+                scope: row.get("scope"),
+                state: row.get("state"),
+                resource: row.get("resource"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                expires_at: row.get("expires_at"),
+                consumed_at: row.get("consumed_at"),
+            })
+        } else {
+            sqlx::query(
+                "SELECT r.id, r.client_id, c.name AS client_name, r.redirect_uri, r.scope, r.state,
+                        r.resource, r.tenant_id, r.subject, r.expires_at, r.consumed_at
+                 FROM oauth_requests r JOIN oauth_clients c ON c.id = r.client_id
+                 WHERE r.id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.control)
+            .await?
+            .map(|row| PendingRow {
+                id: row.get("id"),
+                client_id: row.get("client_id"),
+                client_name: row.get("client_name"),
+                redirect_uri: row.get("redirect_uri"),
+                scope: row.get("scope"),
+                state: row.get("state"),
+                resource: row.get("resource"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                expires_at: row.get("expires_at"),
+                consumed_at: row.get("consumed_at"),
+            })
+        };
         let Some(row) = row else {
             return Err(OauthError::NotFound(
                 "authorization request was not found".to_string(),
             ));
         };
-        if row.get::<Option<i64>, _>("consumed_at").is_some() {
+        if row.consumed_at.is_some() {
             return Err(OauthError::InvalidRequest(
                 "authorization request was already used".to_string(),
             ));
         }
-        if row.get::<i64, _>("expires_at") <= now_ms() {
+        if row.expires_at <= now_ms() {
             return Err(OauthError::InvalidRequest(
                 "authorization request has expired".to_string(),
             ));
         }
         Ok(OauthPendingRequest {
-            id: row.get("id"),
-            client_id: row.get("client_id"),
-            client_name: row.get("client_name"),
-            redirect_uri: row.get("redirect_uri"),
-            scope: row.get("scope"),
-            state: row.get("state"),
-            resource: row.get("resource"),
-            tenant_id: row.get("tenant_id"),
-            subject: row.get("subject"),
-            expires_at: row.get("expires_at"),
+            id: row.id,
+            client_id: row.client_id,
+            client_name: row.client_name,
+            redirect_uri: row.redirect_uri,
+            scope: row.scope,
+            state: row.state,
+            resource: row.resource,
+            tenant_id: row.tenant_id,
+            subject: row.subject,
+            expires_at: row.expires_at,
         })
     }
 
@@ -966,14 +1342,30 @@ impl OauthService {
         subject: &str,
         scope: &str,
     ) -> Result<bool, OauthError> {
-        let row: Option<String> = sqlx::query_scalar(
-            "SELECT scope FROM oauth_consents WHERE client_id = ? AND tenant_id = ? AND subject = ?",
-        )
-        .bind(client_id)
-        .bind(tenant_id)
-        .bind(subject)
-        .fetch_optional(&self.control)
-        .await?;
+        let row: Option<String> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let value = sqlx::query_scalar(
+                "SELECT scope FROM hpa_control.oauth_consents
+                 WHERE client_id = $1 AND tenant_id = $2 AND subject = $3",
+            )
+            .bind(client_id)
+            .bind(tenant_id)
+            .bind(subject)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            value
+        } else {
+            sqlx::query_scalar(
+                "SELECT scope FROM oauth_consents
+                 WHERE client_id = ? AND tenant_id = ? AND subject = ?",
+            )
+            .bind(client_id)
+            .bind(tenant_id)
+            .bind(subject)
+            .fetch_optional(&self.control)
+            .await?
+        };
         let Some(granted) = row else {
             return Ok(false);
         };
@@ -999,16 +1391,32 @@ impl OauthService {
         }
         let now = now_ms();
         let decision = if allow { "allow" } else { "deny" };
-        let consumed = sqlx::query(
-            "UPDATE oauth_requests SET consumed_at = ?, decision = ?
-             WHERE id = ? AND consumed_at IS NULL",
-        )
-        .bind(now)
-        .bind(decision)
-        .bind(request_id)
-        .execute(&self.control)
-        .await?;
-        if consumed.rows_affected() == 0 {
+        let consumed = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let updated = sqlx::query(
+                "UPDATE hpa_control.oauth_requests SET consumed_at = $1, decision = $2
+                 WHERE id = $3 AND consumed_at IS NULL",
+            )
+            .bind(now)
+            .bind(decision)
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            updated.rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE oauth_requests SET consumed_at = ?, decision = ?
+                 WHERE id = ? AND consumed_at IS NULL",
+            )
+            .bind(now)
+            .bind(decision)
+            .bind(request_id)
+            .execute(&self.control)
+            .await?
+            .rows_affected()
+        };
+        if consumed == 0 {
             return Err(OauthError::InvalidRequest(
                 "authorization request was already used".to_string(),
             ));
@@ -1021,27 +1429,84 @@ impl OauthService {
             ));
         }
         if remember {
-            sqlx::query(
-                "INSERT INTO oauth_consents (client_id, tenant_id, subject, scope, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?)
-                 ON CONFLICT(client_id, tenant_id, subject)
-                 DO UPDATE SET scope = excluded.scope, updated_at = excluded.updated_at",
-            )
-            .bind(&request.client_id)
-            .bind(&request.tenant_id)
-            .bind(&request.subject)
-            .bind(&request.scope)
-            .bind(now)
-            .bind(now)
-            .execute(&self.control)
-            .await?;
+            if self.pg().is_some() {
+                let mut transaction = self.pg_begin().await?;
+                sqlx::query(
+                    "INSERT INTO hpa_control.oauth_consents
+                     (client_id, tenant_id, subject, scope, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT(client_id, tenant_id, subject)
+                     DO UPDATE SET scope = EXCLUDED.scope, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(&request.client_id)
+                .bind(&request.tenant_id)
+                .bind(&request.subject)
+                .bind(&request.scope)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO oauth_consents (client_id, tenant_id, subject, scope, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(client_id, tenant_id, subject)
+                     DO UPDATE SET scope = excluded.scope, updated_at = excluded.updated_at",
+                )
+                .bind(&request.client_id)
+                .bind(&request.tenant_id)
+                .bind(&request.subject)
+                .bind(&request.scope)
+                .bind(now)
+                .bind(now)
+                .execute(&self.control)
+                .await?;
+            }
         }
-        let challenge: String =
+        let challenge: String = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let value = sqlx::query_scalar(
+                "SELECT code_challenge FROM hpa_control.oauth_requests WHERE id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            value
+        } else {
             sqlx::query_scalar("SELECT code_challenge FROM oauth_requests WHERE id = ?")
                 .bind(request_id)
                 .fetch_one(&self.control)
-                .await?;
+                .await?
+        };
         let code = format!("hpa_ac_{}", random_token()?);
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_codes
+                 (code_hash, request_id, client_id, redirect_uri, scope, code_challenge, resource,
+                  tenant_id, subject, role, platform_admin, created_at, expires_at, consumed_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL)",
+            )
+            .bind(sha256_hex(code.as_bytes()))
+            .bind(&request.id)
+            .bind(&request.client_id)
+            .bind(&request.redirect_uri)
+            .bind(&request.scope)
+            .bind(&challenge)
+            .bind(&request.resource)
+            .bind(&request.tenant_id)
+            .bind(&request.subject)
+            .bind(&owner.role)
+            .bind(owner.platform_admin)
+            .bind(now)
+            .bind(now + CODE_TTL_MS)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(redirect_with(&request, Some(&code), None));
+        }
         sqlx::query(
             "INSERT INTO oauth_codes
              (code_hash, request_id, client_id, redirect_uri, scope, code_challenge, resource,
@@ -1089,66 +1554,132 @@ impl OauthService {
             ));
         }
         let hash = sha256_hex(code.as_bytes());
-        let row = sqlx::query(
-            "SELECT client_id, redirect_uri, scope, code_challenge, resource, tenant_id, subject,
-                    role, platform_admin, expires_at, consumed_at
-             FROM oauth_codes WHERE code_hash = ?",
-        )
-        .bind(&hash)
-        .fetch_optional(&self.control)
-        .await?;
+        struct CodeRow {
+            client_id: String,
+            redirect_uri: String,
+            scope: String,
+            code_challenge: String,
+            resource: Option<String>,
+            tenant_id: String,
+            subject: String,
+            role: String,
+            platform_admin: i64,
+            expires_at: i64,
+            consumed_at: Option<i64>,
+        }
+        let row: Option<CodeRow> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT client_id, redirect_uri, scope, code_challenge, resource, tenant_id,
+                        subject, role, platform_admin, expires_at, consumed_at
+                 FROM hpa_control.oauth_codes WHERE code_hash = $1",
+            )
+            .bind(&hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            row.map(|row| CodeRow {
+                client_id: row.get("client_id"),
+                redirect_uri: row.get("redirect_uri"),
+                scope: row.get("scope"),
+                code_challenge: row.get("code_challenge"),
+                resource: row.get("resource"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                role: row.get("role"),
+                platform_admin: i64::from(row.get::<bool, _>("platform_admin")),
+                expires_at: row.get("expires_at"),
+                consumed_at: row.get("consumed_at"),
+            })
+        } else {
+            sqlx::query(
+                "SELECT client_id, redirect_uri, scope, code_challenge, resource, tenant_id,
+                        subject, role, platform_admin, expires_at, consumed_at
+                 FROM oauth_codes WHERE code_hash = ?",
+            )
+            .bind(&hash)
+            .fetch_optional(&self.control)
+            .await?
+            .map(|row| CodeRow {
+                client_id: row.get("client_id"),
+                redirect_uri: row.get("redirect_uri"),
+                scope: row.get("scope"),
+                code_challenge: row.get("code_challenge"),
+                resource: row.get("resource"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                role: row.get("role"),
+                platform_admin: row.get("platform_admin"),
+                expires_at: row.get("expires_at"),
+                consumed_at: row.get("consumed_at"),
+            })
+        };
         let Some(row) = row else {
             return Err(OauthError::InvalidGrant(
                 "authorization code is not valid".to_string(),
             ));
         };
-        if row.get::<Option<i64>, _>("consumed_at").is_some() {
+        if row.consumed_at.is_some() {
             return Err(OauthError::InvalidGrant(
                 "authorization code was already used".to_string(),
             ));
         }
-        if row.get::<i64, _>("expires_at") <= now_ms() {
+        if row.expires_at <= now_ms() {
             return Err(OauthError::InvalidGrant(
                 "authorization code has expired".to_string(),
             ));
         }
-        if row.get::<String, _>("client_id") != client_id {
+        if row.client_id != client_id {
             return Err(OauthError::InvalidGrant(
                 "authorization code was issued to another client".to_string(),
             ));
         }
-        if row.get::<String, _>("redirect_uri") != redirect_uri {
+        if row.redirect_uri != redirect_uri {
             return Err(OauthError::InvalidGrant(
                 "redirect_uri does not match the authorization request".to_string(),
             ));
         }
-        let challenge: String = row.get("code_challenge");
+        let challenge: String = row.code_challenge;
         if URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes())) != challenge {
             return Err(OauthError::InvalidGrant(
                 "code_verifier does not match the code challenge".to_string(),
             ));
         }
-        let consumed = sqlx::query(
-            "UPDATE oauth_codes SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL",
-        )
-        .bind(now_ms())
-        .bind(&hash)
-        .execute(&self.control)
-        .await?;
-        if consumed.rows_affected() == 0 {
+        let consumed = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let updated = sqlx::query(
+                "UPDATE hpa_control.oauth_codes SET consumed_at = $1
+                 WHERE code_hash = $2 AND consumed_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(&hash)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            updated.rows_affected()
+        } else {
+            sqlx::query(
+                "UPDATE oauth_codes SET consumed_at = ? WHERE code_hash = ? AND consumed_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(&hash)
+            .execute(&self.control)
+            .await?
+            .rows_affected()
+        };
+        if consumed == 0 {
             return Err(OauthError::InvalidGrant(
                 "authorization code was already used".to_string(),
             ));
         }
-        let scope: String = row.get("scope");
-        let resource: Option<String> = row.get("resource");
-        let audience = resource.unwrap_or_else(|| self.audience());
+        let scope = row.scope.clone();
+        let audience = row.resource.clone().unwrap_or_else(|| self.audience());
         self.issue_pair(
             client_id,
-            &row.get::<String, _>("tenant_id"),
-            &row.get::<String, _>("subject"),
-            &row.get::<String, _>("role"),
-            row.get::<i64, _>("platform_admin") != 0,
+            &row.tenant_id,
+            &row.subject,
+            &row.role,
+            row.platform_admin != 0,
             &scope,
             &audience,
             None,
@@ -1170,29 +1701,82 @@ impl OauthService {
         self.authenticate_client(client_id, client_secret, &client)
             .await?;
         let hash = sha256_hex(refresh_token.as_bytes());
-        let row = sqlx::query(
-            "SELECT id, family_id, client_id, tenant_id, subject, role, platform_admin, scope,
-                    audience, expires_at, revoked_at, rotated_to
-             FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'",
-        )
-        .bind(&hash)
-        .fetch_optional(&self.control)
-        .await?;
+        struct RefreshRow {
+            id: String,
+            family_id: String,
+            client_id: String,
+            tenant_id: String,
+            subject: String,
+            role: String,
+            platform_admin: i64,
+            scope: String,
+            audience: String,
+            expires_at: i64,
+            revoked_at: Option<i64>,
+            rotated_to: Option<String>,
+        }
+        let row: Option<RefreshRow> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT id, family_id, client_id, tenant_id, subject, role, platform_admin,
+                        scope, audience, expires_at, revoked_at, rotated_to
+                 FROM hpa_control.oauth_tokens WHERE token_hash = $1 AND kind = 'refresh'",
+            )
+            .bind(&hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            row.map(|row| RefreshRow {
+                id: row.get("id"),
+                family_id: row.get("family_id"),
+                client_id: row.get("client_id"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                role: row.get("role"),
+                platform_admin: i64::from(row.get::<bool, _>("platform_admin")),
+                scope: row.get("scope"),
+                audience: row.get("audience"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+                rotated_to: row.get("rotated_to"),
+            })
+        } else {
+            sqlx::query(
+                "SELECT id, family_id, client_id, tenant_id, subject, role, platform_admin, scope,
+                        audience, expires_at, revoked_at, rotated_to
+                 FROM oauth_tokens WHERE token_hash = ? AND kind = 'refresh'",
+            )
+            .bind(&hash)
+            .fetch_optional(&self.control)
+            .await?
+            .map(|row| RefreshRow {
+                id: row.get("id"),
+                family_id: row.get("family_id"),
+                client_id: row.get("client_id"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                role: row.get("role"),
+                platform_admin: row.get("platform_admin"),
+                scope: row.get("scope"),
+                audience: row.get("audience"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+                rotated_to: row.get("rotated_to"),
+            })
+        };
         let Some(row) = row else {
             return Err(OauthError::InvalidGrant(
                 "refresh token is not valid".to_string(),
             ));
         };
-        let stored_client: String = row.get("client_id");
+        let stored_client = row.client_id.clone();
         if stored_client != client_id {
             return Err(OauthError::InvalidGrant(
                 "refresh token was issued to another client".to_string(),
             ));
         }
-        let family_id: String = row.get("family_id");
-        if row.get::<Option<i64>, _>("revoked_at").is_some()
-            || row.get::<Option<String>, _>("rotated_to").is_some()
-        {
+        let family_id = row.family_id.clone();
+        if row.revoked_at.is_some() || row.rotated_to.is_some() {
             // Reuse of a rotated token invalidates the whole family.
             self.revoke_family(&family_id, "refresh_token_reuse")
                 .await?;
@@ -1200,14 +1784,14 @@ impl OauthService {
                 "refresh token was already rotated".to_string(),
             ));
         }
-        if row.get::<i64, _>("expires_at") <= now_ms() {
+        if row.expires_at <= now_ms() {
             self.revoke_family(&family_id, "refresh_token_expired")
                 .await?;
             return Err(OauthError::InvalidGrant(
                 "refresh token has expired".to_string(),
             ));
         }
-        let granted: String = row.get("scope");
+        let granted: String = row.scope.clone();
         let scope = match requested_scope.filter(|value| !value.trim().is_empty()) {
             None => granted.clone(),
             Some(requested) => {
@@ -1224,34 +1808,59 @@ impl OauthService {
                 requested.join(" ")
             }
         };
-        let id: String = row.get("id");
-        sqlx::query(
-            "UPDATE oauth_tokens SET used_at = ?, revoked_at = ?, revoked_reason = ? WHERE id = ?",
-        )
-        .bind(now_ms())
-        .bind(now_ms())
-        .bind("rotated")
-        .bind(&id)
-        .execute(&self.control)
-        .await?;
-        let audience: String = row.get("audience");
+        let id = row.id.clone();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_tokens
+                 SET used_at = $1, revoked_at = $1, revoked_reason = $2 WHERE id = $3",
+            )
+            .bind(now_ms())
+            .bind("rotated")
+            .bind(&id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+        } else {
+            sqlx::query(
+                "UPDATE oauth_tokens SET used_at = ?, revoked_at = ?, revoked_reason = ?
+                 WHERE id = ?",
+            )
+            .bind(now_ms())
+            .bind(now_ms())
+            .bind("rotated")
+            .bind(&id)
+            .execute(&self.control)
+            .await?;
+        }
+        let audience = row.audience.clone();
         let pair = self
             .issue_pair(
                 client_id,
-                &row.get::<String, _>("tenant_id"),
-                &row.get::<String, _>("subject"),
-                &row.get::<String, _>("role"),
-                row.get::<i64, _>("platform_admin") != 0,
+                &row.tenant_id,
+                &row.subject,
+                &row.role,
+                row.platform_admin != 0,
                 &scope,
                 &audience,
                 Some(&family_id),
             )
             .await?;
-        sqlx::query("UPDATE oauth_tokens SET rotated_to = ? WHERE id = ?")
-            .bind(&pair.refresh_token)
-            .bind(&id)
-            .execute(&self.control)
-            .await?;
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query("UPDATE hpa_control.oauth_tokens SET rotated_to = $1 WHERE id = $2")
+                .bind(&pair.refresh_token)
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+        } else {
+            sqlx::query("UPDATE oauth_tokens SET rotated_to = ? WHERE id = ?")
+                .bind(&pair.refresh_token)
+                .bind(&id)
+                .execute(&self.control)
+                .await?;
+        }
         Ok(pair)
     }
 
@@ -1291,6 +1900,69 @@ impl OauthService {
             None => format!("fam_{}", random_token()?),
         };
         let refresh_token = format!("hpa_rt_{}", random_token()?);
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_tokens
+                 (id, kind, token_hash, jti, family_id, client_id, tenant_id, subject, role,
+                  platform_admin, scope, audience, created_at, expires_at, revoked_at,
+                  revoked_reason, rotated_to, used_at)
+                 VALUES ($1, 'access', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                         NULL, NULL, NULL, NULL)",
+            )
+            .bind(format!("oat_{}", Uuid::now_v7()))
+            .bind(sha256_hex(access_token.as_bytes()))
+            .bind(&jti)
+            .bind(&family)
+            .bind(client_id)
+            .bind(tenant_id)
+            .bind(subject)
+            .bind(role)
+            .bind(platform_admin)
+            .bind(scope)
+            .bind(audience)
+            .bind(now)
+            .bind(expires_at * 1000)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "INSERT INTO hpa_control.oauth_tokens
+                 (id, kind, token_hash, jti, family_id, client_id, tenant_id, subject, role,
+                  platform_admin, scope, audience, created_at, expires_at, revoked_at,
+                  revoked_reason, rotated_to, used_at)
+                 VALUES ($1, 'refresh', $2, NULL, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                         NULL, NULL, NULL, NULL)",
+            )
+            .bind(format!("ort_{}", Uuid::now_v7()))
+            .bind(sha256_hex(refresh_token.as_bytes()))
+            .bind(&family)
+            .bind(client_id)
+            .bind(tenant_id)
+            .bind(subject)
+            .bind(role)
+            .bind(platform_admin)
+            .bind(scope)
+            .bind(audience)
+            .bind(now)
+            .bind(now + REFRESH_TTL_MS)
+            .execute(&mut *transaction)
+            .await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_clients SET last_used_at = $1, updated_at = $1
+                 WHERE id = $2",
+            )
+            .bind(now)
+            .bind(client_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(OauthTokenPair {
+                access_token,
+                refresh_token,
+                expires_in: ACCESS_TTL_SECONDS,
+                scope: scope.to_string(),
+            });
+        }
         sqlx::query(
             "INSERT INTO oauth_tokens
              (id, kind, token_hash, jti, family_id, client_id, tenant_id, subject, role,
@@ -1352,27 +2024,50 @@ impl OauthService {
 
     pub async fn revoke(&self, token: &str, client_id: Option<&str>) -> Result<bool, OauthError> {
         let hash = sha256_hex(token.as_bytes());
-        let row = sqlx::query(
-            "SELECT id, kind, family_id, client_id FROM oauth_tokens WHERE token_hash = ?",
-        )
-        .bind(&hash)
-        .fetch_optional(&self.control)
-        .await?;
-        let Some(row) = row else {
+        let row: Option<(String, String)> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT client_id, family_id FROM hpa_control.oauth_tokens WHERE token_hash = $1",
+            )
+            .bind(&hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            row.map(|row| (row.get("client_id"), row.get("family_id")))
+        } else {
+            sqlx::query("SELECT client_id, family_id FROM oauth_tokens WHERE token_hash = ?")
+                .bind(&hash)
+                .fetch_optional(&self.control)
+                .await?
+                .map(|row| (row.get("client_id"), row.get("family_id")))
+        };
+        let Some((stored_client, family)) = row else {
             return Ok(false);
         };
-        let stored_client: String = row.get("client_id");
         if let Some(client_id) = client_id
             && stored_client != client_id
         {
             return Ok(false);
         }
-        let family: String = row.get("family_id");
         self.revoke_family(&family, "revoked").await?;
         Ok(true)
     }
 
     async fn revoke_family(&self, family_id: &str, reason: &str) -> Result<(), OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query(
+                "UPDATE hpa_control.oauth_tokens SET revoked_at = $1, revoked_reason = $2
+                 WHERE family_id = $3 AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(reason)
+            .bind(family_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
         sqlx::query(
             "UPDATE oauth_tokens SET revoked_at = ?, revoked_reason = ?
              WHERE family_id = ? AND revoked_at IS NULL",
@@ -1390,16 +2085,32 @@ impl OauthService {
         client_id: &str,
         reason: &str,
     ) -> Result<usize, OauthError> {
-        let revoked = sqlx::query(
-            "UPDATE oauth_tokens SET revoked_at = ?, revoked_reason = ?
-             WHERE client_id = ? AND revoked_at IS NULL",
-        )
-        .bind(now_ms())
-        .bind(reason)
-        .bind(client_id)
-        .execute(&self.control)
-        .await?;
-        Ok(revoked.rows_affected() as usize)
+        let revoked = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let updated = sqlx::query(
+                "UPDATE hpa_control.oauth_tokens SET revoked_at = $1, revoked_reason = $2
+                 WHERE client_id = $3 AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(reason)
+            .bind(client_id)
+            .execute(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            updated.rows_affected() as usize
+        } else {
+            sqlx::query(
+                "UPDATE oauth_tokens SET revoked_at = ?, revoked_reason = ?
+                 WHERE client_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now_ms())
+            .bind(reason)
+            .bind(client_id)
+            .execute(&self.control)
+            .await?
+            .rows_affected() as usize
+        };
+        Ok(revoked)
     }
 
     pub async fn introspect(&self, token: &str) -> Result<Value, OauthError> {
@@ -1423,29 +2134,66 @@ impl OauthService {
             }
         }
         let hash = sha256_hex(token.as_bytes());
-        let row = sqlx::query(
-            "SELECT client_id, tenant_id, subject, scope, audience, expires_at, revoked_at
-             FROM oauth_tokens WHERE token_hash = ?",
-        )
-        .bind(&hash)
-        .fetch_optional(&self.control)
-        .await?;
+        struct TokenRow {
+            client_id: String,
+            tenant_id: String,
+            subject: String,
+            scope: String,
+            audience: String,
+            expires_at: i64,
+            revoked_at: Option<i64>,
+        }
+        let row: Option<TokenRow> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let row = sqlx::query(
+                "SELECT client_id, tenant_id, subject, scope, audience, expires_at, revoked_at
+                 FROM hpa_control.oauth_tokens WHERE token_hash = $1",
+            )
+            .bind(&hash)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            transaction.commit().await?;
+            row.map(|row| TokenRow {
+                client_id: row.get("client_id"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                scope: row.get("scope"),
+                audience: row.get("audience"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+            })
+        } else {
+            sqlx::query(
+                "SELECT client_id, tenant_id, subject, scope, audience, expires_at, revoked_at
+                 FROM oauth_tokens WHERE token_hash = ?",
+            )
+            .bind(&hash)
+            .fetch_optional(&self.control)
+            .await?
+            .map(|row| TokenRow {
+                client_id: row.get("client_id"),
+                tenant_id: row.get("tenant_id"),
+                subject: row.get("subject"),
+                scope: row.get("scope"),
+                audience: row.get("audience"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+            })
+        };
         let Some(row) = row else {
             return Ok(json!({"active": false}));
         };
-        let revoked: Option<i64> = row.get("revoked_at");
-        let expires_at: i64 = row.get("expires_at");
-        if revoked.is_some() || expires_at <= now_ms() {
+        if row.revoked_at.is_some() || row.expires_at <= now_ms() {
             return Ok(json!({"active": false}));
         }
         Ok(json!({
             "active": true,
-            "scope": row.get::<String, _>("scope"),
-            "client_id": row.get::<String, _>("client_id"),
-            "sub": row.get::<String, _>("subject"),
-            "aud": row.get::<String, _>("audience"),
-            "tenant_id": row.get::<String, _>("tenant_id"),
-            "exp": expires_at / 1000,
+            "scope": row.scope,
+            "client_id": row.client_id,
+            "sub": row.subject,
+            "aud": row.audience,
+            "tenant_id": row.tenant_id,
+            "exp": row.expires_at / 1000,
             "token_type": "refresh_token",
         }))
     }
@@ -1454,6 +2202,47 @@ impl OauthService {
         &self,
         client_id: Option<&str>,
     ) -> Result<Vec<OauthTokenRow>, OauthError> {
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let rows = match client_id {
+                Some(client_id) => {
+                    sqlx::query(
+                        "SELECT id, kind, client_id, tenant_id, subject, scope, created_at,
+                            expires_at, revoked_at, family_id
+                     FROM hpa_control.oauth_tokens WHERE client_id = $1
+                     ORDER BY created_at DESC LIMIT 200",
+                    )
+                    .bind(client_id)
+                    .fetch_all(&mut *transaction)
+                    .await?
+                }
+                None => {
+                    sqlx::query(
+                        "SELECT id, kind, client_id, tenant_id, subject, scope, created_at,
+                            expires_at, revoked_at, family_id
+                     FROM hpa_control.oauth_tokens ORDER BY created_at DESC LIMIT 200",
+                    )
+                    .fetch_all(&mut *transaction)
+                    .await?
+                }
+            };
+            transaction.commit().await?;
+            return Ok(rows
+                .iter()
+                .map(|row| OauthTokenRow {
+                    id: row.get("id"),
+                    kind: row.get("kind"),
+                    client_id: row.get("client_id"),
+                    tenant_id: row.get("tenant_id"),
+                    subject: row.get("subject"),
+                    scope: row.get("scope"),
+                    created_at: row.get("created_at"),
+                    expires_at: row.get("expires_at"),
+                    revoked_at: row.get("revoked_at"),
+                    family_id: row.get("family_id"),
+                })
+                .collect());
+        }
         let rows =
             match client_id {
                 Some(client_id) => sqlx::query(
@@ -1490,11 +2279,21 @@ impl OauthService {
     }
 
     pub async fn revoke_token_id(&self, id: &str) -> Result<(), OauthError> {
-        let row: Option<String> =
+        let row: Option<String> = if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            let value =
+                sqlx::query_scalar("SELECT family_id FROM hpa_control.oauth_tokens WHERE id = $1")
+                    .bind(id)
+                    .fetch_optional(&mut *transaction)
+                    .await?;
+            transaction.commit().await?;
+            value
+        } else {
             sqlx::query_scalar("SELECT family_id FROM oauth_tokens WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&self.control)
-                .await?;
+                .await?
+        };
         let Some(family) = row else {
             return Err(OauthError::NotFound(format!("token `{id}` was not found")));
         };
@@ -1504,6 +2303,19 @@ impl OauthService {
 
     pub async fn purge_expired(&self) -> Result<(), OauthError> {
         let now = now_ms();
+        if self.pg().is_some() {
+            let mut transaction = self.pg_begin().await?;
+            sqlx::query("DELETE FROM hpa_control.oauth_codes WHERE expires_at < $1")
+                .bind(now - 3_600_000)
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query("DELETE FROM hpa_control.oauth_requests WHERE expires_at < $1")
+                .bind(now - 3_600_000)
+                .execute(&mut *transaction)
+                .await?;
+            transaction.commit().await?;
+            return Ok(());
+        }
         sqlx::query("DELETE FROM oauth_codes WHERE expires_at < ?")
             .bind(now - 3_600_000)
             .execute(&self.control)
@@ -1631,6 +2443,34 @@ fn redirect_with(
     url.to_string()
 }
 
+fn client_from_pg_row(row: &sqlx::postgres::PgRow) -> OauthClient {
+    use sqlx::Row;
+    let json_list = |value: Option<Value>| -> Vec<String> {
+        value
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+            .unwrap_or_default()
+    };
+    let scopes: String = row.try_get("scopes").unwrap_or_default();
+    OauthClient {
+        id: row.try_get("id").unwrap_or_default(),
+        name: row.try_get("name").unwrap_or_default(),
+        redirect_uris: json_list(row.try_get("redirect_uris").ok()),
+        grant_types: json_list(row.try_get("grant_types").ok()),
+        scopes: serde_json::from_str::<Vec<String>>(&scopes).unwrap_or_default(),
+        auth_method: row.try_get("auth_method").unwrap_or_default(),
+        origin: row.try_get("origin").unwrap_or_default(),
+        created_at: row.try_get("created_at").unwrap_or_default(),
+        updated_at: row.try_get("updated_at").unwrap_or_default(),
+        disabled_at: row.try_get("disabled_at").ok().flatten(),
+        last_used_at: row.try_get("last_used_at").ok().flatten(),
+        has_secret: row
+            .try_get::<Option<String>, _>("secret_hash")
+            .ok()
+            .flatten()
+            .is_some_and(|value| !value.is_empty()),
+    }
+}
+
 fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> OauthClient {
     let json_list = |raw: Option<String>| -> Vec<String> {
         raw.and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
@@ -1652,6 +2492,31 @@ fn client_from_row(row: &sqlx::sqlite::SqliteRow) -> OauthClient {
             .get::<Option<String>, _>("secret_hash")
             .is_some_and(|value| !value.is_empty()),
     }
+}
+
+fn key_from_pg_row(row: &sqlx::postgres::PgRow) -> Result<StoredKey, OauthError> {
+    use sqlx::Row;
+    let alg: String = row.try_get("alg")?;
+    let alg = match alg.as_str() {
+        "ES256" => SigningAlg::Es256,
+        "EdDSA" => SigningAlg::EdDsa,
+        other => {
+            return Err(OauthError::Crypto(format!(
+                "stored signing key uses unsupported algorithm `{other}`"
+            )));
+        }
+    };
+    let secret: String = row.try_get("secret")?;
+    let secret = URL_SAFE_NO_PAD
+        .decode(secret)
+        .map_err(|_| OauthError::Crypto("stored signing key is not base64url".to_string()))?;
+    let public_jwk: Value = row.try_get("public_jwk")?;
+    Ok(StoredKey {
+        kid: row.try_get("kid")?,
+        alg,
+        secret,
+        public_jwk,
+    })
 }
 
 fn key_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredKey, OauthError> {
