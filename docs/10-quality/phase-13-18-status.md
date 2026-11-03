@@ -1,6 +1,6 @@
 # Phase 13–18 状态台账
 
-> 目的：把「文档声称」「代码事实」「本机可复现证据」放在同一张表里。之前出现过文档写“SCIM 已切 PostgreSQL”但 `scim.rs` 里零处 `hpa_control` 引用、以及测试计数照抄旧值的情况；这张表用来防止再次发生。
+> 目的：把「文档声称」「代码事实」「本机可复现证据」放在同一张表里。触发这份表的是「测试计数照抄旧值」——阶段文档里的 23x passed 是当时的快照，既没写跳过项也没写沙箱限制。表里的状态一律以本机实测为准。
 >
 > 最近核对于 **2026-11-03 22:15**，代码 `53d34a4`，PostgreSQL 18.4，macOS。
 
@@ -74,6 +74,15 @@
 
 发布证据必须来自**设置了这些变量之后的运行**；这张表里所有“全绿”都按此口径记录。
 
+### 2.3.1 一次误判记录：SCIM 到底写没写 PostgreSQL
+
+我曾根据 `grep -c 'hpa_control\.' crates/hpa-local/src/scim.rs` 返回 0，判断「SCIM 只写 SQLite、文档虚报」。**这个判断是错的**：
+
+- SCIM 的路由与校验在 `scim.rs`，但 SQL 在 `postgres_control.rs` 的 `scim_*` 方法里（`scim_create_member`、`scim_groups` 等），所以单文件 grep 命中 0。
+- 实测（2026-11-03，PostgreSQL 模式）：`POST /scim/v2/Users` → 201，**同一秒**查 `hpa_control.members` 已有 1 行；`POST /scim/v2/Groups`（带成员与角色映射）→ 201，`scim_groups`=1、`scim_group_members`=1，随后读该用户 `effectiveRole` 立即为 `auditor`。没有任何镜像延迟。
+
+教训：验证「某能力是否走 PG」不能只 grep 单个文件，要看该能力的 store 层（`postgres_*.rs` / `postgres_control.rs` 里的同名方法）。这条也写进第 4 节的纪律里。
+
 ### 2.4 关于各阶段文档里的「门禁」数字
 
 `phase-14` … `phase-18` 每篇结尾都有一段「全量 Rust 23x passed / 1 ignored」的门禁记录。那是**该阶段完成当时的快照**，且只统计了通过数、没写同一环境下被跳过的用例和沙箱限制。以本表为准：
@@ -113,7 +122,7 @@ pnpm check
 
 ## 4. 文档纪律（写给自己和下一位维护者）
 
-1. **声称某模块已切 PostgreSQL 之前**，先 `grep -c 'hpa_control\.' <file>`；0 就是没切。
+1. **声称某模块已切 PostgreSQL 之前**，grep **整个 crate**（`grep -rn 'hpa_control\.\|scim_' crates/hpa-local/src`），并确认它调用的 store 方法落在 `postgres_*.rs`。只看单个 handler 文件会误判（见 2.3.1）。
 2. **测试计数只写实测值**，并写清环境（沙箱/真实 PG/CI）。
 3. **区分“本地模式仍可用”与“PG 模式已验证”**：两者都要有对应测试，缺哪个就在本表标出来。
 4. **`BLOCKED_EXTERNAL` 要写清缺什么**（凭证？主机？IdP 租户？），不要用“待后续”含糊过去。
