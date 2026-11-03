@@ -290,6 +290,8 @@ pub enum AgentError {
     #[error("{0}")]
     Budget(String),
     #[error("{0}")]
+    Lease(String),
+    #[error("{0}")]
     Json(#[from] serde_json::Error),
 }
 
@@ -301,6 +303,9 @@ pub struct AgentRuntime {
     pub connectors: ConnectorRuntime,
     http: reqwest::Client,
     tenant_id: String,
+    node_id: String,
+    lease_ttl_ms: i64,
+    leases: Arc<tokio::sync::Mutex<HashMap<String, i64>>>,
     python: Option<PythonWorkerConfig>,
     tool_capabilities: Arc<tokio::sync::Mutex<HashMap<String, ToolCapability>>>,
     active_python: Arc<tokio::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
@@ -445,6 +450,9 @@ impl AgentRuntime {
                 .build()
                 .unwrap_or_default(),
             tenant_id: "local".to_string(),
+            node_id: agent_node_id(),
+            lease_ttl_ms: agent_lease_ttl_ms(),
+            leases: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             python: None,
             tool_capabilities: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_python: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -459,6 +467,57 @@ impl AgentRuntime {
     pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
         self.tenant_id = tenant_id.into();
         self
+    }
+
+    async fn acquire_session_lease(&self, session_id: &str) -> Result<Option<i64>, AgentError> {
+        let Some(store) = self.db.postgres_agent() else {
+            return Ok(None);
+        };
+        let mut leases = self.leases.lock().await;
+        if leases.contains_key(session_id) {
+            return Err(AgentError::Lease(
+                "agent session is already driven by this runtime".to_string(),
+            ));
+        }
+        let lease = store
+            .acquire_agent_lease(session_id, &self.node_id, self.lease_ttl_ms)
+            .await
+            .map_err(|error| AgentError::Lease(error.to_string()))?;
+        match lease {
+            Some(lease) => {
+                leases.insert(session_id.to_string(), lease.token);
+                Ok(Some(lease.token))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn release_session_lease(&self, session_id: &str) {
+        let Some(store) = self.db.postgres_agent() else {
+            return;
+        };
+        let token = self.leases.lock().await.remove(session_id);
+        if let Some(token) = token {
+            let _ = store
+                .release_agent_lease(session_id, &self.node_id, token)
+                .await;
+        }
+    }
+
+    async fn session_lease_token(&self, session_id: &str) -> Option<i64> {
+        self.leases.lock().await.get(session_id).copied()
+    }
+
+    async fn require_lease(&self, session_id: &str) -> Result<bool, AgentError> {
+        if self.db.postgres_agent().is_none() {
+            return Ok(false);
+        }
+        match self.acquire_session_lease(session_id).await? {
+            Some(_) => Ok(true),
+            None => Err(AgentError::Lease(format!(
+                "agent session `{session_id}` is held by another runtime"
+            ))),
+        }
     }
 
     pub fn python_worker_available(&self) -> bool {
@@ -546,19 +605,56 @@ impl AgentRuntime {
             finished_at: None,
         };
         self.db.insert_agent_session(&row).await?;
+        let _ = self.require_lease(&session_id).await?;
+        let result = self
+            .start_leased(&session_id, &definition, &version_row, &mut state)
+            .await;
+        self.release_session_lease(&session_id).await;
+        result
+    }
+
+    async fn start_leased(
+        &self,
+        session_id: &str,
+        definition: &AgentDefinition,
+        version_row: &AgentVersionRow,
+        state: &mut AgentSessionState,
+    ) -> Result<AgentSessionRow, AgentError> {
         self.emit(
-            &mut state,
-            &session_id,
+            state,
+            session_id,
             "agent.started",
-            json!({"agentId": definition.id, "version": definition.version, "depth": start.depth}),
+            json!({"agentId": definition.id, "version": definition.version, "depth": state.depth}),
         )
         .await?;
-        self.persist(&session_id, &state).await?;
-        self.drive_with_definition(&session_id, &definition, &version_row)
+        self.persist(session_id, state).await?;
+        self.drive_with_definition(session_id, definition, version_row)
             .await
     }
 
     pub async fn drive(&self, session_id: &str) -> Result<AgentSessionRow, AgentError> {
+        let row = self
+            .db
+            .get_agent_session(session_id)
+            .await?
+            .ok_or_else(|| {
+                AgentError::NotFound(format!("agent session `{session_id}` not found"))
+            })?;
+        if row.status == AgentStatus::WaitingApproval.as_str()
+            || matches!(
+                row.status.as_str(),
+                "succeeded" | "failed" | "budget_exhausted" | "timeout" | "cancelled"
+            )
+        {
+            return Ok(row);
+        }
+        let _ = self.require_lease(session_id).await?;
+        let result = self.drive_resumed(session_id).await;
+        self.release_session_lease(session_id).await;
+        result
+    }
+
+    async fn drive_resumed(&self, session_id: &str) -> Result<AgentSessionRow, AgentError> {
         let row = self
             .db
             .get_agent_session(session_id)
@@ -1945,6 +2041,26 @@ impl AgentRuntime {
         session_id: &str,
         decision: &str,
     ) -> Result<AgentSessionRow, AgentError> {
+        let waiting = self
+            .db
+            .get_agent_session(session_id)
+            .await?
+            .is_some_and(|row| row.status == AgentStatus::WaitingApproval.as_str());
+        if waiting {
+            let _ = self.require_lease(session_id).await?;
+        }
+        let result = self.resume_approval_locked(session_id, decision).await;
+        if waiting {
+            self.release_session_lease(session_id).await;
+        }
+        result
+    }
+
+    async fn resume_approval_locked(
+        &self,
+        session_id: &str,
+        decision: &str,
+    ) -> Result<AgentSessionRow, AgentError> {
         if !matches!(decision, "approved" | "rejected") {
             return Err(AgentError::Approval(
                 "decision must be approved or rejected".to_string(),
@@ -2224,7 +2340,19 @@ impl AgentRuntime {
             updated_at: now.clone(),
             finished_at: state.status.is_terminal().then_some(now),
         };
-        self.db.update_agent_session(&updated).await?;
+        if let Some(token) = self.session_lease_token(session_id).await {
+            let fenced = self
+                .db
+                .update_agent_session_fenced(&updated, &self.node_id, token, self.lease_ttl_ms)
+                .await?;
+            if !fenced {
+                return Err(AgentError::Lease(format!(
+                    "agent session `{session_id}` lease lost"
+                )));
+            }
+        } else {
+            self.db.update_agent_session(&updated).await?;
+        }
         Ok(())
     }
 
@@ -2236,15 +2364,26 @@ impl AgentRuntime {
         data: Value,
     ) -> Result<(), AgentError> {
         state.event_sequence += 1;
-        self.db
-            .append_agent_events(&[AgentEventRow {
-                session_id: session_id.to_string(),
-                sequence: state.event_sequence,
-                at: now_rfc3339(),
-                kind: kind.to_string(),
-                data_json: serde_json::to_string(&data)?,
-            }])
-            .await?;
+        let event = AgentEventRow {
+            session_id: session_id.to_string(),
+            sequence: state.event_sequence,
+            at: now_rfc3339(),
+            kind: kind.to_string(),
+            data_json: serde_json::to_string(&data)?,
+        };
+        if let Some(token) = self.session_lease_token(session_id).await {
+            let fenced = self
+                .db
+                .append_agent_events_fenced(&[event], &self.node_id, token, self.lease_ttl_ms)
+                .await?;
+            if !fenced {
+                return Err(AgentError::Lease(format!(
+                    "agent session `{session_id}` lease lost"
+                )));
+            }
+        } else {
+            self.db.append_agent_events(&[event]).await?;
+        }
         Ok(())
     }
 
@@ -2282,27 +2421,39 @@ impl AgentRuntime {
         let sessions = self.db.running_agent_sessions().await?;
         let mut recovered = 0;
         for row in sessions {
-            let mut state: AgentSessionState = serde_json::from_str(&row.state_json)?;
-            if !state.status.is_resumable() {
+            if self.db.postgres_agent().is_some()
+                && self.acquire_session_lease(&row.id).await?.is_none()
+            {
                 continue;
             }
-            state.status = AgentStatus::Interrupted;
-            state.stop_reason = Some("runtime_restart".to_string());
-            state.error = Some(
-                "AGENT_INTERRUPTED: runtime restarted; resume to continue from the last checkpoint"
-                    .to_string(),
-            );
-            self.emit(
-                &mut state,
-                &row.id,
-                "agent.interrupted",
-                json!({"reason": "runtime_restart"}),
-            )
-            .await?;
-            self.persist(&row.id, &state).await?;
+            let result = self.interrupt_recovered_session(&row).await;
+            self.release_session_lease(&row.id).await;
+            result?;
             recovered += 1;
         }
         Ok(recovered)
+    }
+
+    async fn interrupt_recovered_session(&self, row: &AgentSessionRow) -> Result<(), AgentError> {
+        let mut state: AgentSessionState = serde_json::from_str(&row.state_json)?;
+        if !state.status.is_resumable() {
+            return Ok(());
+        }
+        state.status = AgentStatus::Interrupted;
+        state.stop_reason = Some("runtime_restart".to_string());
+        state.error = Some(
+            "AGENT_INTERRUPTED: runtime restarted; resume to continue from the last checkpoint"
+                .to_string(),
+        );
+        self.emit(
+            &mut state,
+            &row.id,
+            "agent.interrupted",
+            json!({"reason": "runtime_restart"}),
+        )
+        .await?;
+        self.persist(&row.id, &state).await?;
+        Ok(())
     }
 
     pub fn start_approval_monitor(&self) {
@@ -3444,6 +3595,26 @@ pub fn agent_version_value(row: &AgentVersionRow) -> Value {
         "createdAt": row.created_at,
         "publishedAt": row.published_at,
     })
+}
+
+fn agent_node_id() -> String {
+    static NODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        std::env::var("HPA_NODE_ID")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("agent-node-{}", Uuid::now_v7()))
+    })
+    .clone()
+}
+
+fn agent_lease_ttl_ms() -> i64 {
+    std::env::var("HPA_AGENT_LEASE_TTL_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .filter(|value| *value >= 200)
+        .unwrap_or(30_000)
 }
 
 fn now_rfc3339() -> String {

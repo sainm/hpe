@@ -23,6 +23,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::db::{Db, DbError};
+use hpa_local::postgres_connector::{
+    ConnectionRecord, ConnectorAuditRecord, ConnectorDefinitionRecord, PostgresConnectorError,
+};
 
 pub const CONNECTOR_SCHEMA: &str = "hpa.connector/v1";
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -394,6 +397,22 @@ impl ConnectorRuntime {
         status: &str,
     ) -> Result<bool, ConnectorError> {
         validate_manifest(manifest)?;
+        if let Some(store) = self.db.postgres_connector() {
+            return store
+                .upsert_definition(
+                    &serde_json::to_string(manifest)?,
+                    &manifest.id,
+                    &manifest.version,
+                    &manifest.name,
+                    connector_kind(manifest.kind),
+                    plugin_id,
+                    plugin_version,
+                    status,
+                    &now_rfc3339(),
+                )
+                .await
+                .map_err(pg_connector_error);
+        }
         let existing: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT manifest_json, plugin_id FROM connector_definitions
              WHERE connector_id = ? AND version = ?",
@@ -460,6 +479,13 @@ impl ConnectorRuntime {
     }
 
     pub async fn list_definitions(&self) -> Result<Vec<ConnectorDefinitionRow>, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            return store
+                .list_definitions()
+                .await
+                .map(|records| records.into_iter().map(definition_from_pg).collect())
+                .map_err(pg_connector_error);
+        }
         Ok(sqlx::query_as::<_, ConnectorDefinitionRow>(
             "SELECT connector_id, version, name, kind, manifest_json, plugin_id, plugin_version,
                     status, created_at
@@ -474,6 +500,23 @@ impl ConnectorRuntime {
         connector_id: &str,
         version: Option<&str>,
     ) -> Result<ConnectorDefinitionRow, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            return match store
+                .definition(connector_id, version)
+                .await
+                .map_err(pg_connector_error)?
+            {
+                Some(record) => Ok(definition_from_pg(record)),
+                None => Err(match version {
+                    Some(version) => ConnectorError::NotFound(format!(
+                        "connector `{connector_id}@{version}` not found"
+                    )),
+                    None => {
+                        ConnectorError::NotFound(format!("connector `{connector_id}` not found"))
+                    }
+                }),
+            };
+        }
         match version {
             Some(version) => sqlx::query_as::<_, ConnectorDefinitionRow>(
                 "SELECT connector_id, version, name, kind, manifest_json, plugin_id, plugin_version,
@@ -501,6 +544,13 @@ impl ConnectorRuntime {
     }
 
     pub async fn list_connections(&self) -> Result<Vec<ConnectionRow>, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            return store
+                .list_connections()
+                .await
+                .map(|records| records.into_iter().map(connection_from_pg).collect())
+                .map_err(pg_connector_error);
+        }
         Ok(sqlx::query_as::<_, ConnectionRow>(
             "SELECT id, name, connector_id, connector_version, config_json, credential_env, status,
                     created_at, updated_at
@@ -511,6 +561,14 @@ impl ConnectorRuntime {
     }
 
     pub async fn connection(&self, id: &str) -> Result<ConnectionRow, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            return match store.connection(id).await.map_err(pg_connector_error)? {
+                Some(record) => Ok(connection_from_pg(record)),
+                None => Err(ConnectorError::NotFound(format!(
+                    "connection `{id}` not found"
+                ))),
+            };
+        }
         sqlx::query_as::<_, ConnectionRow>(
             "SELECT id, name, connector_id, connector_version, config_json, credential_env, status,
                     created_at, updated_at
@@ -556,6 +614,22 @@ impl ConnectorRuntime {
         let id = input
             .id
             .unwrap_or_else(|| format!("conn_{}", Uuid::now_v7()));
+        if let Some(store) = self.db.postgres_connector() {
+            return store
+                .upsert_connection(
+                    &id,
+                    &input.name,
+                    &definition.connector_id,
+                    &definition.version,
+                    &serde_json::to_string(&input.config)?,
+                    credential_env.as_deref(),
+                    &now,
+                    &now,
+                )
+                .await
+                .map(connection_from_pg)
+                .map_err(pg_connector_error);
+        }
         let existing: Option<String> =
             sqlx::query_scalar("SELECT id FROM connections WHERE id = ?")
                 .bind(&id)
@@ -597,11 +671,57 @@ impl ConnectorRuntime {
     }
 
     pub async fn delete_connection(&self, id: &str) -> Result<bool, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            return store
+                .delete_connection(id)
+                .await
+                .map_err(pg_connector_error);
+        }
         let result = sqlx::query("DELETE FROM connections WHERE id = ?")
             .bind(id)
             .execute(&self.db.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_plugin_definitions_status(
+        &self,
+        plugin_id: &str,
+        plugin_version: &str,
+        status: &str,
+    ) -> Result<(), ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            store
+                .set_plugin_definitions_status(plugin_id, plugin_version, status)
+                .await
+                .map_err(pg_connector_error)?;
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE connector_definitions SET status = ?
+             WHERE plugin_id = ? AND plugin_version = ?",
+        )
+        .bind(status)
+        .bind(plugin_id)
+        .bind(plugin_version)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_plugin_definitions(&self, plugin_id: &str) -> Result<(), ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            store
+                .delete_plugin_definitions(plugin_id)
+                .await
+                .map_err(pg_connector_error)?;
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM connector_definitions WHERE plugin_id = ?")
+            .bind(plugin_id)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn test_connection(&self, id: &str) -> Result<Value, ConnectorError> {
@@ -738,6 +858,23 @@ impl ConnectorRuntime {
     }
 
     pub async fn list_audit(&self, limit: i64) -> Result<Vec<Value>, ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            let rows = store.list_audit(limit).await.map_err(pg_connector_error)?;
+            return Ok(rows
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "id": row.id,
+                        "at": row.at,
+                        "connectionId": row.connection_id,
+                        "operation": row.operation,
+                        "status": row.status,
+                        "latencyMs": row.latency_ms,
+                        "detail": serde_json::from_str::<Value>(&row.detail_json).unwrap_or(Value::Null),
+                    })
+                })
+                .collect());
+        }
         let rows = sqlx::query_as::<_, ConnectorAuditRow>(
             "SELECT id, at, connection_id, operation, status, latency_ms, detail_json
              FROM connector_audit ORDER BY at DESC LIMIT ?",
@@ -1940,6 +2077,21 @@ impl ConnectorRuntime {
         latency_ms: i64,
         detail: Value,
     ) -> Result<(), ConnectorError> {
+        if let Some(store) = self.db.postgres_connector() {
+            let record = ConnectorAuditRecord {
+                id: format!("connaudit_{}", Uuid::now_v7()),
+                at: now_rfc3339(),
+                connection_id: connection_id.to_string(),
+                operation: operation.to_string(),
+                status: status.to_string(),
+                latency_ms,
+                detail_json: serde_json::to_string(&redact_detail(detail))?,
+            };
+            return store
+                .insert_audit(&record)
+                .await
+                .map_err(pg_connector_error);
+        }
         sqlx::query(
             "INSERT INTO connector_audit
              (id, at, connection_id, operation, status, latency_ms, detail_json)
@@ -1955,6 +2107,44 @@ impl ConnectorRuntime {
         .execute(&self.db.pool)
         .await?;
         Ok(())
+    }
+}
+
+fn definition_from_pg(record: ConnectorDefinitionRecord) -> ConnectorDefinitionRow {
+    ConnectorDefinitionRow {
+        connector_id: record.connector_id,
+        version: record.version,
+        name: record.name,
+        kind: record.kind,
+        manifest_json: record.manifest_json,
+        plugin_id: record.plugin_id,
+        plugin_version: record.plugin_version,
+        status: record.status,
+        created_at: record.created_at,
+    }
+}
+
+fn connection_from_pg(record: ConnectionRecord) -> ConnectionRow {
+    ConnectionRow {
+        id: record.id,
+        name: record.name,
+        connector_id: record.connector_id,
+        connector_version: record.connector_version,
+        config_json: record.config_json,
+        credential_env: record.credential_env,
+        status: record.status,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn pg_connector_error(error: PostgresConnectorError) -> ConnectorError {
+    match error {
+        PostgresConnectorError::Database(error) => ConnectorError::Sqlx(error),
+        PostgresConnectorError::Json(error) => ConnectorError::Json(error),
+        PostgresConnectorError::Frozen(message) => ConnectorError::Invalid(message),
+        PostgresConnectorError::Owned(message) => ConnectorError::Forbidden(message),
+        PostgresConnectorError::Invalid(message) => ConnectorError::Invalid(message),
     }
 }
 

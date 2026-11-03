@@ -22,6 +22,12 @@ use crate::agent;
 use crate::connector::{self, ConnectorManifest, ConnectorRuntime};
 use crate::db::{AgentVersionRow, Db, DbError};
 use crate::skills::{SkillService, SkillServiceError};
+use hpa_local::postgres_mcp_meta::{McpPluginServerInput, PostgresMcpMetaError};
+use hpa_local::postgres_plugin::{
+    MarketplaceListingRecord, MarketplaceReviewRecord, PluginCapabilityRecord, PluginEventRecord,
+    PluginPackageRecord, PluginRecord, PostgresPluginError, PublisherKeyRecord,
+    RemotePackageRecord, SourceKeyRecord, TrustedKeyRecord,
+};
 
 pub const PLUGIN_SCHEMA: &str = "hpa.plugin/v1";
 pub const MANIFEST_FILE: &str = "hpa.plugin.json";
@@ -811,17 +817,24 @@ impl PluginService {
         hasher.update(public_bytes);
         let key_id = format!("ed25519-{}", &format!("{:x}", hasher.finalize())[..16]);
         let now = now_rfc3339();
-        sqlx::query(
-            "INSERT INTO plugin_trusted_keys (key_id, public_key, label, trust, created_at)
-             VALUES (?, ?, 'Local plugin key', 'verified', ?)
-             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key,
-                label = excluded.label, trust = excluded.trust",
-        )
-        .bind(&key_id)
-        .bind(&public_key)
-        .bind(&now)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_trusted_key(&key_id, &public_key, "Local plugin key", "verified", &now)
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugin_trusted_keys (key_id, public_key, label, trust, created_at)
+                 VALUES (?, ?, 'Local plugin key', 'verified', ?)
+                 ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key,
+                    label = excluded.label, trust = excluded.trust",
+            )
+            .bind(&key_id)
+            .bind(&public_key)
+            .bind(&now)
+            .execute(&self.db.pool)
+            .await?;
+        }
         tokio::fs::write(keys_dir.join("plugin-ed25519.pub"), &public_key).await?;
         Ok(LocalKey {
             key_id,
@@ -856,19 +869,26 @@ impl PluginService {
         if key_id.trim().is_empty() {
             return Err(PluginError::Invalid("keyId is required".to_string()));
         }
-        sqlx::query(
-            "INSERT INTO plugin_trusted_keys (key_id, public_key, label, trust, created_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key,
-                label = excluded.label, trust = excluded.trust",
-        )
-        .bind(key_id)
-        .bind(public_key)
-        .bind(label)
-        .bind(trust)
-        .bind(now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_trusted_key(key_id, public_key, label, trust, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugin_trusted_keys (key_id, public_key, label, trust, created_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(key_id) DO UPDATE SET public_key = excluded.public_key,
+                    label = excluded.label, trust = excluded.trust",
+            )
+            .bind(key_id)
+            .bind(public_key)
+            .bind(label)
+            .bind(trust)
+            .bind(now_rfc3339())
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.event(
             None,
             None,
@@ -880,12 +900,22 @@ impl PluginService {
     }
 
     pub async fn trusted_keys(&self) -> Result<Vec<Value>, PluginError> {
-        let rows = sqlx::query_as::<_, TrustedKeyRow>(
-            "SELECT key_id, public_key, label, trust, created_at
-             FROM plugin_trusted_keys ORDER BY created_at ASC",
-        )
-        .fetch_all(&self.db.pool)
-        .await?;
+        let rows = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .list_trusted_keys()
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(trusted_key_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, TrustedKeyRow>(
+                "SELECT key_id, public_key, label, trust, created_at
+                 FROM plugin_trusted_keys ORDER BY created_at ASC",
+            )
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -901,6 +931,35 @@ impl PluginService {
     }
 
     pub async fn marketplace_sources(&self) -> Result<Vec<Value>, PluginError> {
+        if let Some(store) = self.db.postgres_plugin() {
+            let sources = store.list_sources().await.map_err(pg_plugin_error)?;
+            let mut values = Vec::with_capacity(sources.len());
+            for source in sources {
+                let keys = store
+                    .source_keys(&source.id, true)
+                    .await
+                    .map_err(pg_plugin_error)?;
+                let (package_count, approved_count, withdrawn_count) = store
+                    .source_package_counts(&source.id)
+                    .await
+                    .map_err(pg_plugin_error)?;
+                values.push(json!({
+                    "id": source.id,
+                    "label": source.label,
+                    "indexUri": source.index_uri,
+                    "enabled": source.enabled,
+                    "lastSequence": source.last_sequence,
+                    "lastRefreshAt": source.last_refresh_at,
+                    "createdAt": source.created_at,
+                    "updatedAt": source.updated_at,
+                    "keys": keys.iter().map(source_key_value).collect::<Vec<_>>(),
+                    "packageCount": package_count,
+                    "approvedCount": approved_count,
+                    "withdrawnCount": withdrawn_count,
+                }));
+            }
+            return Ok(values);
+        }
         let rows = sqlx::query(
             "SELECT id, label, index_uri, enabled, last_sequence, last_refresh_at,
                     created_at, updated_at
@@ -957,6 +1016,25 @@ impl PluginService {
     }
 
     pub async fn marketplace_publishers(&self) -> Result<Vec<Value>, PluginError> {
+        if let Some(store) = self.db.postgres_plugin() {
+            let publishers = store.list_publishers().await.map_err(pg_plugin_error)?;
+            let mut values = Vec::with_capacity(publishers.len());
+            for publisher in publishers {
+                let keys = store
+                    .publisher_keys(&publisher.id)
+                    .await
+                    .map_err(pg_plugin_error)?;
+                values.push(json!({
+                    "id": publisher.id,
+                    "name": publisher.name,
+                    "status": publisher.status,
+                    "createdAt": publisher.created_at,
+                    "updatedAt": publisher.updated_at,
+                    "keys": keys.iter().map(publisher_key_value).collect::<Vec<_>>(),
+                }));
+            }
+            return Ok(values);
+        }
         let rows = sqlx::query(
             "SELECT id, name, status, created_at, updated_at
              FROM plugin_publishers
@@ -1007,6 +1085,13 @@ impl PluginService {
             ));
         }
         let now = now_rfc3339();
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_publisher(publisher_id, name, &now)
+                .await
+                .map_err(pg_plugin_error)?;
+            return Ok(json!({"publisherId": publisher_id, "name": name, "status": "active"}));
+        }
         sqlx::query(
             "INSERT INTO plugin_publishers (id, name, status, created_at, updated_at)
              VALUES (?, ?, 'active', ?, ?)
@@ -1032,6 +1117,39 @@ impl PluginService {
         valid_until: Option<&str>,
     ) -> Result<Value, PluginError> {
         decode_public_key(public_key)?;
+        let now = now_rfc3339();
+        if let Some(store) = self.db.postgres_plugin() {
+            if !store
+                .publisher_active(publisher_id)
+                .await
+                .map_err(pg_plugin_error)?
+            {
+                return Err(PluginError::NotFound(
+                    "active publisher not found".to_string(),
+                ));
+            }
+            store
+                .upsert_publisher_key(
+                    publisher_id,
+                    key_id,
+                    public_key,
+                    label,
+                    valid_from,
+                    valid_until,
+                    &now,
+                    &format!("{publisher_id}: {label}"),
+                    true,
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+            return Ok(json!({
+                "publisherId": publisher_id,
+                "keyId": key_id,
+                "status": "active",
+                "validFrom": valid_from,
+                "validUntil": valid_until,
+            }));
+        }
         let exists: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM plugin_publishers WHERE id = ? AND status = 'active'",
         )
@@ -1090,17 +1208,24 @@ impl PluginService {
         publisher_id: &str,
         key_id: &str,
     ) -> Result<Value, PluginError> {
-        let revoked = sqlx::query(
-            "UPDATE plugin_publisher_keys SET revoked_at = ?
-             WHERE publisher_id = ? AND key_id = ? AND revoked_at IS NULL",
-        )
-        .bind(now_rfc3339())
-        .bind(publisher_id)
-        .bind(key_id)
-        .execute(&self.db.pool)
-        .await?
-        .rows_affected()
-            == 1;
+        let revoked = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .revoke_publisher_key(publisher_id, key_id, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?
+        } else {
+            sqlx::query(
+                "UPDATE plugin_publisher_keys SET revoked_at = ?
+                 WHERE publisher_id = ? AND key_id = ? AND revoked_at IS NULL",
+            )
+            .bind(now_rfc3339())
+            .bind(publisher_id)
+            .bind(key_id)
+            .execute(&self.db.pool)
+            .await?
+            .rows_affected()
+                == 1
+        };
         if !revoked {
             return Err(PluginError::NotFound(
                 "active publisher key not found".to_string(),
@@ -1122,6 +1247,20 @@ impl PluginService {
         validate_remote_index_uri(index_uri)?;
         decode_public_key(public_key)?;
         let now = now_rfc3339();
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_source_with_key(
+                    source_id, label, index_uri, key_id, public_key, key_label, &now,
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+            return Ok(json!({
+                "sourceId": source_id,
+                "indexUri": index_uri,
+                "keyId": key_id,
+                "status": "active"
+            }));
+        }
         sqlx::query(
             "INSERT INTO marketplace_sources
              (id, label, index_uri, enabled, last_sequence, last_refresh_at, created_at, updated_at)
@@ -1170,6 +1309,13 @@ impl PluginService {
     ) -> Result<Value, PluginError> {
         decode_public_key(public_key)?;
         let now = now_rfc3339();
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .rotate_source_key(source_id, key_id, public_key, label, &now)
+                .await
+                .map_err(pg_plugin_error)?;
+            return Ok(json!({"sourceId": source_id, "keyId": key_id, "rotatedAt": now}));
+        }
         sqlx::query(
             "UPDATE marketplace_source_keys SET revoked_at = ?
              WHERE source_id = ? AND revoked_at IS NULL",
@@ -1195,13 +1341,21 @@ impl PluginService {
     }
 
     pub async fn refresh_marketplace_source(&self, source_id: &str) -> Result<Value, PluginError> {
-        let source: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT index_uri, label, last_sequence FROM marketplace_sources
-             WHERE id = ? AND enabled = 1",
-        )
-        .bind(source_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
+        let source: Option<(String, String, i64)> = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .enabled_source(source_id)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(|source| (source.index_uri, source.label, source.last_sequence))
+        } else {
+            sqlx::query_as(
+                "SELECT index_uri, label, last_sequence FROM marketplace_sources
+                 WHERE id = ? AND enabled = 1",
+            )
+            .bind(source_id)
+            .fetch_optional(&self.db.pool)
+            .await?
+        };
         let Some((index_uri, _, last_sequence)) = source else {
             return Err(PluginError::NotFound(
                 "enabled marketplace source not found".to_string(),
@@ -1278,74 +1432,124 @@ impl PluginService {
             let temporary = cache.with_extension("hplugin.tmp");
             tokio::fs::write(&temporary, &package_bytes).await?;
             tokio::fs::rename(&temporary, &cache).await?;
-            sqlx::query(
-                "INSERT INTO marketplace_remote_packages
-                 (source_id, plugin_id, version, publisher_id, signer_key_id, package_sha256,
-                  package_path, review_status, index_sequence, published_at, withdrawn_at,
-                  revocation_reason, provenance_json, oci_json)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
-                 ON CONFLICT(source_id, plugin_id, version) DO UPDATE SET
-                    publisher_id = excluded.publisher_id,
-                    signer_key_id = excluded.signer_key_id,
-                    package_sha256 = excluded.package_sha256,
-                    package_path = excluded.package_path,
-                    review_status = excluded.review_status,
-                    index_sequence = excluded.index_sequence,
-                    published_at = excluded.published_at,
-                    withdrawn_at = NULL,
-                    revocation_reason = NULL,
-                    provenance_json = excluded.provenance_json,
-                    oci_json = excluded.oci_json",
-            )
-            .bind(source_id)
-            .bind(&package.plugin_id)
-            .bind(&package.version)
-            .bind(&package.publisher_id)
-            .bind(&package.signer_key_id)
-            .bind(&package.sha256)
-            .bind(cache.to_string_lossy().to_string())
-            .bind(&package.review_status)
-            .bind(index.sequence)
-            .bind(&package.published_at)
-            .bind(
-                package
+            if let Some(store) = self.db.postgres_plugin() {
+                let provenance = package
                     .provenance
                     .as_ref()
                     .map(serde_json::to_string)
-                    .transpose()?,
-            )
-            .bind(
-                package
+                    .transpose()?;
+                let oci = package
                     .oci
                     .as_ref()
                     .map(serde_json::to_string)
-                    .transpose()?,
-            )
-            .execute(&self.db.pool)
-            .await?;
+                    .transpose()?;
+                store
+                    .upsert_remote_package(
+                        source_id,
+                        &package.plugin_id,
+                        &package.version,
+                        &package.publisher_id,
+                        &package.signer_key_id,
+                        &package.sha256,
+                        &cache.to_string_lossy(),
+                        &package.review_status,
+                        index.sequence,
+                        package.published_at.as_deref(),
+                        provenance.as_deref(),
+                        oci.as_deref(),
+                    )
+                    .await
+                    .map_err(pg_plugin_error)?;
+            } else {
+                sqlx::query(
+                    "INSERT INTO marketplace_remote_packages
+                     (source_id, plugin_id, version, publisher_id, signer_key_id, package_sha256,
+                      package_path, review_status, index_sequence, published_at, withdrawn_at,
+                      revocation_reason, provenance_json, oci_json)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                     ON CONFLICT(source_id, plugin_id, version) DO UPDATE SET
+                        publisher_id = excluded.publisher_id,
+                        signer_key_id = excluded.signer_key_id,
+                        package_sha256 = excluded.package_sha256,
+                        package_path = excluded.package_path,
+                        review_status = excluded.review_status,
+                        index_sequence = excluded.index_sequence,
+                        published_at = excluded.published_at,
+                        withdrawn_at = NULL,
+                        revocation_reason = NULL,
+                        provenance_json = excluded.provenance_json,
+                        oci_json = excluded.oci_json",
+                )
+                .bind(source_id)
+                .bind(&package.plugin_id)
+                .bind(&package.version)
+                .bind(&package.publisher_id)
+                .bind(&package.signer_key_id)
+                .bind(&package.sha256)
+                .bind(cache.to_string_lossy().to_string())
+                .bind(&package.review_status)
+                .bind(index.sequence)
+                .bind(&package.published_at)
+                .bind(
+                    package
+                        .provenance
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                )
+                .bind(
+                    package
+                        .oci
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
+                )
+                .execute(&self.db.pool)
+                .await?;
+            }
             package_keys.insert((package.plugin_id.clone(), package.version.clone()));
             accepted += 1;
         }
 
         for withdrawal in &index.withdrawals {
-            sqlx::query(
-                "UPDATE marketplace_remote_packages
-                 SET withdrawn_at = ?, revocation_reason = ?
-                 WHERE source_id = ? AND plugin_id = ? AND version = ?",
-            )
-            .bind(&withdrawal.at)
-            .bind(&withdrawal.reason)
-            .bind(source_id)
-            .bind(&withdrawal.plugin_id)
-            .bind(&withdrawal.version)
-            .execute(&self.db.pool)
-            .await?;
-            let installed: Option<String> =
+            if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .withdraw_remote_package(
+                        source_id,
+                        &withdrawal.plugin_id,
+                        &withdrawal.version,
+                        &withdrawal.at,
+                        &withdrawal.reason,
+                    )
+                    .await
+                    .map_err(pg_plugin_error)?;
+            } else {
+                sqlx::query(
+                    "UPDATE marketplace_remote_packages
+                     SET withdrawn_at = ?, revocation_reason = ?
+                     WHERE source_id = ? AND plugin_id = ? AND version = ?",
+                )
+                .bind(&withdrawal.at)
+                .bind(&withdrawal.reason)
+                .bind(source_id)
+                .bind(&withdrawal.plugin_id)
+                .bind(&withdrawal.version)
+                .execute(&self.db.pool)
+                .await?;
+            }
+            let installed: Option<String> = if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .plugin_installed_version(&withdrawal.plugin_id)
+                    .await
+                    .map_err(pg_plugin_error)?
+                    .flatten()
+            } else {
                 sqlx::query_scalar("SELECT installed_version FROM plugins WHERE id = ?")
                     .bind(&withdrawal.plugin_id)
                     .fetch_optional(&self.db.pool)
                     .await?
-                    .flatten();
+                    .flatten()
+            };
             if installed.as_deref() == Some(withdrawal.version.as_str()) {
                 let _ = self.disable(&withdrawal.plugin_id).await;
             }
@@ -1358,39 +1562,66 @@ impl PluginService {
             .await?;
         }
 
-        let existing: Vec<(String, String)> = sqlx::query_as(
-            "SELECT plugin_id, version FROM marketplace_remote_packages
-             WHERE source_id = ? AND withdrawn_at IS NULL",
-        )
-        .bind(source_id)
-        .fetch_all(&self.db.pool)
-        .await?;
+        let existing: Vec<(String, String)> = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .active_remote_packages(source_id)
+                .await
+                .map_err(pg_plugin_error)?
+        } else {
+            sqlx::query_as(
+                "SELECT plugin_id, version FROM marketplace_remote_packages
+                 WHERE source_id = ? AND withdrawn_at IS NULL",
+            )
+            .bind(source_id)
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         for (plugin_id, version) in existing {
             if !package_keys.contains(&(plugin_id.clone(), version.clone())) {
-                sqlx::query(
-                    "UPDATE marketplace_remote_packages
-                     SET withdrawn_at = ?, revocation_reason = 'removed-from-index'
-                     WHERE source_id = ? AND plugin_id = ? AND version = ?",
-                )
-                .bind(now_rfc3339())
-                .bind(source_id)
-                .bind(&plugin_id)
-                .bind(&version)
-                .execute(&self.db.pool)
-                .await?;
+                if let Some(store) = self.db.postgres_plugin() {
+                    store
+                        .withdraw_remote_package(
+                            source_id,
+                            &plugin_id,
+                            &version,
+                            &now_rfc3339(),
+                            "removed-from-index",
+                        )
+                        .await
+                        .map_err(pg_plugin_error)?;
+                } else {
+                    sqlx::query(
+                        "UPDATE marketplace_remote_packages
+                         SET withdrawn_at = ?, revocation_reason = 'removed-from-index'
+                         WHERE source_id = ? AND plugin_id = ? AND version = ?",
+                    )
+                    .bind(now_rfc3339())
+                    .bind(source_id)
+                    .bind(&plugin_id)
+                    .bind(&version)
+                    .execute(&self.db.pool)
+                    .await?;
+                }
             }
         }
-        sqlx::query(
-            "UPDATE marketplace_sources
-             SET last_sequence = ?, last_refresh_at = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(index.sequence)
-        .bind(now_rfc3339())
-        .bind(now_rfc3339())
-        .bind(source_id)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .update_source_sequence(source_id, index.sequence, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE marketplace_sources
+                 SET last_sequence = ?, last_refresh_at = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(index.sequence)
+            .bind(now_rfc3339())
+            .bind(now_rfc3339())
+            .bind(source_id)
+            .execute(&self.db.pool)
+            .await?;
+        }
         Ok(json!({
             "sourceId": source_id,
             "sequence": index.sequence,
@@ -1403,7 +1634,15 @@ impl PluginService {
         &self,
         source_id: Option<&str>,
     ) -> Result<Vec<Value>, PluginError> {
-        let rows = if let Some(source_id) = source_id {
+        let rows = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .remote_packages(source_id)
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(remote_package_row_from_pg)
+                .collect::<Vec<_>>()
+        } else if let Some(source_id) = source_id {
             sqlx::query_as::<_, RemoteMarketplacePackageRow>(
                 "SELECT * FROM marketplace_remote_packages
                  WHERE source_id = ? ORDER BY plugin_id, version DESC",
@@ -1447,15 +1686,23 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<Value, PluginError> {
-        let package = sqlx::query_as::<_, RemoteMarketplacePackageRow>(
-            "SELECT * FROM marketplace_remote_packages
-             WHERE source_id = ? AND plugin_id = ? AND version = ?",
-        )
-        .bind(source_id)
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_optional(&self.db.pool)
-        .await?
+        let package = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .remote_package(source_id, plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(remote_package_row_from_pg)
+        } else {
+            sqlx::query_as::<_, RemoteMarketplacePackageRow>(
+                "SELECT * FROM marketplace_remote_packages
+                 WHERE source_id = ? AND plugin_id = ? AND version = ?",
+            )
+            .bind(source_id)
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_optional(&self.db.pool)
+            .await?
+        }
         .ok_or_else(|| PluginError::NotFound("remote package not found".to_string()))?;
         if package.review_status != "approved" || package.withdrawn_at.is_some() {
             return Err(PluginError::Forbidden(
@@ -1516,14 +1763,23 @@ impl PluginService {
                 "marketplace index must use Ed25519".to_string(),
             ));
         }
-        let registered: Option<RegisteredKeyMaterial> = sqlx::query_as(
-            "SELECT public_key, valid_from, valid_until, revoked_at
-                 FROM marketplace_source_keys WHERE source_id = ? AND key_id = ?",
-        )
-        .bind(source_id)
-        .bind(&index.signature.key_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
+        let registered: Option<RegisteredKeyMaterial> =
+            if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .source_key(source_id, &index.signature.key_id)
+                    .await
+                    .map_err(pg_plugin_error)?
+                    .map(registered_key_tuple)
+            } else {
+                sqlx::query_as(
+                    "SELECT public_key, valid_from, valid_until, revoked_at
+                     FROM marketplace_source_keys WHERE source_id = ? AND key_id = ?",
+                )
+                .bind(source_id)
+                .bind(&index.signature.key_id)
+                .fetch_optional(&self.db.pool)
+                .await?
+            };
         let Some((public_key, valid_from, valid_until, revoked_at)) = registered else {
             return Err(PluginError::Signature(
                 "marketplace index key is not registered for this source".to_string(),
@@ -1569,25 +1825,42 @@ impl PluginService {
             .publisher
             .as_ref()
             .ok_or_else(|| PluginError::Signature("remote package has no publisher".to_string()))?;
-        let publisher_active: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM plugin_publishers WHERE id = ? AND status = 'active'",
-        )
-        .bind(&package.publisher_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        if publisher.id != package.publisher_id || publisher_active.is_none() {
+        let publisher_active = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .publisher_active(&package.publisher_id)
+                .await
+                .map_err(pg_plugin_error)?
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM plugin_publishers WHERE id = ? AND status = 'active'",
+            )
+            .bind(&package.publisher_id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .is_some()
+        };
+        if publisher.id != package.publisher_id || !publisher_active {
             return Err(PluginError::Signature(
                 "remote package publisher is unknown or suspended".to_string(),
             ));
         }
-        let registration: Option<RegisteredKeyMaterial> = sqlx::query_as(
-            "SELECT public_key, valid_from, valid_until, revoked_at
-                 FROM plugin_publisher_keys WHERE publisher_id = ? AND key_id = ?",
-        )
-        .bind(&package.publisher_id)
-        .bind(&package.signer_key_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
+        let registration: Option<RegisteredKeyMaterial> =
+            if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .publisher_key(&package.publisher_id, &package.signer_key_id)
+                    .await
+                    .map_err(pg_plugin_error)?
+                    .map(registered_key_tuple)
+            } else {
+                sqlx::query_as(
+                    "SELECT public_key, valid_from, valid_until, revoked_at
+                     FROM plugin_publisher_keys WHERE publisher_id = ? AND key_id = ?",
+                )
+                .bind(&package.publisher_id)
+                .bind(&package.signer_key_id)
+                .fetch_optional(&self.db.pool)
+                .await?
+            };
         let Some((public_key, valid_from, valid_until, revoked_at)) = registration else {
             return Err(PluginError::Signature(
                 "remote package signer is not registered for the publisher".to_string(),
@@ -1996,13 +2269,20 @@ impl PluginService {
             Some(signature) => {
                 let canonical = canonical_manifest(&manifest)?;
                 let public_key = verify_signature(signature, &manifest, &content_hash, &canonical)?;
-                let trusted: Option<String> = sqlx::query_scalar(
-                    "SELECT trust FROM plugin_trusted_keys WHERE key_id = ? AND public_key = ?",
-                )
-                .bind(&signature.key_id)
-                .bind(&public_key)
-                .fetch_optional(&self.db.pool)
-                .await?;
+                let trusted: Option<String> = if let Some(store) = self.db.postgres_plugin() {
+                    store
+                        .trusted_key_trust(&signature.key_id, &public_key)
+                        .await
+                        .map_err(pg_plugin_error)?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT trust FROM plugin_trusted_keys WHERE key_id = ? AND public_key = ?",
+                    )
+                    .bind(&signature.key_id)
+                    .bind(&public_key)
+                    .fetch_optional(&self.db.pool)
+                    .await?
+                };
                 match trusted.as_deref() {
                     Some("verified") => "verified".to_string(),
                     _ => "community".to_string(),
@@ -2069,11 +2349,18 @@ impl PluginService {
                     dependency.kind
                 )));
             }
-            let row: Option<(String, String)> =
+            let row: Option<(String, String)> = if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .plugin(&dependency.id)
+                    .await
+                    .map_err(pg_plugin_error)?
+                    .map(|plugin| (plugin.installed_version.unwrap_or_default(), plugin.status))
+            } else {
                 sqlx::query_as("SELECT installed_version, status FROM plugins WHERE id = ?")
                     .bind(&dependency.id)
                     .fetch_optional(&self.db.pool)
-                    .await?;
+                    .await?
+            };
             let Some((installed, status)) = row else {
                 return Err(PluginError::Dependency(format!(
                     "plugin dependency `{}` is not installed",
@@ -2185,13 +2472,21 @@ impl PluginService {
         source: &str,
     ) -> Result<PluginPackageRow, PluginError> {
         let manifest = &bundle.manifest;
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT content_hash FROM plugin_packages WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(&manifest.id)
-        .bind(&manifest.version)
-        .fetch_optional(&self.db.pool)
-        .await?;
+        let store = self.db.postgres_plugin();
+        let existing: Option<String> = if let Some(store) = &store {
+            store
+                .package_content_hash(&manifest.id, &manifest.version)
+                .await
+                .map_err(pg_plugin_error)?
+        } else {
+            sqlx::query_scalar(
+                "SELECT content_hash FROM plugin_packages WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(&manifest.id)
+            .bind(&manifest.version)
+            .fetch_optional(&self.db.pool)
+            .await?
+        };
         if let Some(existing) = existing
             && existing != bundle.content_hash
         {
@@ -2224,47 +2519,81 @@ impl PluginService {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        sqlx::query(
-            "INSERT INTO plugin_packages
-             (plugin_id, version, name, description, license, publisher, manifest_json, content_hash,
-              package_path, signature_json, signer_key_id, signer_public_key, trust, source,
-              capabilities_json, sbom_json, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(plugin_id, version) DO UPDATE SET
-                name = excluded.name,
-                description = excluded.description,
-                license = excluded.license,
-                publisher = excluded.publisher,
-                manifest_json = excluded.manifest_json,
-                content_hash = excluded.content_hash,
-                package_path = excluded.package_path,
-                signature_json = excluded.signature_json,
-                signer_key_id = excluded.signer_key_id,
-                signer_public_key = excluded.signer_public_key,
-                trust = excluded.trust,
-                source = excluded.source,
-                capabilities_json = excluded.capabilities_json,
-                sbom_json = excluded.sbom_json",
-        )
-        .bind(&manifest.id)
-        .bind(&manifest.version)
-        .bind(&manifest.name)
-        .bind(&manifest.description)
-        .bind(&manifest.license)
-        .bind(manifest.publisher.as_ref().map(|publisher| publisher.name.clone()))
-        .bind(serde_json::to_string(manifest)?)
-        .bind(&bundle.content_hash)
-        .bind(package_path.to_string_lossy())
-        .bind(&signature_json)
-        .bind(manifest.signature.as_ref().map(|signature| signature.key_id.clone()))
-        .bind(manifest.signature.as_ref().map(|signature| signature.public_key.clone()))
-        .bind(&bundle.trust)
-        .bind(source)
-        .bind(serde_json::to_string(&manifest.capabilities)?)
-        .bind(serde_json::to_string(&sbom)?)
-        .bind(now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = &store {
+            store
+                .upsert_package(
+                    &manifest.id,
+                    &manifest.version,
+                    &manifest.name,
+                    manifest.description.as_deref(),
+                    &manifest.license,
+                    manifest
+                        .publisher
+                        .as_ref()
+                        .map(|publisher| publisher.name.as_str()),
+                    &serde_json::to_string(manifest)?,
+                    &bundle.content_hash,
+                    &package_path.to_string_lossy(),
+                    signature_json.as_deref(),
+                    manifest
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.key_id.as_str()),
+                    manifest
+                        .signature
+                        .as_ref()
+                        .map(|signature| signature.public_key.as_str()),
+                    &bundle.trust,
+                    source,
+                    &serde_json::to_string(&manifest.capabilities)?,
+                    &serde_json::to_string(&sbom)?,
+                    &now_rfc3339(),
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugin_packages
+                 (plugin_id, version, name, description, license, publisher, manifest_json, content_hash,
+                  package_path, signature_json, signer_key_id, signer_public_key, trust, source,
+                  capabilities_json, sbom_json, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(plugin_id, version) DO UPDATE SET
+                    name = excluded.name,
+                    description = excluded.description,
+                    license = excluded.license,
+                    publisher = excluded.publisher,
+                    manifest_json = excluded.manifest_json,
+                    content_hash = excluded.content_hash,
+                    package_path = excluded.package_path,
+                    signature_json = excluded.signature_json,
+                    signer_key_id = excluded.signer_key_id,
+                    signer_public_key = excluded.signer_public_key,
+                    trust = excluded.trust,
+                    source = excluded.source,
+                    capabilities_json = excluded.capabilities_json,
+                    sbom_json = excluded.sbom_json",
+            )
+            .bind(&manifest.id)
+            .bind(&manifest.version)
+            .bind(&manifest.name)
+            .bind(&manifest.description)
+            .bind(&manifest.license)
+            .bind(manifest.publisher.as_ref().map(|publisher| publisher.name.clone()))
+            .bind(serde_json::to_string(manifest)?)
+            .bind(&bundle.content_hash)
+            .bind(package_path.to_string_lossy())
+            .bind(&signature_json)
+            .bind(manifest.signature.as_ref().map(|signature| signature.key_id.clone()))
+            .bind(manifest.signature.as_ref().map(|signature| signature.public_key.clone()))
+            .bind(&bundle.trust)
+            .bind(source)
+            .bind(serde_json::to_string(&manifest.capabilities)?)
+            .bind(serde_json::to_string(&sbom)?)
+            .bind(now_rfc3339())
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.package(&manifest.id, &manifest.version).await
     }
 
@@ -2293,14 +2622,22 @@ impl PluginService {
                 manifest.id, manifest.version
             )));
         }
-        let plugin: Option<PluginRow> = sqlx::query_as(
-            "SELECT id, name, latest_version, status, installed_version, previous_version,
-                    trust, license, created_at, updated_at
-             FROM plugins WHERE id = ?",
-        )
-        .bind(&manifest.id)
-        .fetch_optional(&self.db.pool)
-        .await?;
+        let plugin: Option<PluginRow> = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .plugin(&manifest.id)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(plugin_row_from_pg)
+        } else {
+            sqlx::query_as(
+                "SELECT id, name, latest_version, status, installed_version, previous_version,
+                        trust, license, created_at, updated_at
+                 FROM plugins WHERE id = ?",
+            )
+            .bind(&manifest.id)
+            .fetch_optional(&self.db.pool)
+            .await?
+        };
         if let Some(plugin) = &plugin
             && let Some(installed) = &plugin.installed_version
         {
@@ -2327,39 +2664,68 @@ impl PluginService {
         }
         let now = now_rfc3339();
         let previous = plugin.and_then(|plugin| plugin.installed_version);
-        sqlx::query(
-            "INSERT INTO plugins
-             (id, name, latest_version, status, installed_version, previous_version, trust, license, created_at, updated_at)
-             VALUES (?, ?, ?, 'installed', NULL, NULL, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                latest_version = excluded.latest_version,
-                trust = excluded.trust,
-                license = excluded.license,
-                updated_at = excluded.updated_at",
-        )
-        .bind(&manifest.id)
-        .bind(&manifest.name)
-        .bind(&manifest.version)
-        .bind(&bundle.trust)
-        .bind(&manifest.license)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_plugin_summary(
+                    &manifest.id,
+                    &manifest.name,
+                    &manifest.version,
+                    "installed",
+                    &bundle.trust,
+                    &manifest.license,
+                    &now,
+                    &now,
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugins
+                 (id, name, latest_version, status, installed_version, previous_version, trust, license, created_at, updated_at)
+                 VALUES (?, ?, ?, 'installed', NULL, NULL, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    latest_version = excluded.latest_version,
+                    trust = excluded.trust,
+                    license = excluded.license,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(&manifest.id)
+            .bind(&manifest.name)
+            .bind(&manifest.version)
+            .bind(&bundle.trust)
+            .bind(&manifest.license)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.activate_version(&manifest.id, &manifest.version, previous.as_deref())
             .await?;
-        sqlx::query(
-            "UPDATE plugins SET installed_version = ?, previous_version = ?, status = 'enabled',
-                    latest_version = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(&manifest.version)
-        .bind(&previous)
-        .bind(&manifest.version)
-        .bind(&now)
-        .bind(&manifest.id)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_plugin_installed(
+                    &manifest.id,
+                    &manifest.version,
+                    previous.as_deref(),
+                    &manifest.version,
+                    &now,
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugins SET installed_version = ?, previous_version = ?, status = 'enabled',
+                        latest_version = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(&manifest.version)
+            .bind(&previous)
+            .bind(&manifest.version)
+            .bind(&now)
+            .bind(&manifest.id)
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.event(
             Some(&manifest.id),
             Some(&manifest.version),
@@ -2504,49 +2870,72 @@ impl PluginService {
     }
 
     async fn deactivate_version(&self, plugin_id: &str, version: &str) -> Result<(), PluginError> {
-        sqlx::query(
-            "UPDATE connector_definitions SET status = 'disabled'
-             WHERE plugin_id = ? AND plugin_version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
-        sqlx::query(
-            "UPDATE mcp_servers SET enabled = 0 WHERE plugin_id = ? AND plugin_version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
-        sqlx::query(
-            "UPDATE plugin_capabilities SET status = 'disabled'
-             WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
+        self.connectors
+            .set_plugin_definitions_status(plugin_id, version, "disabled")
+            .await?;
+        if let Some(store) = self.db.postgres_mcp_meta() {
+            store
+                .set_plugin_servers_enabled(plugin_id, version, false)
+                .await
+                .map_err(pg_mcp_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE mcp_servers SET enabled = 0 WHERE plugin_id = ? AND plugin_version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?;
+        }
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_capabilities_status(plugin_id, version, "disabled")
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugin_capabilities SET status = 'disabled'
+                 WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?;
+        }
         Ok(())
     }
 
     async fn activate_existing(&self, plugin_id: &str, version: &str) -> Result<(), PluginError> {
         self.activate_version(plugin_id, version, None).await?;
-        sqlx::query(
-            "UPDATE mcp_servers SET enabled = 1 WHERE plugin_id = ? AND plugin_version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
-        sqlx::query(
-            "UPDATE plugin_capabilities SET status = 'enabled'
-             WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_mcp_meta() {
+            store
+                .set_plugin_servers_enabled(plugin_id, version, true)
+                .await
+                .map_err(pg_mcp_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE mcp_servers SET enabled = 1 WHERE plugin_id = ? AND plugin_version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?;
+        }
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_capabilities_status(plugin_id, version, "enabled")
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugin_capabilities SET status = 'enabled'
+                 WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -2559,6 +2948,22 @@ impl PluginService {
         config_json: &str,
         permissions_json: &str,
     ) -> Result<(), PluginError> {
+        if let Some(store) = self.db.postgres_plugin() {
+            return store
+                .upsert_capability(
+                    plugin_id,
+                    version,
+                    capability.kind.as_str(),
+                    &capability.id,
+                    &capability.version,
+                    &capability.path,
+                    status,
+                    config_json,
+                    permissions_json,
+                )
+                .await
+                .map_err(pg_plugin_error);
+        }
         sqlx::query(
             "INSERT INTO plugin_capabilities
              (plugin_id, version, kind, capability_id, capability_version, path, status, config_json, permissions_json)
@@ -2592,6 +2997,33 @@ impl PluginService {
         mcp: &McpContribution,
     ) -> Result<(), PluginError> {
         let id = plugin_server_id(plugin_id, &capability.id);
+        if let Some(store) = self.db.postgres_mcp_meta() {
+            if let Some((owner, _)) = store.plugin_server_owner(&id).await.map_err(pg_mcp_error)?
+                && owner.as_deref() != Some(plugin_id)
+            {
+                return Err(PluginError::Conflict(format!(
+                    "MCP server id `{id}` already exists or belongs to another plugin"
+                )));
+            }
+            let now = now_rfc3339();
+            return store
+                .upsert_plugin_server(&McpPluginServerInput {
+                    id,
+                    name: mcp.name.clone(),
+                    transport: mcp.transport.clone(),
+                    command_json: serde_json::to_string(&mcp.command)?,
+                    url: mcp.url.clone(),
+                    allowed_tools_json: serde_json::to_string(&mcp.allowed_tools)?,
+                    network_json: serde_json::to_string(&mcp.network)?,
+                    credential_env: mcp.credential_env.clone(),
+                    plugin_id: plugin_id.to_string(),
+                    plugin_version: version.to_string(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                })
+                .await
+                .map_err(pg_mcp_error);
+        }
         let existing: Option<(Option<String>, Option<String>)> =
             sqlx::query_as("SELECT plugin_id, plugin_version FROM mcp_servers WHERE id = ?")
                 .bind(&id)
@@ -2640,35 +3072,63 @@ impl PluginService {
     }
 
     pub async fn list(&self) -> Result<Vec<Value>, PluginError> {
-        let rows = sqlx::query_as::<_, PluginRow>(
-            "SELECT id, name, latest_version, status, installed_version, previous_version,
-                    trust, license, created_at, updated_at
-             FROM plugins ORDER BY updated_at DESC",
-        )
-        .fetch_all(&self.db.pool)
-        .await?;
+        let rows = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .list_plugins()
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(plugin_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, PluginRow>(
+                "SELECT id, name, latest_version, status, installed_version, previous_version,
+                        trust, license, created_at, updated_at
+                 FROM plugins ORDER BY updated_at DESC",
+            )
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         Ok(rows.iter().map(plugin_row_value).collect())
     }
 
     pub async fn detail(&self, id: &str) -> Result<Value, PluginError> {
-        let plugin = sqlx::query_as::<_, PluginRow>(
-            "SELECT id, name, latest_version, status, installed_version, previous_version,
-                    trust, license, created_at, updated_at
-             FROM plugins WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.db.pool)
-        .await?
+        let plugin = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .plugin(id)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(plugin_row_from_pg)
+        } else {
+            sqlx::query_as::<_, PluginRow>(
+                "SELECT id, name, latest_version, status, installed_version, previous_version,
+                        trust, license, created_at, updated_at
+                 FROM plugins WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.db.pool)
+            .await?
+        }
         .ok_or_else(|| PluginError::NotFound(format!("plugin `{id}` not found")))?;
-        let packages = sqlx::query_as::<_, PluginPackageRow>(
-            "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
-                    content_hash, package_path, signature_json, signer_key_id, signer_public_key,
-                    trust, source, capabilities_json, sbom_json, created_at
-             FROM plugin_packages WHERE plugin_id = ? ORDER BY created_at DESC",
-        )
-        .bind(id)
-        .fetch_all(&self.db.pool)
-        .await?;
+        let packages = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .list_packages(id)
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(package_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, PluginPackageRow>(
+                "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
+                        content_hash, package_path, signature_json, signer_key_id, signer_public_key,
+                        trust, source, capabilities_json, sbom_json, created_at
+                 FROM plugin_packages WHERE plugin_id = ? ORDER BY created_at DESC",
+            )
+            .bind(id)
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         let installed_version = plugin.installed_version.as_deref();
         let capabilities = if let Some(version) = installed_version {
             self.capabilities(id, version).await?
@@ -2701,16 +3161,26 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<Vec<Value>, PluginError> {
-        let rows = sqlx::query_as::<_, PluginCapabilityRow>(
-            "SELECT plugin_id, version, kind, capability_id, capability_version, path, status,
-                    config_json, permissions_json
-             FROM plugin_capabilities WHERE plugin_id = ? AND version = ?
-             ORDER BY kind ASC, capability_id ASC",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_all(&self.db.pool)
-        .await?;
+        let rows = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .capabilities(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(capability_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, PluginCapabilityRow>(
+                "SELECT plugin_id, version, kind, capability_id, capability_version, path, status,
+                        config_json, permissions_json
+                 FROM plugin_capabilities WHERE plugin_id = ? AND version = ?
+                 ORDER BY kind ASC, capability_id ASC",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         Ok(rows.iter().map(capability_row_value).collect())
     }
 
@@ -2720,11 +3190,18 @@ impl PluginService {
             .installed_version
             .ok_or_else(|| PluginError::Conflict("plugin has no installed version".to_string()))?;
         self.activate_existing(id, &version).await?;
-        sqlx::query("UPDATE plugins SET status = 'enabled', updated_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(id)
-            .execute(&self.db.pool)
-            .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_plugin_status(id, "enabled", &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query("UPDATE plugins SET status = 'enabled', updated_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(id)
+                .execute(&self.db.pool)
+                .await?;
+        }
         self.event(Some(id), Some(&version), "plugin.enabled", json!({}))
             .await?;
         self.detail(id).await
@@ -2735,11 +3212,18 @@ impl PluginService {
         if let Some(version) = &plugin.installed_version {
             self.deactivate_version(id, version).await?;
         }
-        sqlx::query("UPDATE plugins SET status = 'disabled', updated_at = ? WHERE id = ?")
-            .bind(now_rfc3339())
-            .bind(id)
-            .execute(&self.db.pool)
-            .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_plugin_status(id, "disabled", &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query("UPDATE plugins SET status = 'disabled', updated_at = ? WHERE id = ?")
+                .bind(now_rfc3339())
+                .bind(id)
+                .execute(&self.db.pool)
+                .await?;
+        }
         self.event(
             Some(id),
             plugin.installed_version.as_deref(),
@@ -2762,16 +3246,23 @@ impl PluginService {
             .ok_or_else(|| PluginError::Conflict("plugin has no installed version".to_string()))?;
         self.deactivate_version(id, &current).await?;
         self.activate_version(id, &previous, None).await?;
-        sqlx::query(
-            "UPDATE plugins SET status = 'enabled', installed_version = ?, previous_version = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(&previous)
-        .bind(&current)
-        .bind(now_rfc3339())
-        .bind(id)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_plugin_rollback(id, &previous, &current, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugins SET status = 'enabled', installed_version = ?, previous_version = ?, updated_at = ?
+                 WHERE id = ?",
+            )
+            .bind(&previous)
+            .bind(&current)
+            .bind(now_rfc3339())
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.event(
             Some(id),
             Some(&previous),
@@ -2796,26 +3287,43 @@ impl PluginService {
         if let Some(version) = &plugin.installed_version {
             self.deactivate_version(id, version).await?;
         }
-        sqlx::query("DELETE FROM connector_definitions WHERE plugin_id = ?")
+        self.connectors.delete_plugin_definitions(id).await?;
+        if let Some(store) = self.db.postgres_mcp_meta() {
+            store
+                .delete_plugin_servers(id)
+                .await
+                .map_err(pg_mcp_error)?;
+        } else {
+            sqlx::query("DELETE FROM mcp_servers WHERE plugin_id = ?")
+                .bind(id)
+                .execute(&self.db.pool)
+                .await?;
+        }
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .set_capabilities_uninstalled(id)
+                .await
+                .map_err(pg_plugin_error)?;
+            store
+                .set_plugin_uninstalled(id, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugin_capabilities SET status = 'uninstalled' WHERE plugin_id = ?",
+            )
             .bind(id)
             .execute(&self.db.pool)
             .await?;
-        sqlx::query("DELETE FROM mcp_servers WHERE plugin_id = ?")
+            sqlx::query(
+                "UPDATE plugins SET status = 'uninstalled', installed_version = NULL,
+                        previous_version = NULL, updated_at = ? WHERE id = ?",
+            )
+            .bind(now_rfc3339())
             .bind(id)
             .execute(&self.db.pool)
             .await?;
-        sqlx::query("UPDATE plugin_capabilities SET status = 'uninstalled' WHERE plugin_id = ?")
-            .bind(id)
-            .execute(&self.db.pool)
-            .await?;
-        sqlx::query(
-            "UPDATE plugins SET status = 'uninstalled', installed_version = NULL,
-                    previous_version = NULL, updated_at = ? WHERE id = ?",
-        )
-        .bind(now_rfc3339())
-        .bind(id)
-        .execute(&self.db.pool)
-        .await?;
+        }
         let installed = self.data_dir.join("plugins").join("installed").join(id);
         if installed.exists() {
             let _ = std::fs::remove_dir_all(&installed);
@@ -2831,16 +3339,26 @@ impl PluginService {
     }
 
     async fn dependents(&self, id: &str) -> Result<Vec<String>, PluginError> {
-        let packages = sqlx::query_as::<_, PluginPackageRow>(
-            "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
-                    content_hash, package_path, signature_json, signer_key_id, signer_public_key,
-                    trust, source, capabilities_json, sbom_json, created_at
-             FROM plugin_packages p WHERE p.version = (
-                SELECT installed_version FROM plugins WHERE id = p.plugin_id AND status != 'uninstalled'
-             )",
-        )
-        .fetch_all(&self.db.pool)
-        .await?;
+        let packages = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .installed_packages()
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(package_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, PluginPackageRow>(
+                "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
+                        content_hash, package_path, signature_json, signer_key_id, signer_public_key,
+                        trust, source, capabilities_json, sbom_json, created_at
+                 FROM plugin_packages p WHERE p.version = (
+                    SELECT installed_version FROM plugins WHERE id = p.plugin_id AND status != 'uninstalled'
+                 )",
+            )
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         let mut dependents = Vec::new();
         for package in packages {
             if package.plugin_id == id {
@@ -2874,18 +3392,26 @@ impl PluginService {
                 "review status must be approved or rejected".to_string(),
             ));
         }
-        let updated = sqlx::query(
-            "UPDATE plugin_market_listings SET review_status = ?, review_note = ?, reviewed_at = ?
-             WHERE plugin_id = ? AND version = ? AND review_status = 'pending'",
-        )
-        .bind(status)
-        .bind(note)
-        .bind(now_rfc3339())
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
+        let updated = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .review_listing(plugin_id, version, status, note, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)? as usize
+        } else {
+            sqlx::query(
+                "UPDATE plugin_market_listings SET review_status = ?, review_note = ?, reviewed_at = ?
+                 WHERE plugin_id = ? AND version = ? AND review_status = 'pending'",
+            )
+            .bind(status)
+            .bind(note)
+            .bind(now_rfc3339())
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?
+            .rows_affected() as usize
+        };
+        if updated == 0 {
             return Err(PluginError::Conflict(
                 "listing is not pending review".to_string(),
             ));
@@ -2905,16 +3431,24 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<Value, PluginError> {
-        let updated = sqlx::query(
-            "UPDATE plugin_market_listings SET review_status = 'withdrawn', withdrawn_at = ?
-             WHERE plugin_id = ? AND version = ? AND review_status != 'withdrawn'",
-        )
-        .bind(now_rfc3339())
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
-        if updated.rows_affected() == 0 {
+        let updated = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .withdraw_listing(plugin_id, version, &now_rfc3339())
+                .await
+                .map_err(pg_plugin_error)? as usize
+        } else {
+            sqlx::query(
+                "UPDATE plugin_market_listings SET review_status = 'withdrawn', withdrawn_at = ?
+                 WHERE plugin_id = ? AND version = ? AND review_status != 'withdrawn'",
+            )
+            .bind(now_rfc3339())
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?
+            .rows_affected() as usize
+        };
+        if updated == 0 {
             return Err(PluginError::NotFound(
                 "active listing not found".to_string(),
             ));
@@ -2953,41 +3487,61 @@ impl PluginService {
         let plugin_id = &bundle.manifest.id;
         let version = &bundle.manifest.version;
         let now = now_rfc3339();
-        sqlx::query(
-            "INSERT INTO plugin_market_listings
-             (plugin_id, version, review_status, review_note, submitted_at, reviewed_at, withdrawn_at, downloads)
-             VALUES (?, ?, 'pending', NULL, ?, NULL, NULL, 0)
-             ON CONFLICT(plugin_id, version) DO UPDATE SET
-                review_status = 'pending',
-                review_note = NULL,
-                submitted_at = excluded.submitted_at,
-                reviewed_at = NULL,
-                withdrawn_at = NULL",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .bind(&now)
-        .execute(&self.db.pool)
-        .await?;
-        sqlx::query(
-            "INSERT INTO plugins
-             (id, name, latest_version, status, installed_version, previous_version, trust, license, created_at, updated_at)
-             VALUES (?, ?, ?, 'available', NULL, NULL, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
-                latest_version = excluded.latest_version,
-                trust = excluded.trust,
-                license = excluded.license,
-                updated_at = excluded.updated_at",
-        )
-        .bind(plugin_id)
-        .bind(&bundle.manifest.name)
-        .bind(version)
-        .bind(&bundle.trust)
-        .bind(&bundle.manifest.license)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .upsert_listing_pending(plugin_id, version, &now)
+                .await
+                .map_err(pg_plugin_error)?;
+            store
+                .upsert_plugin_summary(
+                    plugin_id,
+                    &bundle.manifest.name,
+                    version,
+                    "available",
+                    &bundle.trust,
+                    &bundle.manifest.license,
+                    &now,
+                    &now,
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugin_market_listings
+                 (plugin_id, version, review_status, review_note, submitted_at, reviewed_at, withdrawn_at, downloads)
+                 VALUES (?, ?, 'pending', NULL, ?, NULL, NULL, 0)
+                 ON CONFLICT(plugin_id, version) DO UPDATE SET
+                    review_status = 'pending',
+                    review_note = NULL,
+                    submitted_at = excluded.submitted_at,
+                    reviewed_at = NULL,
+                    withdrawn_at = NULL",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .bind(&now)
+            .execute(&self.db.pool)
+            .await?;
+            sqlx::query(
+                "INSERT INTO plugins
+                 (id, name, latest_version, status, installed_version, previous_version, trust, license, created_at, updated_at)
+                 VALUES (?, ?, ?, 'available', NULL, NULL, ?, ?, ?, ?)
+                 ON CONFLICT(id) DO UPDATE SET
+                    latest_version = excluded.latest_version,
+                    trust = excluded.trust,
+                    license = excluded.license,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(plugin_id)
+            .bind(&bundle.manifest.name)
+            .bind(version)
+            .bind(&bundle.trust)
+            .bind(&bundle.manifest.license)
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.event(
             Some(plugin_id),
             Some(version),
@@ -2999,25 +3553,43 @@ impl PluginService {
     }
 
     pub async fn marketplace_list(&self) -> Result<Vec<Value>, PluginError> {
-        let listings = sqlx::query_as::<_, MarketplaceListingRow>(
-            "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
-                    withdrawn_at, downloads
-             FROM plugin_market_listings ORDER BY submitted_at DESC",
-        )
-        .fetch_all(&self.db.pool)
-        .await?;
+        let listings = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .list_listings()
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(listing_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, MarketplaceListingRow>(
+                "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
+                        withdrawn_at, downloads
+                 FROM plugin_market_listings ORDER BY submitted_at DESC",
+            )
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         let mut values = Vec::new();
         for listing in listings {
-            let package = sqlx::query_as::<_, PluginPackageRow>(
-                "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
-                        content_hash, package_path, signature_json, signer_key_id, signer_public_key,
-                        trust, source, capabilities_json, sbom_json, created_at
-                 FROM plugin_packages WHERE plugin_id = ? AND version = ?",
-            )
-            .bind(&listing.plugin_id)
-            .bind(&listing.version)
-            .fetch_optional(&self.db.pool)
-            .await?;
+            let package = if let Some(store) = self.db.postgres_plugin() {
+                store
+                    .package(&listing.plugin_id, &listing.version)
+                    .await
+                    .map_err(pg_plugin_error)?
+                    .map(package_row_from_pg)
+            } else {
+                sqlx::query_as::<_, PluginPackageRow>(
+                    "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
+                            content_hash, package_path, signature_json, signer_key_id, signer_public_key,
+                            trust, source, capabilities_json, sbom_json, created_at
+                     FROM plugin_packages WHERE plugin_id = ? AND version = ?",
+                )
+                .bind(&listing.plugin_id)
+                .bind(&listing.version)
+                .fetch_optional(&self.db.pool)
+                .await?
+            };
             let Some(package) = package else {
                 continue;
             };
@@ -3048,26 +3620,44 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<Value, PluginError> {
-        let listing = sqlx::query_as::<_, MarketplaceListingRow>(
-            "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
-                    withdrawn_at, downloads
-             FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_optional(&self.db.pool)
-        .await?
+        let listing = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .listing(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(listing_row_from_pg)
+        } else {
+            sqlx::query_as::<_, MarketplaceListingRow>(
+                "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
+                        withdrawn_at, downloads
+                 FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_optional(&self.db.pool)
+            .await?
+        }
         .ok_or_else(|| PluginError::NotFound("marketplace listing not found".to_string()))?;
         let package = self.package(plugin_id, version).await?;
         let manifest: Value = serde_json::from_str(&package.manifest_json)?;
-        let reviews = sqlx::query_as::<_, MarketplaceReviewRow>(
-            "SELECT id, plugin_id, version, rating, comment, created_at
-             FROM plugin_reviews WHERE plugin_id = ? AND version = ? ORDER BY created_at DESC",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_all(&self.db.pool)
-        .await?;
+        let reviews = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .reviews(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(review_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, MarketplaceReviewRow>(
+                "SELECT id, plugin_id, version, rating, comment, created_at
+                 FROM plugin_reviews WHERE plugin_id = ? AND version = ? ORDER BY created_at DESC",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         Ok(json!({
             "pluginId": plugin_id,
             "version": version,
@@ -3095,30 +3685,52 @@ impl PluginService {
         if !(1..=5).contains(&rating) {
             return Err(PluginError::Invalid("rating must be 1..5".to_string()));
         }
-        let exists: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        if exists.is_none() {
+        let exists = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .listing_exists(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT 1 FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .is_some()
+        };
+        if !exists {
             return Err(PluginError::NotFound(
                 "marketplace listing not found".to_string(),
             ));
         }
-        sqlx::query(
-            "INSERT INTO plugin_reviews (id, plugin_id, version, rating, comment, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(format!("plreview_{}", Uuid::now_v7()))
-        .bind(plugin_id)
-        .bind(version)
-        .bind(rating)
-        .bind(comment)
-        .bind(now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .insert_review(
+                    &format!("plreview_{}", Uuid::now_v7()),
+                    plugin_id,
+                    version,
+                    rating,
+                    comment,
+                    &now_rfc3339(),
+                )
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "INSERT INTO plugin_reviews (id, plugin_id, version, rating, comment, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(format!("plreview_{}", Uuid::now_v7()))
+            .bind(plugin_id)
+            .bind(version)
+            .bind(rating)
+            .bind(comment)
+            .bind(now_rfc3339())
+            .execute(&self.db.pool)
+            .await?;
+        }
         self.event(
             Some(plugin_id),
             Some(version),
@@ -3130,13 +3742,21 @@ impl PluginService {
     }
 
     async fn rating(&self, plugin_id: &str, version: &str) -> Result<Value, PluginError> {
-        let row: (Option<f64>, i64) = sqlx::query_as(
-            "SELECT AVG(rating), COUNT(*) FROM plugin_reviews WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_one(&self.db.pool)
-        .await?;
+        let row: (Option<f64>, i64) = if let Some(store) = self.db.postgres_plugin() {
+            let (average, count) = store
+                .rating(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?;
+            (Some(average), count)
+        } else {
+            sqlx::query_as(
+                "SELECT AVG(rating), COUNT(*) FROM plugin_reviews WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_one(&self.db.pool)
+            .await?
+        };
         Ok(json!({"average": row.0, "count": row.1}))
     }
 
@@ -3145,15 +3765,23 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<Value, PluginError> {
-        let listing = sqlx::query_as::<_, MarketplaceListingRow>(
-            "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
-                    withdrawn_at, downloads
-             FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .fetch_optional(&self.db.pool)
-        .await?
+        let listing = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .listing(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(listing_row_from_pg)
+        } else {
+            sqlx::query_as::<_, MarketplaceListingRow>(
+                "SELECT plugin_id, version, review_status, review_note, submitted_at, reviewed_at,
+                        withdrawn_at, downloads
+                 FROM plugin_market_listings WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .fetch_optional(&self.db.pool)
+            .await?
+        }
         .ok_or_else(|| PluginError::NotFound("marketplace listing not found".to_string()))?;
         if listing.review_status != "approved" || listing.withdrawn_at.is_some() {
             return Err(PluginError::Forbidden(
@@ -3172,26 +3800,43 @@ impl PluginService {
             )
             .await?;
         let detail = self.install_bundle(bundle, "marketplace").await?;
-        sqlx::query(
-            "UPDATE plugin_market_listings SET downloads = downloads + 1
-             WHERE plugin_id = ? AND version = ?",
-        )
-        .bind(plugin_id)
-        .bind(version)
-        .execute(&self.db.pool)
-        .await?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .increment_downloads(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?;
+        } else {
+            sqlx::query(
+                "UPDATE plugin_market_listings SET downloads = downloads + 1
+                 WHERE plugin_id = ? AND version = ?",
+            )
+            .bind(plugin_id)
+            .bind(version)
+            .execute(&self.db.pool)
+            .await?;
+        }
         Ok(detail)
     }
 
     pub async fn events(&self, plugin_id: &str, limit: i64) -> Result<Vec<Value>, PluginError> {
-        let rows = sqlx::query_as::<_, PluginEventRow>(
-            "SELECT id, at, plugin_id, version, kind, detail_json FROM plugin_events
-             WHERE plugin_id = ? ORDER BY at DESC LIMIT ?",
-        )
-        .bind(plugin_id)
-        .bind(limit.clamp(1, 200))
-        .fetch_all(&self.db.pool)
-        .await?;
+        let rows = if let Some(store) = self.db.postgres_plugin() {
+            store
+                .events(plugin_id, limit)
+                .await
+                .map_err(pg_plugin_error)?
+                .into_iter()
+                .map(event_row_from_pg)
+                .collect::<Vec<_>>()
+        } else {
+            sqlx::query_as::<_, PluginEventRow>(
+                "SELECT id, at, plugin_id, version, kind, detail_json FROM plugin_events
+                 WHERE plugin_id = ? ORDER BY at DESC LIMIT ?",
+            )
+            .bind(plugin_id)
+            .bind(limit.clamp(1, 200))
+            .fetch_all(&self.db.pool)
+            .await?
+        };
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -3217,6 +3862,13 @@ impl PluginService {
         let id = format!("plevent_{}", Uuid::now_v7());
         let at = now_rfc3339();
         let detail_json = serde_json::to_string(&detail)?;
+        if let Some(store) = self.db.postgres_plugin() {
+            store
+                .insert_event(&id, &at, plugin_id, version, kind, &detail_json)
+                .await
+                .map_err(pg_plugin_error)?;
+            return Ok(());
+        }
         let mut transaction = self.db.pool.begin().await?;
         sqlx::query(
             "INSERT INTO plugin_events (id, at, plugin_id, version, kind, detail_json)
@@ -3248,6 +3900,14 @@ impl PluginService {
     }
 
     async fn plugin_row(&self, id: &str) -> Result<PluginRow, PluginError> {
+        if let Some(store) = self.db.postgres_plugin() {
+            return store
+                .plugin(id)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(plugin_row_from_pg)
+                .ok_or_else(|| PluginError::NotFound(format!("plugin `{id}` not found")));
+        }
         sqlx::query_as::<_, PluginRow>(
             "SELECT id, name, latest_version, status, installed_version, previous_version,
                     trust, license, created_at, updated_at
@@ -3264,6 +3924,18 @@ impl PluginService {
         plugin_id: &str,
         version: &str,
     ) -> Result<PluginPackageRow, PluginError> {
+        if let Some(store) = self.db.postgres_plugin() {
+            return store
+                .package(plugin_id, version)
+                .await
+                .map_err(pg_plugin_error)?
+                .map(package_row_from_pg)
+                .ok_or_else(|| {
+                    PluginError::NotFound(format!(
+                        "plugin package `{plugin_id}@{version}` not found"
+                    ))
+                });
+        }
         sqlx::query_as::<_, PluginPackageRow>(
             "SELECT plugin_id, version, name, description, license, publisher, manifest_json,
                     content_hash, package_path, signature_json, signer_key_id, signer_public_key,
@@ -4427,6 +5099,166 @@ fn review_value(row: &MarketplaceReviewRow) -> Value {
         "comment": row.comment,
         "createdAt": row.created_at,
     })
+}
+
+fn pg_plugin_error(error: PostgresPluginError) -> PluginError {
+    match error {
+        PostgresPluginError::Database(error) => PluginError::Sqlx(error),
+        PostgresPluginError::Json(error) => PluginError::Json(error),
+        PostgresPluginError::Invalid(message) => PluginError::Invalid(message),
+    }
+}
+
+fn pg_mcp_error(error: PostgresMcpMetaError) -> PluginError {
+    match error {
+        PostgresMcpMetaError::Database(error) => PluginError::Sqlx(error),
+        PostgresMcpMetaError::Json(error) => PluginError::Json(error),
+        PostgresMcpMetaError::Invalid(message) => PluginError::Invalid(message),
+    }
+}
+
+fn plugin_row_from_pg(record: PluginRecord) -> PluginRow {
+    PluginRow {
+        id: record.id,
+        name: record.name,
+        latest_version: record.latest_version,
+        status: record.status,
+        installed_version: record.installed_version,
+        previous_version: record.previous_version,
+        trust: record.trust,
+        license: record.license,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+    }
+}
+
+fn package_row_from_pg(record: PluginPackageRecord) -> PluginPackageRow {
+    PluginPackageRow {
+        plugin_id: record.plugin_id,
+        version: record.version,
+        name: record.name,
+        description: record.description,
+        license: record.license,
+        publisher: record.publisher,
+        manifest_json: record.manifest_json,
+        content_hash: record.content_hash,
+        package_path: record.package_path,
+        signature_json: record.signature_json,
+        signer_key_id: record.signer_key_id,
+        signer_public_key: record.signer_public_key,
+        trust: record.trust,
+        source: record.source,
+        capabilities_json: record.capabilities_json,
+        sbom_json: record.sbom_json,
+        created_at: record.created_at,
+    }
+}
+
+fn capability_row_from_pg(record: PluginCapabilityRecord) -> PluginCapabilityRow {
+    PluginCapabilityRow {
+        plugin_id: record.plugin_id,
+        version: record.version,
+        kind: record.kind,
+        capability_id: record.capability_id,
+        capability_version: record.capability_version,
+        path: record.path,
+        status: record.status,
+        config_json: record.config_json,
+        permissions_json: record.permissions_json,
+    }
+}
+
+fn listing_row_from_pg(record: MarketplaceListingRecord) -> MarketplaceListingRow {
+    MarketplaceListingRow {
+        plugin_id: record.plugin_id,
+        version: record.version,
+        review_status: record.review_status,
+        review_note: record.review_note,
+        submitted_at: record.submitted_at,
+        reviewed_at: record.reviewed_at,
+        withdrawn_at: record.withdrawn_at,
+        downloads: record.downloads,
+    }
+}
+
+fn review_row_from_pg(record: MarketplaceReviewRecord) -> MarketplaceReviewRow {
+    MarketplaceReviewRow {
+        id: record.id,
+        plugin_id: record.plugin_id,
+        version: record.version,
+        rating: record.rating,
+        comment: record.comment,
+        created_at: record.created_at,
+    }
+}
+
+fn trusted_key_row_from_pg(record: TrustedKeyRecord) -> TrustedKeyRow {
+    TrustedKeyRow {
+        key_id: record.key_id,
+        public_key: record.public_key,
+        label: record.label,
+        trust: record.trust,
+        created_at: record.created_at,
+    }
+}
+
+fn event_row_from_pg(record: PluginEventRecord) -> PluginEventRow {
+    PluginEventRow {
+        id: record.id,
+        at: record.at,
+        plugin_id: record.plugin_id,
+        version: record.version,
+        kind: record.kind,
+        detail_json: record.detail_json,
+    }
+}
+
+fn remote_package_row_from_pg(record: RemotePackageRecord) -> RemoteMarketplacePackageRow {
+    RemoteMarketplacePackageRow {
+        source_id: record.source_id,
+        plugin_id: record.plugin_id,
+        version: record.version,
+        publisher_id: record.publisher_id,
+        signer_key_id: record.signer_key_id,
+        package_sha256: record.package_sha256,
+        package_path: record.package_path,
+        review_status: record.review_status,
+        index_sequence: record.index_sequence,
+        published_at: record.published_at,
+        withdrawn_at: record.withdrawn_at,
+        revocation_reason: record.revocation_reason,
+        provenance_json: record.provenance_json,
+        oci_json: record.oci_json,
+    }
+}
+
+fn source_key_value(key: &SourceKeyRecord) -> Value {
+    json!({
+        "keyId": key.key_id,
+        "label": key.label,
+        "validFrom": key.valid_from,
+        "validUntil": key.valid_until,
+    })
+}
+
+fn publisher_key_value(key: &PublisherKeyRecord) -> Value {
+    json!({
+        "keyId": key.key_id,
+        "label": key.label,
+        "validFrom": key.valid_from,
+        "validUntil": key.valid_until,
+        "revokedAt": key.revoked_at,
+        "createdAt": key.created_at,
+    })
+}
+
+fn registered_key_tuple(key: hpa_local::postgres_plugin::RegisteredKey) -> RegisteredKeyMaterial {
+    (
+        key.public_key,
+        key.valid_from,
+        key.valid_until,
+        key.revoked_at,
+    )
 }
 
 fn now_rfc3339() -> String {

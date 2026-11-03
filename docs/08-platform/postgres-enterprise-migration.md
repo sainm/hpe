@@ -9,9 +9,9 @@
 
 1. **镜像（历史）**：SQLite 权威，写穿到 PostgreSQL。该阶段代码已移除。
 2. **读取切换（完成）**：配额、租户、成员、SCIM、浏览器会话、OAuth AS 在 PG 模式全部读 PostgreSQL。
-3. **权威翻转（完成）**：Enterprise API 与 SCIM 的租户/配额/成员/Group 写入、OAuth AS 状态、浏览器会话与平台令牌均只写 PostgreSQL；SQLite 对应表降级为可重建缓存，周期任务从 PostgreSQL 重建。
+3. **权威翻转（完成）**：Enterprise API 与 SCIM 的租户/配额/成员/Group 写入、OAuth AS 状态、浏览器会话与平台令牌均只写 PostgreSQL；Agent、Skill 与 MCP 控制面元数据在 PG 模式只写 PostgreSQL；SQLite 对应表降级为可重建缓存，周期任务从 PostgreSQL 重建。
 
-剩余差异是真实企业 IdP/SCIM/Vault/HA 的外部验收；Agent 版本/会话/事件/审批/工具调用已在 PG 模式切换为 PostgreSQL 权威。
+剩余差异是真实企业 IdP/SCIM/Vault/HA 的外部验收；Agent 版本/会话/事件/审批/工具调用、Skill 包/版本/文件/运行/产物与 MCP PAT/审批/审计/服务器元数据已在 PG 模式切换为 PostgreSQL 权威。
 
 ## 2. 现状矩阵
 
@@ -28,8 +28,11 @@
 | SCIM Group / 映射 | 不写 | **权威** | 角色重算在同一 PG 事务 |
 | 浏览器会话 | 不写 | **权威** | 读/写/轮换/登出/按租户吊销全部走 PostgreSQL |
 | OAuth AS 状态（clients/codes/tokens/consents/signing keys） | 不写 | **权威** | `postgres_oauth_cross_node` |
-| Agent 会话 / 版本 / 事件 / 审批 / 工具调用 | 不写 | **权威** | `postgres_agent_cross_node` |
+| Agent 会话 / 版本 / 事件 / 审批 / 工具调用 | 不写 | **权威** | `postgres_agent_cross_node`；会话 owner lease 见 `postgres_agent_lease_cross_node` |
 | Skill 包 / 版本 / 文件 / 运行 / 产物 | 不写 | **权威** | `postgres_skill_cross_node`；签名文件仍为本地 |
+| MCP PAT / 审批 / 审计 / 外部服务器 | 不写 | **权威** | `postgres_mcp_meta_cross_node`；持久 session/task 另由 `HPA_POSTGRES_MCP` 覆盖 |
+| Connector 定义 / 连接 / 审计 | 不写 | **权威** | `postgres_connector_cross_node`；插件包与 Marketplace 元数据仍为本地 |
+| Plugin 生命周期 / Marketplace | 不写 | **权威** | `postgres_plugin_cross_node`；包文件/签名私钥仍为节点本地 |
 
 ## 3. 权威写入与缓存
 
@@ -48,6 +51,9 @@
 | `POST/PUT/DELETE /api/enterprise/members` | 只写 PostgreSQL 成员表（含 SCIM 字段） |
 | SCIM User/Group | 只写 PostgreSQL；Group 成员与 effective role 在同一事务 |
 | OAuth AS | clients/requests/codes/tokens/consents/signing keys 只写 `hpa_control` |
+| MCP 元数据 | PAT/审批/审计/外部服务器只写 `hpa_tenant.mcp_*`；审批决定与一次性消费在单条 UPDATE 内完成 |
+| Connector 元数据 | 定义/连接/审计只写 `hpa_tenant.connector_*`；插件启停/卸载通过同一存储改定义状态 |
+| Plugin 元数据 | 包/安装/能力/事件、上架/评分、发布者/来源/远程包只写 `hpa_tenant.plugin_*`/`marketplace_*`；插件事件同事务写 `marketplace_event_stream` |
 | 管理员令牌 / 审计 / 浏览器会话 | 只写 PostgreSQL |
 
 PostgreSQL 写入失败会直接返回错误；不会出现“本地成功、共享状态没变”。
@@ -59,6 +65,9 @@ PostgreSQL 写入失败会直接返回错误；不会出现“本地成功、共
 | 租户 list/get/status | PG 模式读 `hpa_control.tenants`；空节点立即可见其他节点创建的租户 |
 | 配额 | 读 `hpa_control.quotas` |
 | 成员 / SCIM Users/Groups | 读 `hpa_control.members/scim_groups/scim_group_members` |
+| MCP PAT / 审批 / 审计 / 服务器 | 读 `hpa_tenant.mcp_tokens/mcp_approvals/mcp_audit/mcp_servers`；PAT 认证按 token hash 查询并触碰 `last_used_at` |
+| Connector 定义 / 连接 / 审计 | 读 `hpa_tenant.connector_definitions/connections/connector_audit`；执行引擎按定义 manifest 在本节点运行 |
+| Plugin / Marketplace | 读 `hpa_tenant.plugin_*`/`marketplace_*`；插件包文件与安装目录仍按本节点路径读取 |
 | 浏览器登录成员覆盖 | `BrowserAuth` 读 PostgreSQL 成员 |
 | 租户 active 检查 | 读 PostgreSQL 状态；仅升级窗口在 PG 无行时回退 SQLite 并自愈 |
 | `active_tenants()` | PG 有租户行时以 `hpa_control.tenants` 为准，否则回退 SQLite |
@@ -146,7 +155,11 @@ HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_scim_cross_nod
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_member_authority
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_mirror_verify
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_agent_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_agent_lease_cross_node
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_skill_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_mcp_meta_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_connector_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_plugin_cross_node
 node scripts/scim-e2e.mjs                                  # 需要运行中的服务与管理员令牌
 ```
 
@@ -154,7 +167,11 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 - `postgres_scim_cross_node`：A 创建 User/Group，B 读取角色映射与成员；SQLite SCIM 表 0 行。
 - `postgres_member_authority`：A 建租户/成员，B 立即可见；目录角色覆盖 session；disabled 成员与 suspended 租户使 B 的 session 失效；SQLite 无权威行。
 - `postgres_agent_cross_node`：A 建/发布 Agent，B 读取版本；B 恢复 interrupted 会话为 succeeded、取消 running 会话；审批与工具调用跨节点可见，重复 begin 幂等；两节点 SQLite Agent 表 0 行。
+- `postgres_agent_lease_cross_node`：A 持有 running 会话租约，B 启动恢复不中断；伪造 token 写入失败；过期后 B 接管并递增 token，A 旧 token 失败；C 启动接管空闲会话并写 `agent.interrupted`；终态拒绝迟到写入。
 - `postgres_skill_cross_node`：A 导入 Skill，B 读取版本与包文件；A 发布后 B 看到 published；B 运行 Skill 后 A 读取 run 与 `summary.json` artifact；SQLite Skill 表 0 行；Skill 配额按 PG 计数。
+- `postgres_mcp_meta_cross_node`：A 创建 MCP PAT，B 列表可见并用它通过 `/mcp` 认证，A 读到 B 写入的审计；B 吊销后 A 立即 401；审批决定/一次性消费/过期、服务器 upsert/list/delete 与 stats 跨节点一致；SQLite MCP 表 0 行。
+- `postgres_connector_cross_node`：A/B 共享内置 Connector 定义；A 建样例连接，B 读取、更新、测试，A 读到更新的连接与 B 写入的审计；A 删除后 B 列表消失；定义幂等/冻结/所有权与 SQLite 0 行均有断言。
+- `postgres_plugin_cross_node`：A 安装样例插件，B 读取插件/包/能力/贡献的 Connector；B 停用、A 启用；A 发布 Marketplace，B 审核/评分/撤回；发布者与来源/key 跨节点可见，撤销跨节点生效；远程包与插件 MCP server 存储级验证；A 卸载后 B 读到 uninstalled；SQLite 插件表 0 行。
 - `postgres_control_mirror`：跨节点配额与租户读取、空 data dir 节点为未见租户注册 Worker。
 
 ## 6. 风险
@@ -163,4 +180,6 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 - `hpa_control.members` 有 `(tenant_id, subject)`、email、user_name、external_id 唯一约束；历史重复数据在首次写入/导入时会失败关闭，需先清理。
 - SCIM Group 的 SQLite 表在 PG 模式不再写入；依赖 SQLite 直读的自定义脚本应改用 SCIM/PostgreSQL。
 - 删除租户只标记 `deleted` 并吊销 PG token/session；历史 SQLite 行由缓存重建清理，租户业务库目录由删除流程移除。
-- Agent 版本/会话/事件/审批/工具调用在 PG 模式走 `hpa_tenant.agent_*`，跨节点发布、恢复、取消、审批与工具幂等由 `postgres_agent_cross_node` 验证；Agent 配额也按 PostgreSQL 行计数。Skill 包/版本/文件/运行/产物元数据由 Phase 14 切到 `hpa_tenant.skill_*`，签名文件与 artifact 内容仍在节点本地；`hpa agent/skill ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。Agent 主动执行尚无 owner lease，多个控制面同时启动时 `recover` 可能把其他节点的 running 会话标记为 interrupted；生产部署需单写者或后续 owner lease。
+- Agent 版本/会话/事件/审批/工具调用在 PG 模式走 `hpa_tenant.agent_*`，跨节点发布、恢复、取消、审批与工具幂等由 `postgres_agent_cross_node` 验证；Agent 配额也按 PostgreSQL 行计数。会话 owner lease（`lease_owner/lease_token/lease_expires_at`）保证同一 running 会话单一写者，`recover` 跳过 live 租约、只接管过期会话；`HPA_NODE_ID` 必须稳定且唯一，TTL 由 `HPA_AGENT_LEASE_TTL_MS` 控制（默认 30s，最小 200ms）。Skill 包/版本/文件/运行/产物元数据由 Phase 14 切到 `hpa_tenant.skill_*`，签名文件与 artifact 内容仍在节点本地；`hpa agent/skill ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。
+- MCP PAT/审批/审计/服务器元数据由 Phase 15 切到 `hpa_tenant.mcp_*`；`credential_env` 只保存变量名，服务器进程与凭证值仍属节点本地。持久 session/subscription/task 仍由 `HPA_POSTGRES_MCP=1` 的 `hpa_control` 表覆盖，两者不要混用为同一迁移项。`hpa mcp token ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。
+- Connector 定义/连接/审计由 Phase 16 切到 `hpa_tenant.connector_*`；插件包、签名、发布者/来源/远程 Marketplace 索引与插件自身表由 Phase 17 切到 `hpa_tenant.plugin_*`/`marketplace_*`。插件包文件、签名私钥与安装目录仍在节点本地；跨节点启用/回滚需要目标节点具备文件或共享存储。凭证环境变量只在连接行保存名称，值与执行仍属节点本地。

@@ -5,10 +5,16 @@ use hpa_local::postgres_agent::{
     AgentApprovalRecord, AgentEventRecord, AgentSessionRecord, AgentSummaryRecord,
     AgentToolCallRecord, AgentVersionRecord, PostgresAgentError, PostgresAgentStore,
 };
+use hpa_local::postgres_connector::PostgresConnectorStore;
 use hpa_local::postgres_execution::{
     ArtifactRecord, ExecutionLeaseRecord, ExecutionRecord, PostgresExecutionError,
     PostgresExecutionStore, WorkflowRecord, WorkflowVersionRecord,
 };
+use hpa_local::postgres_mcp_meta::{
+    McpApprovalRecord, McpAuditRecord, McpServerRecord, McpTokenRecord, PostgresMcpMetaError,
+    PostgresMcpMetaStore,
+};
+use hpa_local::postgres_plugin::PostgresPluginStore;
 use hpa_local::postgres_skill::{
     PostgresSkillError, PostgresSkillStore, SkillArtifactRecord, SkillFileRecord, SkillRunRecord,
     SkillSummaryRecord, SkillVersionRecord,
@@ -45,6 +51,8 @@ pub enum DbError {
     PostgresAgent(String),
     #[error("PostgreSQL skill error: {0}")]
     PostgresSkill(String),
+    #[error("PostgreSQL MCP metadata error: {0}")]
+    PostgresMcpMeta(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -56,6 +64,9 @@ pub struct Db {
     postgres_trigger: Option<PostgresTriggerStore>,
     postgres_agent: Option<PostgresAgentStore>,
     postgres_skill: Option<PostgresSkillStore>,
+    postgres_mcp_meta: Option<PostgresMcpMetaStore>,
+    postgres_connector: Option<PostgresConnectorStore>,
+    postgres_plugin: Option<PostgresPluginStore>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -325,6 +336,103 @@ pub struct McpServerRow {
     pub credential_env: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl From<McpTokenRecord> for McpTokenRow {
+    fn from(record: McpTokenRecord) -> Self {
+        Self {
+            id: record.id,
+            name: record.name,
+            scopes_json: record.scopes_json,
+            tenant_id: record.tenant_id,
+            created_at: record.created_at,
+            last_used_at: record.last_used_at,
+            revoked_at: record.revoked_at,
+        }
+    }
+}
+
+impl From<McpApprovalRecord> for McpApprovalRow {
+    fn from(record: McpApprovalRecord) -> Self {
+        Self {
+            id: record.id,
+            token_id: record.token_id,
+            tool_name: record.tool_name,
+            arguments_json: record.arguments_json,
+            arguments_hash: record.arguments_hash,
+            request_state: record.request_state,
+            risk: record.risk,
+            status: record.status,
+            created_at: record.created_at,
+            expires_at: record.expires_at,
+            decided_at: record.decided_at,
+            used_at: record.used_at,
+        }
+    }
+}
+
+impl From<&McpAuditRow> for McpAuditRecord {
+    fn from(row: &McpAuditRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            at: row.at.clone(),
+            token_id: row.token_id.clone(),
+            method: row.method.clone(),
+            tool_name: row.tool_name.clone(),
+            status: row.status.clone(),
+            latency_ms: row.latency_ms,
+            detail_json: row.detail_json.clone(),
+        }
+    }
+}
+
+impl From<McpAuditRecord> for McpAuditRow {
+    fn from(record: McpAuditRecord) -> Self {
+        Self {
+            id: record.id,
+            at: record.at,
+            token_id: record.token_id,
+            method: record.method,
+            tool_name: record.tool_name,
+            status: record.status,
+            latency_ms: record.latency_ms,
+            detail_json: record.detail_json,
+        }
+    }
+}
+
+impl From<McpServerRow> for McpServerRecord {
+    fn from(row: McpServerRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            transport: row.transport,
+            command_json: row.command_json,
+            url: row.url,
+            allowed_tools_json: row.allowed_tools_json,
+            network_json: row.network_json,
+            credential_env: row.credential_env,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+impl From<McpServerRecord> for McpServerRow {
+    fn from(record: McpServerRecord) -> Self {
+        Self {
+            id: record.id,
+            name: record.name,
+            transport: record.transport,
+            command_json: record.command_json,
+            url: record.url,
+            allowed_tools_json: record.allowed_tools_json,
+            network_json: record.network_json,
+            credential_env: record.credential_env,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -1240,6 +1348,9 @@ impl Db {
             postgres_trigger: None,
             postgres_agent: None,
             postgres_skill: None,
+            postgres_mcp_meta: None,
+            postgres_connector: None,
+            postgres_plugin: None,
         })
     }
 
@@ -1252,8 +1363,27 @@ impl Db {
         self.postgres_execution = Some(PostgresExecutionStore::new(pool.clone(), &tenant_id));
         self.postgres_agent = Some(PostgresAgentStore::new(pool.clone(), &tenant_id));
         self.postgres_skill = Some(PostgresSkillStore::new(pool.clone(), &tenant_id));
+        self.postgres_mcp_meta = Some(PostgresMcpMetaStore::new(pool.clone(), &tenant_id));
+        self.postgres_connector = Some(PostgresConnectorStore::new(pool.clone(), &tenant_id));
+        self.postgres_plugin = Some(PostgresPluginStore::new(pool.clone(), &tenant_id));
         self.postgres_trigger = Some(PostgresTriggerStore::new(pool, tenant_id));
         self
+    }
+
+    pub fn postgres_connector(&self) -> Option<PostgresConnectorStore> {
+        self.postgres_connector.clone()
+    }
+
+    pub fn postgres_agent(&self) -> Option<PostgresAgentStore> {
+        self.postgres_agent.clone()
+    }
+
+    pub fn postgres_plugin(&self) -> Option<PostgresPluginStore> {
+        self.postgres_plugin.clone()
+    }
+
+    pub fn postgres_mcp_meta(&self) -> Option<PostgresMcpMetaStore> {
+        self.postgres_mcp_meta.clone()
     }
 
     fn map_postgres_execution(error: PostgresExecutionError) -> DbError {
@@ -1280,6 +1410,10 @@ impl Db {
             }
             other => DbError::PostgresSkill(other.to_string()),
         }
+    }
+
+    fn map_postgres_mcp_meta(error: PostgresMcpMetaError) -> DbError {
+        DbError::PostgresMcpMeta(error.to_string())
     }
 
     pub async fn upsert_workflow(&self, row: &WorkflowRow) -> DbResult<()> {
@@ -2370,6 +2504,13 @@ impl Db {
         tenant_id: &str,
         created_at: &str,
     ) -> DbResult<McpTokenRow> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .create_token(name, token_hash, scopes_json, tenant_id, created_at)
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let id = format!("mcptok_{}", uuid::Uuid::now_v7());
         sqlx::query(
             "INSERT INTO mcp_tokens (id, name, token_hash, scopes_json, tenant_id, created_at, last_used_at, revoked_at)
@@ -2389,6 +2530,13 @@ impl Db {
     }
 
     pub async fn get_mcp_token(&self, id: &str) -> DbResult<Option<McpTokenRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .get_token(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpTokenRow>(
             "SELECT id, name, scopes_json, tenant_id, created_at, last_used_at, revoked_at
              FROM mcp_tokens WHERE id = ?",
@@ -2403,6 +2551,13 @@ impl Db {
         token_hash: &str,
         now: &str,
     ) -> DbResult<Option<McpTokenRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .find_token(token_hash, now)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let row = sqlx::query_as::<_, McpTokenRow>(
             "SELECT id, name, scopes_json, tenant_id, created_at, last_used_at, revoked_at
              FROM mcp_tokens WHERE token_hash = ? AND revoked_at IS NULL",
@@ -2421,6 +2576,13 @@ impl Db {
     }
 
     pub async fn list_mcp_tokens(&self) -> DbResult<Vec<McpTokenRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .list_tokens()
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpTokenRow>(
             "SELECT id, name, scopes_json, tenant_id, created_at, last_used_at, revoked_at
              FROM mcp_tokens ORDER BY created_at DESC",
@@ -2430,6 +2592,12 @@ impl Db {
     }
 
     pub async fn revoke_mcp_token(&self, id: &str, now: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .revoke_token(id, now)
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let result =
             sqlx::query("UPDATE mcp_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
                 .bind(now)
@@ -2451,6 +2619,22 @@ impl Db {
         created_at: &str,
         expires_at: &str,
     ) -> DbResult<McpApprovalRow> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .create_approval(
+                    token_id,
+                    tool_name,
+                    arguments_json,
+                    arguments_hash,
+                    request_state,
+                    risk,
+                    created_at,
+                    expires_at,
+                )
+                .await
+                .map(Into::into)
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let id = format!("mcpappr_{}", uuid::Uuid::now_v7());
         sqlx::query(
             "INSERT INTO mcp_approvals
@@ -2475,6 +2659,13 @@ impl Db {
     }
 
     pub async fn get_mcp_approval(&self, id: &str) -> DbResult<Option<McpApprovalRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .get_approval(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpApprovalRow>(
             "SELECT id, token_id, tool_name, arguments_json, arguments_hash, request_state, risk,
                     status, created_at, expires_at, decided_at, used_at
@@ -2486,6 +2677,13 @@ impl Db {
     }
 
     pub async fn get_mcp_approval_by_state(&self, state: &str) -> DbResult<Option<McpApprovalRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .get_approval_by_state(state)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpApprovalRow>(
             "SELECT id, token_id, tool_name, arguments_json, arguments_hash, request_state, risk,
                     status, created_at, expires_at, decided_at, used_at
@@ -2501,6 +2699,13 @@ impl Db {
         status: Option<&str>,
         limit: i64,
     ) -> DbResult<Vec<McpApprovalRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .list_approvals(status, limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let limit = limit.clamp(1, 200);
         match status {
             Some(status) => Ok(sqlx::query_as::<_, McpApprovalRow>(
@@ -2529,6 +2734,12 @@ impl Db {
         status: &str,
         decided_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .decide_approval(id, status, decided_at)
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let result = sqlx::query(
             "UPDATE mcp_approvals SET status = ?, decided_at = ?
              WHERE id = ? AND status = 'pending'",
@@ -2542,6 +2753,12 @@ impl Db {
     }
 
     pub async fn consume_mcp_approval(&self, id: &str, used_at: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .consume_approval(id, used_at)
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let result = sqlx::query(
             "UPDATE mcp_approvals SET used_at = ?
              WHERE id = ? AND status = 'approved' AND used_at IS NULL",
@@ -2554,6 +2771,12 @@ impl Db {
     }
 
     pub async fn expire_mcp_approvals(&self, now: &str) -> DbResult<u64> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .expire_approvals(now)
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let result = sqlx::query(
             "UPDATE mcp_approvals SET status = 'expired'
              WHERE status = 'pending' AND expires_at < ?",
@@ -2565,6 +2788,12 @@ impl Db {
     }
 
     pub async fn insert_mcp_audit(&self, row: &McpAuditRow) -> DbResult<()> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .insert_audit(&McpAuditRecord::from(row))
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         sqlx::query(
             "INSERT INTO mcp_audit (id, at, token_id, method, tool_name, status, latency_ms, detail_json)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2583,6 +2812,13 @@ impl Db {
     }
 
     pub async fn list_mcp_audit(&self, limit: i64) -> DbResult<Vec<McpAuditRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .list_audit(limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpAuditRow>(
             "SELECT id, at, token_id, method, tool_name, status, latency_ms, detail_json
              FROM mcp_audit ORDER BY at DESC LIMIT ?",
@@ -2593,6 +2829,9 @@ impl Db {
     }
 
     pub async fn mcp_stats(&self) -> DbResult<(i64, i64, i64)> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store.stats().await.map_err(Self::map_postgres_mcp_meta);
+        }
         let pending: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM mcp_approvals WHERE status = 'pending'")
                 .fetch_one(&self.pool)
@@ -2608,6 +2847,12 @@ impl Db {
     }
 
     pub async fn upsert_mcp_server(&self, row: &McpServerRow) -> DbResult<()> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .upsert_server(&McpServerRecord::from(row.clone()))
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         sqlx::query(
             "INSERT INTO mcp_servers
              (id, name, transport, command_json, url, allowed_tools_json, network_json, credential_env, created_at, updated_at)
@@ -2638,6 +2883,13 @@ impl Db {
     }
 
     pub async fn list_mcp_servers(&self) -> DbResult<Vec<McpServerRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .list_servers()
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpServerRow>(
             "SELECT id, name, transport, command_json, url, allowed_tools_json, network_json,
                     credential_env, created_at, updated_at
@@ -2648,6 +2900,13 @@ impl Db {
     }
 
     pub async fn get_mcp_server(&self, id: &str) -> DbResult<Option<McpServerRow>> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .get_server(id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         Ok(sqlx::query_as::<_, McpServerRow>(
             "SELECT id, name, transport, command_json, url, allowed_tools_json, network_json,
                     credential_env, created_at, updated_at
@@ -2659,6 +2918,12 @@ impl Db {
     }
 
     pub async fn delete_mcp_server(&self, id: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_mcp_meta.as_ref() {
+            return store
+                .delete_server(id)
+                .await
+                .map_err(Self::map_postgres_mcp_meta);
+        }
         let result = sqlx::query("DELETE FROM mcp_servers WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
@@ -2942,6 +3207,23 @@ impl Db {
         Ok(())
     }
 
+    pub async fn update_agent_session_fenced(
+        &self,
+        row: &AgentSessionRow,
+        owner: &str,
+        token: i64,
+        ttl_ms: i64,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            return store
+                .fenced_update_agent_session(&AgentSessionRecord::from(row), owner, token, ttl_ms)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
+        self.update_agent_session(row).await?;
+        Ok(true)
+    }
+
     pub async fn get_agent_session(&self, id: &str) -> DbResult<Option<AgentSessionRow>> {
         if let Some(store) = self.postgres_agent.as_ref() {
             return store
@@ -3038,6 +3320,27 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn append_agent_events_fenced(
+        &self,
+        events: &[AgentEventRow],
+        owner: &str,
+        token: i64,
+        ttl_ms: i64,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_agent.as_ref() {
+            let records = events
+                .iter()
+                .map(AgentEventRecord::from)
+                .collect::<Vec<_>>();
+            return store
+                .fenced_append_agent_events(&records, owner, token, ttl_ms)
+                .await
+                .map_err(Self::map_postgres_agent);
+        }
+        self.append_agent_events(events).await?;
+        Ok(true)
     }
 
     pub async fn list_agent_events(

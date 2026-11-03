@@ -1,6 +1,6 @@
 # PostgreSQL 控制面基线
 
-> 状态：**P13-01 IN_PROGRESS**。schema、SQLx migration、角色分离、RLS、SQLite 导入、Workflow/Execution/Trigger Repository 已在 PostgreSQL 18 执行通过；`HPA_POSTGRES_RUNTIME=1` 时 workflow/version、execution/event/artifact、trigger_state/trigger_fires、execution lease、remote marker、Worker Job、平台令牌/审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group、Agent 版本/会话/事件/审批/工具调用与 Skill 包/版本/文件/运行/产物已切换并可跨进程读取；SQLite 控制表作为可重建缓存。Plugin/Connector/MCP 等剩余元数据仍使用 SQLite，不能宣称生产控制面已整体切换。
+> 状态：**P13-01 IN_PROGRESS**。schema、SQLx migration、角色分离、RLS、SQLite 导入、Workflow/Execution/Trigger Repository 已在 PostgreSQL 18 执行通过；`HPA_POSTGRES_RUNTIME=1` 时 workflow/version、execution/event/artifact、trigger_state/trigger_fires、execution lease、remote marker、Worker Job、平台令牌/审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group、Agent 版本/会话/事件/审批/工具调用（含会话 owner lease）、Skill 包/版本/文件/运行/产物、MCP PAT/审批/审计/服务器、Connector 定义/连接/审计与 Plugin 生命周期/Marketplace 元数据已切换并可跨进程读取；SQLite 控制表作为可重建缓存。Plugin 包文件、签名私钥与安装目录仍属节点本地；真实企业 IdP/HA 等外部验收未完成，不能宣称生产控制面已整体切换。
 
 ## 1. 边界
 
@@ -120,7 +120,7 @@ hpa serve --port 8787
 
 API 不接受请求体切换 tenant：`tenantId` 若存在必须等于认证租户，否则返回 400 `TENANT_MISMATCH`；Repository 再次校验 state 内嵌 tenant，防止绕过 API 的伪造。
 
-执行模式中的 `remote_executions` marker 同步写入 PostgreSQL；Hybrid Worker 写入 execution 后，本地 recovery 不会接管该远程执行。Workflow draft/current row 与 frozen version 均写 PostgreSQL。当前限制：Plugin/Connector/MCP 元数据与部分 Agent 工具实现仍依赖 SQLite；Skill 签名文件仍在节点本地。此模式不证明 P13-01 完成。
+执行模式中的 `remote_executions` marker 同步写入 PostgreSQL；Hybrid Worker 写入 execution 后，本地 recovery 不会接管该远程执行。Workflow draft/current row 与 frozen version 均写 PostgreSQL。当前限制：Plugin 包文件、签名私钥与安装目录仍属节点本地；MCP、Connector 与 Plugin 元数据已切到 PostgreSQL；Skill 签名文件仍在节点本地。此模式不证明 P13-01 完成。
 
 Execution owner 使用 `HPA_NODE_ID`、`HPA_EXECUTION_LEASE_TTL_SECONDS`（默认 30 秒）和 `HPA_EXECUTION_RECOVERY_TICK_MS`（默认 5000）。每个 step 前续租，state/events 更新必须匹配 holder + fencing token 且 lease 未过期。节点故障后其他控制面扫描 running execution，lease 过期后递增 token 接管；旧 owner 的后续 commit/release 失败。
 
@@ -180,7 +180,7 @@ Phase 13 基线不提供自动 down migration。企业数据删除不可逆，�
 
 ## 9. 尚未完成
 
-- Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS 与 Agent 版本/会话/事件/审批/工具调用已有显式 PostgreSQL 路由并验证跨节点读取；Skill 等其余元数据仍使用 SQLite。
-- SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；Skill 整库迁移与真实 HA 演练尚未实现。
+- Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本/运行、MCP PAT/审批/审计/服务器、Connector 定义/连接/审计与 Plugin/Marketplace 元数据已有显式 PostgreSQL 路由并验证跨节点读取；剩余是真实企业 IdP、HA/read replica 与对象存储等外部验收。
+- SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；插件包文件跨节点同步与真实 HA 演练尚未实现。
 - 对象存储、只读副本、在线 PITR、连接重试和多控制面部署属于后续 P13-02/P13-06。
 - 本文件中的 PASS 只适用于 schema/RLS/migration 基线，不适用于完整 P13-01 或 Phase 13。

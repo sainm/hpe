@@ -330,7 +330,11 @@ try {
 } finally {
   nodeA?.child.kill();
   nodeB?.child.kill();
-  await fs.rm(workdir, { recursive: true, force: true });
+  // A node that is still flushing tenant files can make the recursive delete
+  // fail with ENOTEMPTY; retry and never let cleanup mask the real result.
+  await fs
+    .rm(workdir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    .catch(() => {});
 }
 
 console.log(JSON.stringify(summary, null, 2));

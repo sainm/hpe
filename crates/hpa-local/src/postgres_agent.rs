@@ -60,6 +60,13 @@ pub struct AgentSessionRecord {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLeaseRecord {
+    pub owner: String,
+    pub token: i64,
+    pub expires_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentEventRecord {
     pub session_id: String,
@@ -799,6 +806,214 @@ impl PostgresAgentStore {
             > 0;
         transaction.commit().await?;
         Ok(changed)
+    }
+
+    pub async fn acquire_agent_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+        ttl_ms: i64,
+    ) -> Result<Option<AgentLeaseRecord>, PostgresAgentError> {
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::milliseconds(ttl_ms.max(1));
+        let mut transaction = self.begin().await?;
+        let row = sqlx::query(
+            "UPDATE hpa_tenant.agent_sessions
+             SET lease_owner = $3, lease_token = lease_token + 1, lease_expires_at = $4
+             WHERE tenant_id = $1 AND id = $2
+               AND status NOT IN ('succeeded', 'failed', 'budget_exhausted', 'timeout', 'cancelled')
+               AND (
+                    lease_owner IS NULL
+                    OR lease_expires_at IS NULL
+                    OR lease_expires_at < now()
+                    OR lease_owner = $3
+               )
+             RETURNING lease_owner, lease_token, lease_expires_at",
+        )
+        .bind(&self.tenant_id)
+        .bind(session_id)
+        .bind(owner)
+        .bind(expires_at)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.map(|row| {
+            Ok(AgentLeaseRecord {
+                owner: row.try_get("lease_owner")?,
+                token: row.try_get("lease_token")?,
+                expires_at: format_time(row.try_get("lease_expires_at")?)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn renew_agent_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+        token: i64,
+        ttl_ms: i64,
+    ) -> Result<bool, PostgresAgentError> {
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::milliseconds(ttl_ms.max(1));
+        let mut transaction = self.begin().await?;
+        let result = sqlx::query(
+            "UPDATE hpa_tenant.agent_sessions SET lease_expires_at = $4
+             WHERE tenant_id = $1 AND id = $2 AND lease_owner = $3 AND lease_token = $5
+               AND lease_expires_at > now()",
+        )
+        .bind(&self.tenant_id)
+        .bind(session_id)
+        .bind(owner)
+        .bind(expires_at)
+        .bind(token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn release_agent_lease(
+        &self,
+        session_id: &str,
+        owner: &str,
+        token: i64,
+    ) -> Result<bool, PostgresAgentError> {
+        let mut transaction = self.begin().await?;
+        let result = sqlx::query(
+            "UPDATE hpa_tenant.agent_sessions
+             SET lease_owner = NULL, lease_expires_at = NULL
+             WHERE tenant_id = $1 AND id = $2 AND lease_owner = $3 AND lease_token = $4",
+        )
+        .bind(&self.tenant_id)
+        .bind(session_id)
+        .bind(owner)
+        .bind(token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn agent_lease(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AgentLeaseRecord>, PostgresAgentError> {
+        let mut transaction = self.begin().await?;
+        let row = sqlx::query(
+            "SELECT lease_owner, lease_token, lease_expires_at
+             FROM hpa_tenant.agent_sessions
+             WHERE tenant_id = $1 AND id = $2 AND lease_owner IS NOT NULL",
+        )
+        .bind(&self.tenant_id)
+        .bind(session_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        row.map(|row| {
+            Ok(AgentLeaseRecord {
+                owner: row.try_get("lease_owner")?,
+                token: row.try_get("lease_token")?,
+                expires_at: format_time(row.try_get("lease_expires_at")?)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub async fn fenced_update_agent_session(
+        &self,
+        row: &AgentSessionRecord,
+        owner: &str,
+        token: i64,
+        ttl_ms: i64,
+    ) -> Result<bool, PostgresAgentError> {
+        let output = row.output_json.as_deref().map(parse_json).transpose()?;
+        let state = parse_json(&row.state_json)?;
+        let error = row.error_json.as_deref().map(parse_json).transpose()?;
+        let updated_at = parse_time(&row.updated_at)?;
+        let finished_at = row.finished_at.as_deref().map(parse_time).transpose()?;
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::milliseconds(ttl_ms.max(1));
+        let mut transaction = self.begin().await?;
+        let result = sqlx::query(
+            "UPDATE hpa_tenant.agent_sessions
+             SET status = $2, output_json = $3, state_json = $4,
+                 error_json = $5, updated_at = $6, finished_at = $7, lease_expires_at = $9
+             WHERE tenant_id = $1 AND id = $8
+               AND lease_owner = $10 AND lease_token = $11 AND lease_expires_at > now()
+               AND status NOT IN ('succeeded', 'failed', 'budget_exhausted', 'timeout', 'cancelled')",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.status)
+        .bind(output.as_ref().map(Json))
+        .bind(Json(&state))
+        .bind(error.as_ref().map(Json))
+        .bind(updated_at)
+        .bind(finished_at)
+        .bind(&row.id)
+        .bind(expires_at)
+        .bind(owner)
+        .bind(token)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn fenced_append_agent_events(
+        &self,
+        events: &[AgentEventRecord],
+        owner: &str,
+        token: i64,
+        ttl_ms: i64,
+    ) -> Result<bool, PostgresAgentError> {
+        let Some(first) = events.first() else {
+            return Ok(true);
+        };
+        let expires_at = OffsetDateTime::now_utc() + time::Duration::milliseconds(ttl_ms.max(1));
+        let mut transaction = self.begin().await?;
+        let held: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM hpa_tenant.agent_sessions
+             WHERE tenant_id = $1 AND id = $2 AND lease_owner = $3 AND lease_token = $4
+               AND lease_expires_at > now()
+               AND status NOT IN ('succeeded', 'failed', 'budget_exhausted', 'timeout', 'cancelled')
+             FOR UPDATE",
+        )
+        .bind(&self.tenant_id)
+        .bind(&first.session_id)
+        .bind(owner)
+        .bind(token)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if held.is_none() {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        for event in events {
+            let data = parse_json(&event.data_json)?;
+            sqlx::query(
+                "INSERT INTO hpa_tenant.agent_events
+                 (tenant_id, session_id, sequence, at, kind, data_json)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (tenant_id, session_id, sequence) DO NOTHING",
+            )
+            .bind(&self.tenant_id)
+            .bind(&event.session_id)
+            .bind(event.sequence)
+            .bind(parse_time(&event.at)?)
+            .bind(&event.kind)
+            .bind(Json(&data))
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE hpa_tenant.agent_sessions SET lease_expires_at = $3
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(&self.tenant_id)
+        .bind(&first.session_id)
+        .bind(expires_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
     }
 
     async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, PostgresAgentError> {

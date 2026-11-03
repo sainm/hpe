@@ -384,6 +384,7 @@ impl From<AgentError> for ApiError {
             AgentError::Budget(message) => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, "AGENT_BUDGET", message)
             }
+            AgentError::Lease(message) => Self::conflict("AGENT_LEASE", message),
             AgentError::Json(error) => Self::internal(format!("JSON error: {error}")),
         }
     }

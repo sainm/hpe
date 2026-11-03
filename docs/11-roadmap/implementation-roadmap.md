@@ -250,6 +250,22 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 > 状态：**本地验收完成**（2026-11-03）。Skill 包与版本元数据（skills/skill_versions/skill_files/skill_runs/skill_run_artifacts）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威，支持跨节点导入、版本/文件读取、发布状态、运行与产物；本地 SQLite 模式与 Skill API/CLI/MCP 路径不改变。签名文件、跨节点 Skill 文件同步与 Skill 执行所有权不在本阶段。完整契约见 [Phase 14 Skill PostgreSQL](phase-14-skill-postgres.md)。
 
+## 8i. Phase 15：MCP 控制面元数据 PostgreSQL 权威
+
+> 状态：**本地验收完成**（2026-11-03）。MCP PAT、审批、审计与外部服务器元数据（mcp_tokens/mcp_approvals/mcp_audit/mcp_servers）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威，支持跨节点 token 创建/查找/吊销、审批决定/一次性消费/过期、审计写入与服务器管理；本地 SQLite 模式、MCP Gateway/stdio/HTTP 传输与 MCP Center 不改变。持久 MCP session/task 状态仍由 `HPA_POSTGRES_MCP=1` 独立覆盖，Plugin/Connector 元数据不在本阶段。完整契约见 [Phase 15 MCP PostgreSQL](phase-15-mcp-control-postgres.md)。
+
+## 8j. Phase 16：Connector 元数据 PostgreSQL 权威
+
+> 状态：**本地验收完成**（2026-11-03）。Connector 定义、连接与审计（connector_definitions/connections/connector_audit）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威，节点启动幂等注册内置连接器，支持跨节点创建/读取/更新/测试/删除连接与审计；插件启停/卸载的 Connector 贡献走同一路径。本地 SQLite 模式与执行引擎不改变。插件包、签名与 Marketplace 元数据不在本阶段。完整契约见 [Phase 16 Connector PostgreSQL](phase-16-connector-postgres.md)。
+
+## 8k. Phase 17：Plugin 元数据 PostgreSQL 权威
+
+> 状态：**本地验收完成**（2026-11-03）。插件生命周期、本地 Marketplace 与远程 Marketplace 元数据（plugin_packages/plugins/plugin_capabilities/plugin_events/plugin_market_listings/plugin_reviews/publishers/sources/remote_packages/event_stream）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威；插件贡献的 MCP server 与 Connector 分别走 Phase 15/16 的存储。包文件、签名私钥与安装目录仍属节点本地，跨节点启用需目标节点具备文件。本地 SQLite 模式与插件 CLI/UI 不改变。完整契约见 [Phase 17 Plugin PostgreSQL](phase-17-plugin-postgres.md)。
+
+## 8l. Phase 18：Agent 会话 owner lease
+
+> 状态：**本地验收完成**（2026-11-03）。`hpa_tenant.agent_sessions` 增加 owner/token/expiry 租约列；AgentRuntime 在 start/drive/approval resume/recover 时获取租约，persist/emit 使用 holder+token+未过期围栏，终态或等待审批释放；`recover` 跳过仍被其他节点持有的 running 会话，只接管过期会话。本地 SQLite 模式不变。完整契约见 [Phase 18 Agent lease](phase-18-agent-lease.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid

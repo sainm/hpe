@@ -18,6 +18,7 @@
 - session 关闭级联删除 subscription；已创建 task 保留，但 `session_id` 置空。
 - notification 使用数据库 identity sequence；tenant 之间的 sequence 不要求全局连续。
 - JSONB 只保存协议数据和摘要，不保存 bearer token 或 secret。
+- PAT/审批/审计/外部服务器元数据（`hpa_tenant.mcp_tokens/mcp_approvals/mcp_audit/mcp_servers`）由 [Phase 15](../11-roadmap/phase-15-mcp-control-postgres.md) 管理，与本节的 session/task 状态分开：`HPA_POSTGRES_RUNTIME=1` 即切到 PostgreSQL，不依赖 `HPA_POSTGRES_MCP=1`。
 
 ## 2. 恢复语义
 

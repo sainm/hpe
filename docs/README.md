@@ -129,6 +129,10 @@
 - [Phase 12 可观测性](08-platform/observability.md)
 - [企业控制面 PostgreSQL 迁移](08-platform/postgres-enterprise-migration.md)
 - [Phase 14 Skill 元数据 PostgreSQL 权威](11-roadmap/phase-14-skill-postgres.md)
+- [Phase 15 MCP 控制面元数据 PostgreSQL 权威](11-roadmap/phase-15-mcp-control-postgres.md)
+- [Phase 16 Connector 元数据 PostgreSQL 权威](11-roadmap/phase-16-connector-postgres.md)
+- [Phase 17 Plugin 元数据 PostgreSQL 权威](11-roadmap/phase-17-plugin-postgres.md)
+- [Phase 18 Agent 会话 owner lease](11-roadmap/phase-18-agent-lease.md)
 - [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI
