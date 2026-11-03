@@ -152,7 +152,7 @@
 | P13-EXEC-07 | 空 data_dir 节点从 PG 恢复 running execution、执行并释放 lease | 进程级 E2E |
 | P13-WORKFLOW-01 | `HPA_POSTGRES_RUNTIME=1` 时 draft/publish/list/get/version 全部走 PostgreSQL | 真实 PG Store + API |
 | P13-WORKFLOW-02 | 相同 workflow/version 内容变化失败关闭；新版本可发布；跨租户不可见 | 负向集成 |
-| P13-EXEC-03 | Workflow、Trigger、Enterprise、Worker、Agent 等全部生产 Repository 切换 PostgreSQL | `IN_PROGRESS` |
+| P13-EXEC-03 | Workflow、Trigger、Enterprise、Worker、Agent、Skill、MCP 控制面、Connector、Plugin 全部生产 Repository 切换 PostgreSQL | 逐 store 跨节点测试，见 [Phase 13–18 状态台账](phase-13-18-status.md) |
 | P13-MARKET-01 | 远程 source/publisher/key/package 可在 Web 管理并安装 | API + Playwright |
 | P13-MARKET-02 | 1440/607 无溢出，source/publisher axe serious/critical=0 | Playwright + axe |
 | P13-MARKET-03 | 在线 OSV/离线漏洞库、key-based Sigstore bundle + OCI digest provenance、Web/VS Code Remote UI、持久 SSE 撤回推送；Fulcio/Rekor keyless、Registry attestation 拉取与跨控制面 federation | 部分完成 |
