@@ -145,6 +145,8 @@ enum EnterpriseCommand {
 enum DbCommand {
     Migrate,
     Status,
+    /// Compare the SQLite control plane with its PostgreSQL mirror.
+    VerifyMirror,
     ImportSqlite {
         #[arg(long)]
         source: PathBuf,
@@ -478,7 +480,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Command::Enterprise { command } => {
             enterprise_command(resolve_data_dir(cli.data_dir)?, command).await?
         }
-        Command::Db { command } => database_command(command).await?,
+        Command::Db { command } => {
+            database_command(command, resolve_data_dir(cli.data_dir)?).await?
+        }
         Command::Worker {
             control_url,
             max_concurrency,
@@ -509,7 +513,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn database_command(command: DbCommand) -> Result<(), Box<dyn Error>> {
+async fn database_command(command: DbCommand, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let database_url = std::env::var("HPA_POSTGRES_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
         .map_err(|_| {
@@ -570,6 +574,17 @@ async fn database_command(command: DbCommand) -> Result<(), Box<dyn Error>> {
                 "available": MIGRATOR.migrations.len(),
                 "migrations": migrations,
             }));
+        }
+        DbCommand::VerifyMirror => {
+            let report = verify_control_mirror(&data_dir, &pool).await?;
+            let drift = report["drift"]["total"].as_i64().unwrap_or_default();
+            print_json(&report);
+            if drift > 0 {
+                return Err(CliError(format!(
+                    "control plane mirror drift detected: {drift} item(s)"
+                ))
+                .into());
+            }
         }
         DbCommand::ImportSqlite { source } => {
             MIGRATOR.run(&pool).await?;
@@ -1496,6 +1511,152 @@ async fn enterprise_cli_postgres_pool() -> Result<Option<sqlx::postgres::PgPool>
         .into());
     }
     Ok(Some(pool))
+}
+
+/// Compares the SQLite control plane with its PostgreSQL mirror.
+async fn verify_control_mirror(
+    data_dir: &Path,
+    pool: &sqlx::postgres::PgPool,
+) -> Result<Value, Box<dyn Error>> {
+    use hpa_local::postgres_control::PostgresControlStore;
+    use sqlx::Row;
+
+    let control_db = data_dir.join("control.db");
+    if !control_db.exists() {
+        return Err(CliError(format!(
+            "control database not found: {}",
+            control_db.display()
+        ))
+        .into());
+    }
+    let sqlite = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("sqlite://{}", control_db.display()))
+        .await?;
+    let store = PostgresControlStore::new(pool.clone());
+
+    let mut drift: Vec<Value> = Vec::new();
+
+    // Tenants: existence and status must agree.
+    let remote_tenants = store.list_tenants().await?;
+    let remote_tenant_index = remote_tenants
+        .iter()
+        .map(|tenant| (tenant.id.as_str(), tenant.status.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let local_tenants = sqlx::query("SELECT id, status FROM enterprise_tenants")
+        .fetch_all(&sqlite)
+        .await?;
+    let mut local_tenant_ids = std::collections::HashSet::new();
+    for row in &local_tenants {
+        let id: String = row.get("id");
+        let status: String = row.get("status");
+        local_tenant_ids.insert(id.clone());
+        match remote_tenant_index.get(id.as_str()) {
+            None => drift.push(json!({"kind": "tenant.missingInPostgres", "id": id})),
+            Some(remote_status) if *remote_status != status => drift.push(json!({
+                "kind": "tenant.statusMismatch",
+                "id": id,
+                "sqlite": status,
+                "postgres": remote_status,
+            })),
+            Some(_) => {}
+        }
+    }
+    for tenant in &remote_tenants {
+        if !local_tenant_ids.contains(&tenant.id) {
+            drift.push(json!({"kind": "tenant.extraInPostgres", "id": tenant.id}));
+        }
+    }
+
+    // Quotas: every field must agree.
+    let local_quotas = sqlx::query(
+        "SELECT tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
+                max_plugins, max_connections, max_concurrent_runs FROM enterprise_quotas",
+    )
+    .fetch_all(&sqlite)
+    .await?;
+    for row in &local_quotas {
+        let tenant_id: String = row.get("tenant_id");
+        let local = json!({
+            "maxWorkflows": row.get::<i64, _>("max_workflows"),
+            "maxExecutionsPerDay": row.get::<i64, _>("max_executions_per_day"),
+            "maxSkills": row.get::<i64, _>("max_skills"),
+            "maxAgents": row.get::<i64, _>("max_agents"),
+            "maxPlugins": row.get::<i64, _>("max_plugins"),
+            "maxConnections": row.get::<i64, _>("max_connections"),
+            "maxConcurrentRuns": row.get::<i64, _>("max_concurrent_runs"),
+        });
+        match store.quota(&tenant_id).await? {
+            None => drift.push(json!({"kind": "quota.missingInPostgres", "tenantId": tenant_id})),
+            Some(remote) => {
+                let remote = json!({
+                    "maxWorkflows": remote.max_workflows,
+                    "maxExecutionsPerDay": remote.max_executions_per_day,
+                    "maxSkills": remote.max_skills,
+                    "maxAgents": remote.max_agents,
+                    "maxPlugins": remote.max_plugins,
+                    "maxConnections": remote.max_connections,
+                    "maxConcurrentRuns": remote.max_concurrent_runs,
+                });
+                if remote != local {
+                    drift.push(json!({
+                        "kind": "quota.mismatch",
+                        "tenantId": tenant_id,
+                        "sqlite": local,
+                        "postgres": remote,
+                    }));
+                }
+            }
+        }
+    }
+
+    // Members: existence plus the fields that drive authorization.
+    let remote_members = store.list_members(None).await?;
+    let remote_member_index = remote_members
+        .iter()
+        .map(|member| (member.id.as_str(), member))
+        .collect::<std::collections::HashMap<_, _>>();
+    let local_members =
+        sqlx::query("SELECT id, tenant_id, subject, role, status, email FROM enterprise_members")
+            .fetch_all(&sqlite)
+            .await?;
+    let mut local_member_ids = std::collections::HashSet::new();
+    for row in &local_members {
+        let id: String = row.get("id");
+        let role: String = row.get("role");
+        let status: String = row.get("status");
+        local_member_ids.insert(id.clone());
+        match remote_member_index.get(id.as_str()) {
+            None => drift.push(json!({"kind": "member.missingInPostgres", "id": id})),
+            Some(remote) => {
+                if remote.role != role || remote.status != status {
+                    drift.push(json!({
+                        "kind": "member.attrMismatch",
+                        "id": id,
+                        "sqlite": {"role": role, "status": status},
+                        "postgres": {"role": remote.role, "status": remote.status},
+                    }));
+                }
+            }
+        }
+    }
+    for member in &remote_members {
+        if !local_member_ids.contains(&member.id) {
+            drift.push(json!({"kind": "member.extraInPostgres", "id": member.id}));
+        }
+    }
+
+    let total = drift.len();
+    sqlite.close().await;
+    Ok(json!({
+        "database": "postgresql",
+        "counts": {
+            "tenants": {"sqlite": local_tenants.len(), "postgres": remote_tenants.len()},
+            "quotas": {"sqlite": local_quotas.len()},
+            "members": {"sqlite": local_members.len(), "postgres": remote_members.len()},
+        },
+        "drift": {"total": total, "items": drift},
+    }))
 }
 
 async fn enterprise_command(

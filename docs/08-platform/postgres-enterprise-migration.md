@@ -68,7 +68,7 @@
 2. ~~**配额权威翻转**~~（已完成）：`PUT /quotas` 先写 PostgreSQL（失败即请求失败），SQLite 降级为本地缓存并允许 upsert（不再要求本机已有租户行）；读取仍以 PG 优先。回退读取路径保留到第 5 步统一切除。
 3. **成员与 SCIM**：`scim.rs` 的 12 处成员查询、Group 映射、`browser_auth::find_member` 一起切；SCIM E2E 必须在 PG 模式下重跑（`pnpm test:scim-e2e`）。
 4. ~~**浏览器会话**~~（已完成）：`hpa_control.sessions` 承接读取、创建、`last_seen` 触碰、refresh 轮换（保留 token_hash + version 双重围栏）、登出、按 id/租户吊销；SQLite 只在 PG 无该行时作为升级窗口回退。**OAuth AS 状态**（`oauth_clients/codes/tokens/consents/signing_keys`）仍未迁移，那是第 4 步剩下的部分。
-5. **停止双写**：删除 SQLite 控制面写入与 `sync_postgres_control`，`enterprise_*` 表只作为历史备份保留。
+5. **停止双写**：删除 SQLite 控制面写入与 `sync_postgres_control`，`enterprise_*` 表只作为历史备份保留。关闭前先用 `hpa db verify-mirror` 确认零漂移（见下节）。
 
 ### 3.4 会话（已完成）
 
@@ -110,6 +110,26 @@
 ### 4.2 周期镜像
 
 `HPA_CONTROL_SYNC_INTERVAL_MS`（默认 `30000`）控制后台对账间隔。测试 `postgres_control_refresh` 用 100ms 间隔启动节点，通过 `/scim/v2/Users` 创建成员（只写 SQLite），断言该成员在不重启的前提下出现在 `hpa_control.members`。
+
+## 4.3 漂移检查
+
+```bash
+HPA_POSTGRES_URL=postgresql://user@host:5432/db \
+  hpa --data-dir <data-dir> db verify-mirror
+```
+
+比较 SQLite 控制面与 PostgreSQL 镜像，输出 `counts` 与 `drift.items`：
+
+| 漂移类型 | 含义 |
+| --- | --- |
+| `tenant.missingInPostgres` / `tenant.statusMismatch` | 租户未镜像或状态不一致 |
+| `quota.missingInPostgres` / `quota.mismatch` | 配额缺失或字段不一致 |
+| `member.missingInPostgres` / `member.attrMismatch` | 成员缺失，或 `role`/`status` 不一致 |
+| `*.extraInPostgres` | 镜像里存在 SQLite 已删除的行（例如 SCIM 删除尚未收敛） |
+
+存在漂移时命令以非零退出码结束，便于放进发布门禁。`postgres_mirror_verify` 覆盖：一致时为零、直接改 SQLite 后报 `member.attrMismatch`、周期镜像修复后回到零。
+
+**用途**：这是第 5 步「停止双写」的前置条件——没有零漂移就不该关掉 SQLite 写入。
 
 ## 5. 验证
 
