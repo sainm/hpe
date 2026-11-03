@@ -49,7 +49,7 @@ HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db \
 - 终态会话拒绝迟到的 fenced 写入。
 - 两节点 SQLite Agent 表保持 0 行。
 
-门禁：全量 Rust 239 passed / 1 ignored；真实 PostgreSQL 18.4 上 29 个 PG 集成测试文件（30 用例）通过；PostgreSQL 备份演练恢复 20 个 migration、69 个业务关系与 40 张 `hpa_tenant` + 26 张 `hpa_control` FORCE RLS 表一致；Web typecheck、11 Vitest 与 build 通过；扩展 63 Vitest、7 个 Extension Host 检查通过；品牌/IR/契约/文档（172 文件 856 链接）/镜像/OTel/供应链门禁通过。
+门禁：当前全量 Rust/Web/Extension/PostgreSQL 结果以 [Phase 13–18 状态台账](../10-quality/phase-13-18-status.md) 为准；PostgreSQL 备份演练覆盖 21 个 migration 与 42 张 `hpa_tenant` + 26 张 `hpa_control` FORCE RLS 表。
 
 ## 5. 非目标
 

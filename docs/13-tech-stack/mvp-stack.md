@@ -120,7 +120,7 @@
 - MRTR 审批闭环（API/Web）：input_required → 本地审批 → 重试执行；参数哈希绑定、TTL、一次性消费。
 - MCP Client 对 stdio/HTTP 外部服务器探测并完成只读调用；SSRF/metadata 地址拒绝。
 - Claude Code `claude mcp list` 连接并完成 initialize/tools/list；Codex 官方配置通过 `codex debug prompt-input` 连接并发现工具。
-- 全量回归通过（66 passed，1 ignored）。
+- 全量回归通过；具体计数以当前测试输出与 [Phase 13–18 状态台账](../10-quality/phase-13-18-status.md) 为准。
 
 ## 3d. Phase 4 本地 Agent Platform
 

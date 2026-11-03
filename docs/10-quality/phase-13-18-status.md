@@ -2,21 +2,22 @@
 
 > 目的：把「文档声称」「代码事实」「本机可复现证据」放在同一张表里。触发这份表的是「测试计数照抄旧值」——阶段文档里的 23x passed 是当时的快照，既没写跳过项也没写沙箱限制。表里的状态一律以本机实测为准。
 >
-> 最近核对于 **2026-11-03 22:15**，代码 `53d34a4`，PostgreSQL 18.4，macOS。
+> 最近核对于 **2026-11-04**，代码 `693d3a4` 加执行控制工作树，PostgreSQL 18.4，macOS。
 
 ## 0. 一句话结论
 
 - 控制面元数据在 `HPA_POSTGRES_RUNTIME=1` 下**基本全部**以 PostgreSQL 为权威；SQLite 退化为单节点模式或可重建缓存。
-- 本机可复现的自动化证据：
-  - 默认（沙箱按平台策略启用）：Rust 全量 **225 passed / 14 failed / 1 ignored**，PostgreSQL 隔离 **28 / 29**。
-  - 设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1`（受限环境专用）：**235 passed / 4 failed / 1 ignored**，PostgreSQL 隔离 **29 / 29**；4 个失败是 `runner.rs` 里**要求沙箱生效**的用例，在降级模式下按设计失败。
+- 本机 2026-11-04 可复现的自动化证据：
+  - Rust 全量：所有非 ignored 用例通过，1 ignored；当前 shell 的 seatbelt 用例实际通过，没有沙箱降级。
+  - PostgreSQL 隔离：**29 / 29 文件通过（30 个用例）**。
+  - PostgreSQL 备份：21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致。
 - 仍需外部环境的只有四类：真实 AI 客户端、企业 IdP/CA/Vault、生产 Collector/HA、**跨版本**多节点滚动升级（同版本重启已由 `pnpm test:rolling` 覆盖）。
 
 ## 1. 逐阶段台账
 
 | 阶段 | 能力 | 代码位置 | 自动化证据 | 本机状态 |
 | --- | --- | --- | --- | --- |
-| P13-01 | 租户/配额/成员/SCIM 权威；令牌与审计权威；浏览器会话；OAuth AS | `enterprise.rs`、`scim.rs`、`browser_auth.rs`、`oauth.rs`、`postgres_control.rs` | `postgres_member_authority`、`postgres_scim_cross_node`、`postgres_token_store`、`postgres_session_store`、`postgres_oauth_cross_node`、`postgres_control_mirror`、`postgres_mirror_verify`、`postgres_control_refresh` | 全绿 |
+| P13-01 | 租户/配额/成员/SCIM 权威；令牌与审计权威；浏览器会话；OAuth AS；执行幂等与协作取消状态 | `enterprise.rs`、`scim.rs`、`browser_auth.rs`、`oauth.rs`、`postgres_control.rs`、`postgres_execution.rs` | `postgres_member_authority`、`postgres_scim_cross_node`、`postgres_token_store`、`postgres_session_store`、`postgres_oauth_cross_node`、`postgres_execution_store`、`postgres_runtime`、`postgres_control_mirror`、`postgres_mirror_verify`、`postgres_control_refresh` | 全绿 |
 | P13-02 | outbox、调度器 leader 选举、执行租约与恢复、Worker 租约 | `distributed_runtime.rs`、`postgres_execution.rs`、`postgres_worker.rs` | `postgres_distributed`、`postgres_event_bus`、`postgres_scheduler_leader`、`postgres_execution_lease`、`postgres_execution_recovery`、`postgres_atomic_execution_fire`、`postgres_runtime`、`postgres_worker_daemon`、`postgres_worker_registry` | 全绿 |
 | P13-03 | 持久 MCP session/subscription/task | `persistent_mcp.rs` | `postgres_mcp`、`mcp_multinode` | 全绿 |
 | P13-04 | 可选 Python Agent Worker、LiteLLM 网关 | `services/ai-worker`、`ai_worker_client.rs` | `ai_worker_process`（需 `HPA_AI_WORKER_BIN`）、Python 17 passed / 2 skipped + ruff + mypy | 设置 `HPA_AI_WORKER_BIN=services/ai-worker/.venv/bin/hpa-ai-worker` 后实跑通过（2.70s）；未设置时静默跳过。真实云模型 `BLOCKED_EXTERNAL` |
@@ -24,7 +25,7 @@
 | P13-06 | 企业认证、SCIM、租户暂停、遗留 SSO | `enterprise.rs`、`browser_auth.rs`、`oidc_verify.rs` | `enterprise`、`enterprise_ops`、`browser_sso`、`postgres_scim_cross_node` | 全绿（真实企业 IdP/CA/Vault `BLOCKED_EXTERNAL`） |
 | P13-07 | OTLP traces/metrics/logs、跨进程传播 | `telemetry.rs`、`services/ai-worker` | `otel`（2 用例）、`otel_metrics_logs`、`otel_cross_process`（需 `HPA_AI_WORKER_BIN`）、`check:otel` | `otel`/`otel_metrics_logs` 无需变量实跑通过；`otel_cross_process` 设置变量后 0.86s 实跑通过。生产 Collector/HA `BLOCKED_EXTERNAL` |
 | P13-08 | 发布产物、checksums、回滚手册 | `scripts/release-pack.mjs`、`scripts/release-verify.mjs`、`docs/10-quality/release-checklist.md` | `release:pack` + `release:verify`（`hpa doctor` 冒烟） | 打包链路完成；真实客户端验收 `BLOCKED_EXTERNAL` |
-| P14 | Skill 包/版本/文件/运行元数据权威 | `postgres_skill.rs` | `postgres_skill_cross_node` | 默认失败（技能测试执行 `scripts/audit.py`，本机禁止 `sandbox-exec`）；设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 后**通过**（运行结果记为 `sandbox=process`） |
+| P14 | Skill 包/版本/文件/运行元数据权威 | `postgres_skill.rs` | `postgres_skill_cross_node` | 全绿（当前 shell 的 seatbelt 用例通过） |
 | P15 | MCP 控制面（PAT/审批/审计/外部服务器） | `postgres_mcp_meta.rs` | `postgres_mcp_meta_cross_node` | 全绿 |
 | P16 | Connector 定义/连接/审计 | `postgres_connector.rs` | `postgres_connector_cross_node` | 全绿 |
 | P17 | Plugin 生命周期/Marketplace/信任元数据 | `postgres_plugin.rs` | `postgres_plugin_cross_node` | 全绿（包文件与签名私钥仍节点本地） |
@@ -32,7 +33,7 @@
 
 ## 2. 本机失败清单
 
-### 2.1 默认模式（沙箱启用）
+### 2.1 沙箱受限环境（历史记录）
 
 | 位置 | 数量 | 原因 |
 | --- | --- | --- |
@@ -50,7 +51,7 @@
 
 其余 10 个用例在该模式下转为通过（含 `postgres_skill_cross_node`、bin 的 mcp/skills、`agents`、`mcp_http`、`mcp_stdio`）。
 
-**解释**：两组数字不能互相替代。默认模式证明「隔离策略按平台生效」；降级模式证明「功能链路在受限环境可跑」。发布证据应以默认模式为准，降级模式只用于补齐功能覆盖。
+**解释**：两组历史数字不能互相替代。当前 2026-11-04 shell 不再受嵌套 seatbelt 限制，全量非 ignored 测试通过；其他 CI/容器若禁止嵌套沙箱，仍需按上表区分平台限制和功能缺陷。
 
 ### 2.3 已知偶发
 
@@ -87,11 +88,10 @@
 
 `phase-14` … `phase-18` 每篇结尾都有一段「全量 Rust 23x passed / 1 ignored」的门禁记录。那是**该阶段完成当时的快照**，且只统计了通过数、没写同一环境下被跳过的用例和沙箱限制。以本表为准：
 
-- 默认模式：225 passed / 14 failed / 1 ignored（14 个为沙箱限制）
-- 降级模式：235 passed / 4 failed / 1 ignored
-- PostgreSQL：默认 28/29，降级 29/29
+- 2026-11-04 当前 shell：全部非 ignored 测试通过，1 ignored
+- PostgreSQL：29/29 文件，30/30 用例
 
-另外「66 张 FORCE RLS 表」指的是 **40 张 `hpa_tenant` + 26 张 `hpa_control`**，不是 66 张租户表；`hpa doctor` 现在按 schema 分开报告。
+另外「68 张 FORCE RLS 表」指的是 **42 张 `hpa_tenant` + 26 张 `hpa_control`**，不是 68 张租户业务表；`hpa doctor` 按 schema 分开报告。
 
 ## 2.5 滚动重启演练
 
@@ -103,8 +103,10 @@
 
 | 能力 | 实现 | 证据 |
 | --- | --- | --- |
-| 并发迁移序列化 | `db migrate` 在整个窗口持有 `pg_advisory_lock` | 三进程并发：`applied` = `[0, 0, 20]`，迁移表 20 行；CI 有对应步骤 |
+| 并发迁移序列化 | `db migrate` 在整个窗口持有 `pg_advisory_lock` | 三进程并发：`applied` = `[0, 0, 21]`，迁移表 21 行；CI 有对应步骤 |
 | 启动连接重试 | `HPA_POSTGRES_CONNECT_RETRIES` / `HPA_POSTGRES_CONNECT_TIMEOUT_SECS` | 指向空端口时输出 `cannot connect to PostgreSQL after N attempt(s): …`（默认 ~26s，可调） |
+| 执行幂等 | `execution_idempotency` + `Idempotency-Key` | 相同 key/hash 返回原 execution；不同内容 fail-closed；SQLite 与临时 PostgreSQL 均实跑 |
+| 协作取消 | `execution_cancel_requests` + owner step 边界检查 | RUNNING 请求先持久化，执行 owner 或恢复节点在当前步骤结束后写 `execution.cancelled` |
 
 - **只读副本**：`HPA_POSTGRES_REPLICA_URL` 让控制台列表/计数走副本，副本不可用自动回退主库（2 秒探测 + 运行期 warn）。
 - **本机主备演练**：`pnpm test:ha` 用两个真实集群验证「读走副本 → 复制延迟 → 副本故障回退 → 主库宕机提升备库后继续读写」。

@@ -78,6 +78,7 @@ describe("extension manifest", () => {
         "hpa.runtime.refresh",
         "hpa.runtime.connect",
         "hpa.workflow.run",
+        "hpa.execution.retry",
         "hpa.skill.install",
         "hpa.mcp.register",
         "hpa.marketplace.manage",

@@ -1169,12 +1169,19 @@ impl EnterpriseState {
         tenant_id: &str,
         method: &str,
         path: &str,
+        idempotency_key: Option<&str>,
     ) -> Result<(), ApiError> {
         if !matches!(method, "POST" | "PUT") {
             return Ok(());
         }
         let quota = self.quota(tenant_id).await?;
         let db = &entry.state.db;
+        if is_execution_create_request(method, path)
+            && let Some(idempotency_key) = idempotency_key
+            && db.execution_idempotency_exists(idempotency_key).await?
+        {
+            return Ok(());
+        }
         let (label, count, limit) = if method == "POST" && path == "/workflows" {
             ("workflows", db.workflow_count().await?, quota.max_workflows)
         } else if method == "POST" && path == "/skills/import" {
@@ -1197,7 +1204,7 @@ impl EnterpriseState {
                 count_query(db, "SELECT COUNT(*) FROM connections").await?,
                 quota.max_connections,
             )
-        } else if method == "POST" && path.ends_with("/executions") {
+        } else if is_execution_create_request(method, path) {
             (
                 "executionsToday",
                 db.execution_count_since(&today_prefix()).await?,
@@ -1230,7 +1237,7 @@ impl EnterpriseState {
                 format!("tenant quota `{label}` exceeded ({count}/{limit})"),
             ));
         }
-        if method == "POST" && path.ends_with("/executions") {
+        if is_execution_create_request(method, path) {
             let running = db.active_execution_count().await?;
             if running >= quota.max_concurrent_runs {
                 return Err(ApiError::new(
@@ -4213,7 +4220,15 @@ async fn tenant_gate(
         Ok(entry) => entry,
         Err(error) => return error.into_response(),
     };
-    if let Err(error) = state.check_quota(&entry, &tenant_id, &method, &path).await {
+    let request_idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Err(error) = state
+        .check_quota(&entry, &tenant_id, &method, &path, request_idempotency_key)
+        .await
+    {
         return error.into_response();
     }
     if method != "GET" {
@@ -4260,6 +4275,7 @@ fn required_action(method: &str, path: &str) -> &'static str {
         return "approve";
     }
     let execute = path.starts_with("/workflows/") && path.ends_with("/executions")
+        || path.starts_with("/executions/") && path.ends_with("/retry")
         || path.starts_with("/executions/") && path.ends_with("/cancel")
         || path.starts_with("/agents/") && path.ends_with("/run")
         || path.starts_with("/agents/sessions/")
@@ -4268,6 +4284,10 @@ fn required_action(method: &str, path: &str) -> &'static str {
         return "execute";
     }
     "write"
+}
+
+fn is_execution_create_request(method: &str, path: &str) -> bool {
+    method == "POST" && (path.ends_with("/executions") || path.ends_with("/retry"))
 }
 
 fn role_allows(role: &str, action: &str) -> bool {
@@ -4766,4 +4786,37 @@ fn csv(value: &Value) -> String {
         text
     };
     format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_execution_create_request, required_action, role_allows};
+
+    #[test]
+    fn retry_requires_execute_permission() {
+        let action = required_action("POST", "/executions/exec_123/retry");
+        assert_eq!(action, "execute");
+        assert!(role_allows("operator", action));
+        assert!(!role_allows("viewer", action));
+        assert!(is_execution_create_request(
+            "POST",
+            "/executions/exec_123/retry"
+        ));
+        assert!(is_execution_create_request(
+            "POST",
+            "/workflows/wf_123/executions"
+        ));
+    }
+
+    #[test]
+    fn cancel_and_approval_keep_distinct_permissions() {
+        assert_eq!(
+            required_action("POST", "/executions/exec_123/cancel"),
+            "execute"
+        );
+        assert_eq!(
+            required_action("POST", "/executions/exec_123/approvals"),
+            "approve"
+        );
+    }
 }

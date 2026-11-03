@@ -769,6 +769,11 @@ export const api = {
         body: JSON.stringify({ nodeId, decision, form }),
       },
     ),
+  retryExecution: (executionId: string) =>
+    request<ExecutionDetail>(
+      `/executions/${encodeURIComponent(executionId)}/retry`,
+      { method: "POST" },
+    ),
   cancelExecution: (executionId: string) =>
     request<ExecutionDetail>(
       `/executions/${encodeURIComponent(executionId)}/cancel`,

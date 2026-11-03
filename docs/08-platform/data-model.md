@@ -163,6 +163,23 @@ CREATE UNIQUE INDEX ux_exec_idem
   ON executions (tenant_id, workflow_version_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 
+CREATE TABLE execution_idempotency (
+  tenant_id text NOT NULL,
+  idempotency_key text NOT NULL,
+  request_hash text NOT NULL,
+  execution_id uuid NOT NULL,
+  created_at timestamptz NOT NULL,
+  PRIMARY KEY (tenant_id, idempotency_key),
+  UNIQUE (tenant_id, execution_id)
+);
+
+CREATE TABLE execution_cancel_requests (
+  tenant_id text NOT NULL,
+  execution_id uuid NOT NULL,
+  requested_at timestamptz NOT NULL,
+  PRIMARY KEY (tenant_id, execution_id)
+);
+
 CREATE TABLE execution_events (
   id uuid PRIMARY KEY,
   execution_id uuid NOT NULL REFERENCES executions(id),
@@ -178,6 +195,7 @@ CREATE TABLE execution_events (
 
 - 事件只 INSERT；大对象引用 Artifact。
 - `sequence` 每执行单调；消费者幂等。
+- 当前本地实现把启动/重试幂等映射存入 `execution_idempotency`，与 execution+start event 同事务；运行中取消先写 `execution_cancel_requests`，由 execution owner 在步骤边界协作停止。
 - `NodeExecution` 每次 attempt 一行；不覆盖历史。
 - 索引：`(tenant_id, status, started_at desc)`、`(execution_id, sequence)`。
 

@@ -113,7 +113,7 @@ async fn postgres_migrations_enforce_forced_rls_and_role_boundaries() {
     .fetch_all(&pool)
     .await
     .expect("inspect RLS metadata");
-    assert_eq!(rls_tables.len(), 66, "unexpected tenant table count");
+    assert_eq!(rls_tables.len(), 68, "unexpected tenant table count");
     for row in rls_tables {
         let schema: String = row.get("nspname");
         let table: String = row.get("relname");

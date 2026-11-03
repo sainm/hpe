@@ -24,6 +24,7 @@ use hpa_core::{registry, validator};
 use hpa_skill::{SkillError, SkillManifest, runtime_versions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
@@ -100,6 +101,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/executions/{id}/events", get(list_events))
         .route("/executions/{id}/events/stream", get(stream_events))
         .route("/executions/{id}/approvals", post(decide_approval))
+        .route("/executions/{id}/retry", post(retry_execution))
         .route("/executions/{id}/cancel", post(cancel))
         .route("/approvals", get(list_approvals))
         .route("/artifacts", get(list_artifacts))
@@ -353,6 +355,10 @@ impl From<DbError> for ApiError {
                 format!(
                     "agent `{agent_id}` version `{version}` is already stored with different content; bump the version"
                 ),
+            ),
+            DbError::IdempotencyConflict { key } => Self::conflict(
+                "IDEMPOTENCY_CONFLICT",
+                format!("idempotency key `{key}` was reused with a different request"),
             ),
             other => Self::internal(other.to_string()),
         }
@@ -861,9 +867,34 @@ struct ExecuteRequest {
     version: Option<String>,
 }
 
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value
+        .to_str()
+        .map_err(|_| ApiError::bad_request("IDEMPOTENCY_KEY_INVALID", "invalid idempotency key"))?
+        .trim();
+    if key.is_empty() || key.len() > 255 {
+        return Err(ApiError::bad_request(
+            "IDEMPOTENCY_KEY_INVALID",
+            "idempotency key must be between 1 and 255 bytes",
+        ));
+    }
+    Ok(Some(key.to_string()))
+}
+
+fn request_hash(value: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).unwrap_or_default())
+    )
+}
+
 async fn start_execution(
     State(state): State<ApiState>,
     Path(workflow_id): Path<String>,
+    headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecutionDetail>, ApiError> {
     let (workflow, frozen_registry) = if let Some(version) = request.version.as_deref() {
@@ -894,7 +925,18 @@ async fn start_execution(
         .with_details(serde_json::to_value(issues).unwrap_or(Value::Null))
     })?;
     let execution_id = format!("exec_{}", Uuid::now_v7());
+    let input = request.input.unwrap_or_else(|| json!({}));
     let env = request.env.unwrap_or_default();
+    let request_idempotency_key = idempotency_key(&headers)?;
+    let request_hash = request_idempotency_key.as_ref().map(|_| {
+        request_hash(&json!({
+            "operation": "startExecution",
+            "workflowId": workflow_id,
+            "version": request.version.as_deref(),
+            "input": &input,
+            "env": &env,
+        }))
+    });
     if request
         .tenant_id
         .as_deref()
@@ -910,7 +952,7 @@ async fn start_execution(
         &workflow,
         &compilation.plan,
         &execution_id,
-        request.input.unwrap_or(json!({})),
+        input,
         env,
         tenant_id,
     )
@@ -935,7 +977,106 @@ async fn start_execution(
         started_at: execution.started_at.clone(),
         updated_at: execution.updated_at.clone(),
     };
-    state.db.insert_execution(&execution_row, &event).await?;
+    if let (Some(key), Some(hash)) = (&request_idempotency_key, &request_hash) {
+        if let Some(row) = state
+            .db
+            .insert_execution_idempotent(&execution_row, &event, key, hash)
+            .await?
+        {
+            let previous = parse_state(&row)?;
+            return Ok(Json(ExecutionDetail {
+                summary: ExecutionSummary::from_state(&previous),
+                state: previous,
+            }));
+        }
+    } else {
+        state.db.insert_execution(&execution_row, &event).await?;
+    }
+    state.runtime.trigger(execution_id);
+    Ok(Json(ExecutionDetail {
+        summary: ExecutionSummary::from_state(&execution),
+        state: execution,
+    }))
+}
+
+/// Re-runs an execution from the snapshot and input it originally used, so a
+/// retry reproduces the same IR even if the workflow has been edited since.
+async fn retry_execution(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<ExecutionDetail>, ApiError> {
+    let row = state
+        .db
+        .get_execution(&id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("execution `{id}` not found")))?;
+    let previous = parse_state(&row)?;
+    if !previous.status.is_terminal() {
+        return Err(ApiError::conflict(
+            "RETRY_NOT_TERMINAL",
+            "only a finished execution can be retried",
+        ));
+    }
+    let workflow: Workflow = serde_json::from_str(&row.workflow_json)?;
+    let compilation = compile_workflow(&workflow).map_err(|issues| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+            "workflow snapshot does not compile",
+        )
+        .with_details(serde_json::to_value(issues).unwrap_or(Value::Null))
+    })?;
+    let execution_id = format!("exec_{}", Uuid::now_v7());
+    let request_idempotency_key = idempotency_key(&headers)?;
+    let request_hash = request_idempotency_key.as_ref().map(|_| {
+        request_hash(&json!({
+            "operation": "retryExecution",
+            "sourceExecutionId": id,
+            "workflowId": &previous.workflow_id,
+            "workflowVersion": &previous.workflow_version,
+            "input": &previous.input,
+            "env": &previous.env,
+        }))
+    });
+    let mut execution = new_state(
+        &workflow,
+        &compilation.plan,
+        &execution_id,
+        previous.input.clone(),
+        previous.env.clone(),
+        state.tenant_id.clone(),
+    )
+    .map_err(|error| ApiError::bad_request("INPUT_INVALID", error.to_string()))?;
+    execution.registry_version = previous.registry_version.clone();
+    let event = start_event(&mut execution);
+    let execution_row = ExecutionRow {
+        id: execution.id.clone(),
+        workflow_id: execution.workflow_id.clone(),
+        workflow_version: execution.workflow_version.clone(),
+        status: "running".to_string(),
+        state_json: serde_json::to_string(&execution)?,
+        workflow_json: row.workflow_json.clone(),
+        output_json: None,
+        error_json: None,
+        started_at: execution.started_at.clone(),
+        updated_at: execution.updated_at.clone(),
+    };
+    if let (Some(key), Some(hash)) = (&request_idempotency_key, &request_hash) {
+        if let Some(row) = state
+            .db
+            .insert_execution_idempotent(&execution_row, &event, key, hash)
+            .await?
+        {
+            let previous = parse_state(&row)?;
+            return Ok(Json(ExecutionDetail {
+                summary: ExecutionSummary::from_state(&previous),
+                state: previous,
+            }));
+        }
+    } else {
+        state.db.insert_execution(&execution_row, &event).await?;
+    }
     state.runtime.trigger(execution_id);
     Ok(Json(ExecutionDetail {
         summary: ExecutionSummary::from_state(&execution),
@@ -1085,6 +1226,75 @@ struct ApprovalDecision {
     form: Option<Value>,
 }
 
+async fn replay_approval_decision(
+    state: &ApiState,
+    row: &ExecutionRow,
+    execution: &ExecutionState,
+    node_id: &str,
+    decision: &str,
+) -> Result<Option<ExecutionDetail>, ApiError> {
+    if execution.status == ExecutionStatus::WaitingApproval {
+        return Ok(None);
+    }
+    let decided = execution.node_outputs.get(node_id).and_then(|output| {
+        let object = output.as_object()?;
+        if object.get("timedOut").and_then(Value::as_bool) == Some(true) {
+            return Some("approval.timeout");
+        }
+        match object.get("decision").and_then(Value::as_str) {
+            Some("approved") => Some("approval.approved"),
+            Some("rejected") => Some("approval.rejected"),
+            _ => None,
+        }
+    });
+    let actual = match decided {
+        Some(actual) => Some(actual),
+        None => {
+            let events = state.db.list_events(&execution.id, -1, 1_000).await?;
+            events
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.node_id.as_deref() == Some(node_id)
+                        && matches!(
+                            event.kind.as_str(),
+                            "approval.approved" | "approval.rejected" | "approval.timeout"
+                        )
+                })
+                .map(|event| match event.kind.as_str() {
+                    "approval.approved" => "approval.approved",
+                    "approval.rejected" => "approval.rejected",
+                    _ => "approval.timeout",
+                })
+        }
+    };
+    let Some(actual) = actual else {
+        return Ok(None);
+    };
+    let expected = match decision {
+        "approved" => "approval.approved",
+        "rejected" => "approval.rejected",
+        "timeout" => "approval.timeout",
+        _ => {
+            return Err(ApiError::bad_request(
+                "APPROVAL_DECISION",
+                "decision must be approved, rejected or timeout",
+            ));
+        }
+    };
+    if actual != expected {
+        return Err(ApiError::conflict(
+            "APPROVAL_ALREADY_DECIDED",
+            format!("approval `{node_id}` was already decided as `{actual}`"),
+        ));
+    }
+    let existing = parse_state(row)?;
+    Ok(Some(ExecutionDetail {
+        summary: ExecutionSummary::from_state(&existing),
+        state: existing,
+    }))
+}
+
 async fn decide_approval(
     State(state): State<ApiState>,
     Path(id): Path<String>,
@@ -1096,6 +1306,17 @@ async fn decide_approval(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("execution `{id}` not found")))?;
     let mut execution = parse_state(&row)?;
+    if let Some(detail) = replay_approval_decision(
+        &state,
+        &row,
+        &execution,
+        &request.node_id,
+        &request.decision,
+    )
+    .await?
+    {
+        return Ok(Json(detail));
+    }
     let workflow: Workflow = serde_json::from_str(&row.workflow_json)?;
     let compilation = compile_workflow(&workflow).map_err(|issues| {
         ApiError::internal(format!(
@@ -1111,7 +1332,23 @@ async fn decide_approval(
         request.form.unwrap_or(json!({})),
     )
     .map_err(|error| ApiError::conflict("APPROVAL_FAILED", error.to_string()))?;
-    state.db.save_execution(&execution, &events).await?;
+    if let Err(error) = state.db.save_execution(&execution, &events).await {
+        if let Some(latest) = state.db.get_execution(&id).await? {
+            let latest_state = parse_state(&latest)?;
+            if let Some(replay) = replay_approval_decision(
+                &state,
+                &latest,
+                &latest_state,
+                &request.node_id,
+                &request.decision,
+            )
+            .await?
+            {
+                return Ok(Json(replay));
+            }
+        }
+        return Err(error.into());
+    }
     let remote = match &state.worker_queue {
         Some(queue) => queue
             .job_for_execution(&id)
@@ -1146,16 +1383,50 @@ async fn cancel(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("execution `{id}` not found")))?;
     let mut execution = parse_state(&row)?;
+    let remote = match &state.worker_queue {
+        Some(queue) => queue
+            .job_for_execution(&id)
+            .await
+            .map_err(worker_api_error)?,
+        None => None,
+    };
     if execution.status == ExecutionStatus::Running {
-        return Err(ApiError::conflict(
-            "CANCEL_RUNNING",
-            "cancel is only supported while waiting for approval in this milestone",
-        ));
+        if let (Some(queue), Some(job)) = (&state.worker_queue, &remote)
+            && !matches!(
+                job.status.as_str(),
+                "succeeded" | "failed" | "cancelled" | "uninstalled"
+            )
+        {
+            queue
+                .cancel_job(&job.tenant_id, &job.id)
+                .await
+                .map_err(worker_api_error)?;
+            return Ok(Json(ExecutionDetail {
+                summary: ExecutionSummary::from_state(&execution),
+                state: execution,
+            }));
+        }
+        if !state
+            .db
+            .request_execution_cancel(&id, &now_rfc3339())
+            .await?
+        {
+            return Err(ApiError::conflict(
+                "CANCEL_STATE",
+                "execution is no longer cancellable",
+            ));
+        }
+        return Ok(Json(ExecutionDetail {
+            summary: ExecutionSummary::from_state(&execution),
+            state: execution,
+        }));
     }
     let events = cancel_execution(&mut execution)
         .map_err(|error| ApiError::conflict("CANCEL_FAILED", error.to_string()))?;
     state.db.save_execution(&execution, &events).await?;
-    if let Some(queue) = &state.worker_queue {
+    if let Some(queue) = &state.worker_queue
+        && remote.is_some()
+    {
         queue
             .cancel_execution_job(&id)
             .await

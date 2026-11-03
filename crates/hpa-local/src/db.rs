@@ -43,6 +43,8 @@ pub enum DbError {
     SkillVersionFrozen { skill_id: String, version: String },
     #[error("agent version `{agent_id}@{version}` is frozen")]
     AgentVersionFrozen { agent_id: String, version: String },
+    #[error("idempotency key `{key}` was reused with a different request")]
+    IdempotencyConflict { key: String },
     #[error("PostgreSQL execution error: {0}")]
     PostgresExecution(String),
     #[error("PostgreSQL trigger error: {0}")]
@@ -906,6 +908,18 @@ const SCHEMA: &[&str] = &[
         updated_at TEXT NOT NULL
     )",
     "CREATE INDEX IF NOT EXISTS idx_executions_workflow ON executions(workflow_id, started_at DESC)",
+    "CREATE TABLE IF NOT EXISTS execution_idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        execution_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (execution_id) REFERENCES executions(id) ON DELETE CASCADE
+    )",
+    "CREATE TABLE IF NOT EXISTS execution_cancel_requests (
+        execution_id TEXT PRIMARY KEY,
+        requested_at TEXT NOT NULL,
+        FOREIGN KEY (execution_id) REFERENCES executions(id) ON DELETE CASCADE
+    )",
     "CREATE TABLE IF NOT EXISTS remote_executions (
         execution_id TEXT PRIMARY KEY,
         worker_id TEXT NOT NULL,
@@ -1401,7 +1415,12 @@ impl Db {
     }
 
     fn map_postgres_execution(error: PostgresExecutionError) -> DbError {
-        DbError::PostgresExecution(error.to_string())
+        match error {
+            PostgresExecutionError::IdempotencyConflict { key } => {
+                DbError::IdempotencyConflict { key }
+            }
+            other => DbError::PostgresExecution(other.to_string()),
+        }
     }
 
     fn map_postgres_trigger(error: PostgresTriggerError) -> DbError {
@@ -1990,6 +2009,181 @@ impl Db {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Inserts an execution and its idempotency mapping atomically.
+    ///
+    /// `Ok(None)` means this request created the execution. `Ok(Some(row))`
+    /// means the same key/hash already completed and the original execution is
+    /// returned. Reusing a key with different request content fails closed.
+    pub async fn insert_execution_idempotent(
+        &self,
+        row: &ExecutionRow,
+        start_event: &ExecutionEvent,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> DbResult<Option<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .insert_execution_idempotent(
+                    &ExecutionRecord::from(row),
+                    start_event,
+                    idempotency_key,
+                    request_hash,
+                )
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_execution);
+        }
+
+        if let Some((existing_hash, execution_id)) = sqlx::query_as::<_, (String, String)>(
+            "SELECT request_hash, execution_id
+             FROM execution_idempotency WHERE idempotency_key = ?",
+        )
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            if existing_hash != request_hash {
+                return Err(DbError::IdempotencyConflict {
+                    key: idempotency_key.to_string(),
+                });
+            }
+            return self.get_execution(&execution_id).await;
+        }
+
+        let event_json = serde_json::to_string(start_event)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO executions (id, workflow_id, workflow_version, status, state_json, workflow_json, output_json, error_json, started_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.workflow_id)
+        .bind(&row.workflow_version)
+        .bind(&row.status)
+        .bind(&row.state_json)
+        .bind(&row.workflow_json)
+        .bind(&row.output_json)
+        .bind(&row.error_json)
+        .bind(&row.started_at)
+        .bind(&row.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO events (execution_id, sequence, payload_json) VALUES (?, ?, ?)")
+            .bind(&start_event.execution_id)
+            .bind(start_event.sequence as i64)
+            .bind(event_json)
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO execution_idempotency
+             (idempotency_key, request_hash, execution_id, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(idempotency_key) DO NOTHING",
+        )
+        .bind(idempotency_key)
+        .bind(request_hash)
+        .bind(&row.id)
+        .bind(&row.started_at)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        tx.rollback().await?;
+
+        let (existing_hash, execution_id): (String, String) = sqlx::query_as(
+            "SELECT request_hash, execution_id
+             FROM execution_idempotency WHERE idempotency_key = ?",
+        )
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await?;
+        if existing_hash != request_hash {
+            return Err(DbError::IdempotencyConflict {
+                key: idempotency_key.to_string(),
+            });
+        }
+        self.get_execution(&execution_id)
+            .await?
+            .map(Some)
+            .ok_or_else(|| DbError::Sqlx(sqlx::Error::RowNotFound))
+    }
+
+    /// Persists a cooperative cancellation request for a running execution.
+    /// The execution owner observes it before its next step or after recovery.
+    pub async fn request_execution_cancel(
+        &self,
+        execution_id: &str,
+        requested_at: &str,
+    ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .request_execution_cancel(execution_id, requested_at)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO execution_cancel_requests (execution_id, requested_at)
+             SELECT id, ? FROM executions
+             WHERE id = ? AND status IN ('running', 'waiting_approval')
+             ON CONFLICT(execution_id) DO NOTHING",
+        )
+        .bind(requested_at)
+        .bind(execution_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted {
+            return Ok(true);
+        }
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM execution_cancel_requests
+             WHERE execution_id = ?)",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
+    pub async fn execution_cancel_requested(&self, execution_id: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .execution_cancel_requested(execution_id)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM execution_cancel_requests
+             WHERE execution_id = ?)",
+        )
+        .bind(execution_id)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
+    }
+
+    pub async fn execution_idempotency_exists(&self, idempotency_key: &str) -> DbResult<bool> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .execution_idempotency_exists(idempotency_key)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM execution_idempotency
+             WHERE idempotency_key = ?)",
+        )
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await?
+            != 0)
     }
 
     pub async fn insert_execution_with_trigger(

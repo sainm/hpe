@@ -7,7 +7,7 @@
 - 默认仍是本地单用户模式：业务 API 无认证，匿名请求映射到内置租户 `local`；控制面在此模式下同样不要求令牌。
 - 设置 `HPA_ENTERPRISE_MODE=1|true|required` 后进入企业模式：除 `/api/health` 外，`/api/*` 需要 `Authorization: Bearer`。
 - 控制面数据在 `<data_dir>/control.db`；租户业务数据在各自的 `hpa.db`。
-- 默认隔离手段是“每租户独立 SQLite 文件 + TenantGate 路由”。设置 `HPA_POSTGRES_RUNTIME=1` 后 execution/event/artifact 使用 PostgreSQL FORCE RLS；其他 Repository 尚未整体切换。
+- 默认隔离手段是“每租户独立 SQLite 文件 + TenantGate 路由”。设置 `HPA_POSTGRES_RUNTIME=1` 后 Workflow/Execution/Trigger、Worker Job、Enterprise、Agent、Skill、MCP、Connector 与 Plugin 元数据使用 PostgreSQL 权威与 FORCE RLS；SQLite 仅作单节点模式或可重建缓存。
 - 角色是固定的 8 个粗粒度角色，权限按 HTTP 动作近似映射；没有资源级 ACL、自定义角色或 ABAC 策略引擎。
 - 单节点运行；没有多节点、HA 或计量计费。浏览器 SSO 由 Phase 9 补齐，出站 Worker 派发由 Phase 8 补齐。
 

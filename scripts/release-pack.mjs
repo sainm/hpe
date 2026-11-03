@@ -14,6 +14,9 @@ import path from "node:path";
 import os from "node:os";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
+const localCargo = path.join(os.homedir(), ".cargo", "bin", "cargo");
+const cargo =
+  process.env.CARGO || (fs.existsSync(localCargo) ? localCargo : "cargo");
 
 function parseArgs(rawArgv) {
   // `pnpm <script> -- --flag` forwards a literal `--`; ignore it.
@@ -104,7 +107,7 @@ const binaryPath = path.join(root, "target", cargoProfileDir, "hpa");
 
 if (options.build) {
   console.log(`building hpa (${options.profile})`);
-  run("cargo", ["build", "-p", "hpa-local", "--profile", options.profile], { capture: false });
+  run(cargo, ["build", "-p", "hpa-local", "--profile", options.profile], { capture: false });
 }
 if (!fs.existsSync(binaryPath)) {
   console.error(`missing binary: ${binaryPath} (run without --skip-build)`);
@@ -125,7 +128,7 @@ const brand = (() => {
   }
 })();
 
-const version = tryRun("cargo", ["metadata", "--no-deps", "--format-version", "1"]);
+const version = tryRun(cargo, ["metadata", "--no-deps", "--format-version", "1"]);
 let packageVersion = "0.1.0";
 try {
   const metadata = JSON.parse(version);

@@ -52,6 +52,7 @@ async fn postgres_execution_store_round_trips_events_and_artifacts() {
         .await
         .expect("insert execution tenant");
     let store = PostgresExecutionStore::new(pool.clone(), &tenant_id);
+    let peer_store = PostgresExecutionStore::new(pool.clone(), &tenant_id);
     let other_store = PostgresExecutionStore::new(pool.clone(), "other-execution-tenant");
 
     let workflow: Workflow =
@@ -70,10 +71,46 @@ async fn postgres_execution_store_round_trips_events_and_artifacts() {
     state.registry_version = "registry-test-v1".to_string();
     let start = make_start_event(&mut state);
     let record = execution_record(&workflow, &state, "1.0.0");
-    store
-        .insert_execution(&record, &start)
-        .await
-        .expect("insert execution");
+    assert!(
+        store
+            .insert_execution_idempotent(&record, &start, "pg-execution-key", "request-hash")
+            .await
+            .expect("insert idempotent execution")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .insert_execution_idempotent(&record, &start, "pg-execution-key", "request-hash")
+            .await
+            .expect("replay idempotent execution")
+            .expect("existing execution")
+            .id,
+        state.id
+    );
+    assert!(matches!(
+        store
+            .insert_execution_idempotent(
+                &record,
+                &start,
+                "pg-execution-key",
+                "different-request-hash"
+            )
+            .await
+            .expect_err("different request hash must conflict"),
+        PostgresExecutionError::IdempotencyConflict { .. }
+    ));
+    assert!(
+        store
+            .execution_idempotency_exists("pg-execution-key")
+            .await
+            .expect("idempotency key exists")
+    );
+    assert!(
+        !other_store
+            .execution_idempotency_exists("pg-execution-key")
+            .await
+            .expect("idempotency key is tenant scoped")
+    );
     let registry_version: String = sqlx::query_scalar(
         "SELECT registry_version FROM hpa_tenant.workflow_versions
          WHERE tenant_id = $1 AND workflow_id = $2 AND version = '1.0.0'",
@@ -166,6 +203,30 @@ async fn postgres_execution_store_round_trips_events_and_artifacts() {
         .mark_remote_execution(&remote_state.id, "worker-postgres")
         .await
         .expect("mark remote execution");
+    assert!(
+        !peer_store
+            .execution_cancel_requested(&remote_state.id)
+            .await
+            .expect("read initial cancel flag")
+    );
+    assert!(
+        peer_store
+            .request_execution_cancel(&remote_state.id, &remote_state.updated_at)
+            .await
+            .expect("request cross-node cancellation")
+    );
+    assert!(
+        store
+            .execution_cancel_requested(&remote_state.id)
+            .await
+            .expect("read cross-node cancel flag")
+    );
+    assert!(
+        !other_store
+            .execution_cancel_requested(&remote_state.id)
+            .await
+            .expect("other tenant cancel flag")
+    );
     assert!(
         store
             .is_remote_execution(&remote_state.id)

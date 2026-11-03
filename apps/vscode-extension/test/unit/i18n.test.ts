@@ -1,3 +1,4 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { I18n, localeFromLanguage, messageKeys, missingKeys, type Locale } from "../../src/i18n";
 
@@ -21,6 +22,23 @@ describe("message catalogs", () => {
   it("treats English as a complete fallback catalog", () => {
     expect(missingKeys("en")).toEqual([]);
     expect(new I18n("en").has("errors.unauthorized")).toBe(true);
+  });
+
+  it("ships every static key used by extension source files", () => {
+    const keys = new Set(messageKeys());
+    const sourceFiles = (directory: URL): string[] =>
+      readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        const child = new URL(`${entry.name}${entry.isDirectory() ? "/" : ""}`, directory);
+        if (entry.isDirectory()) return sourceFiles(child);
+        return /\.(ts|tsx)$/.test(entry.name) && entry.name !== "i18n.ts"
+          ? [readFileSync(child, "utf8")]
+          : [];
+      });
+    for (const source of sourceFiles(new URL("../../src/", import.meta.url))) {
+      for (const match of source.matchAll(/\.t\(\s*["']([^"']+)["']/g)) {
+        expect(keys.has(match[1]!), match[1]).toBe(true);
+      }
+    }
   });
 });
 

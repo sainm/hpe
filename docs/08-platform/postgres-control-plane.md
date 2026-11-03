@@ -14,7 +14,7 @@ Phase 13 的控制面目标是一个 PostgreSQL 数据库，不按租户拆库�
 
 每个 `hpa_tenant` 表同时通过外键引用 `hpa_control.tenants(id)`；子资源还必须使用包含 `tenant_id` 的复合外键，防止伪造租户内父子关系。
 
-当前已覆盖 66 张租户相关表：`hpa_tenant` 40 张，`hpa_control` 中带租户范围的 26 张。`oidc_config`、`oauth_signing_keys` 和全局 `runtime_leases` 不属于租户表，敏感性各不相同，按角色显式授权。
+当前已覆盖 68 张租户相关表：`hpa_tenant` 42 张，`hpa_control` 中带租户范围的 26 张。`oidc_config`、`oauth_signing_keys` 和全局 `runtime_leases` 不属于租户表，敏感性各不相同，按角色显式授权。
 
 ## 2. 角色
 
@@ -54,7 +54,7 @@ cargo run -p hpa-local -- db status
 
 - `hpa db migrate` 在读取 `before`、执行迁移、读取 `after` 的**整个窗口**上持有 `pg_advisory_lock`（固定 key），所以并发运行多个实例时只有一个会 `applied > 0`，其余为 `0`，且 `applied` 数值可信。输出里带 `"lock": "pg_advisory_lock"` 便于确认走的是加锁路径。
 - `hpa serve` 连接 PostgreSQL 时有界重试：`HPA_POSTGRES_CONNECT_RETRIES`（默认 5 次）与 `HPA_POSTGRES_CONNECT_TIMEOUT_SECS`（单次 5 秒）。数据库重启期间控制面会等待并重试，最终失败时输出 `cannot connect to PostgreSQL after N attempt(s): …`，不再只抛 `PoolTimedOut`。
-- 验证：三个进程同时 `db migrate` 于空库 → `applied` 分别为 `[0, 0, 20]`，`_sqlx_migrations` 恰好 20 行；CI 的 `concurrent migrations serialize` 步骤固化这条断言。
+- 验证：三个进程同时 `db migrate` 于空库 → `applied` 分别为 `[0, 0, 21]`，`_sqlx_migrations` 恰好 21 行；CI 的 `concurrent migrations serialize` 步骤固化这条断言。
 
 已发布 migration 不得修改。需要修复时增加新版本；checksum 不一致必须停止发布并由人工恢复正确版本。
 
@@ -166,7 +166,7 @@ cargo test -p hpa-local --test postgres_runtime -- --nocapture
 
 测试覆盖：
 
-- 66 张租户表均 `relrowsecurity=true`、`relforcerowsecurity=true` 且至少有一个 policy。
+- 68 张租户相关表均 `relrowsecurity=true`、`relforcerowsecurity=true` 且至少有一个 policy。
 - Alpha 只能读写 Alpha；Beta 行、跨租户 ID 更新和删除均为 0。
 - 跨租户 INSERT 与未设置租户上下文均 fail-closed。
 - 同一事务切换 `hpa.tenant_id` 只能看到对应租户，验证连接复用不复用旧上下文。
@@ -190,7 +190,7 @@ export HPA_POSTGRES_TEST_URL='postgresql://localhost:5432/hpa_p13_test'
 node scripts/check-postgres-backup.mjs
 ```
 
-脚本拒绝在未带 `test`/`phase13`/`backup` 标记的数据库上演练，使用 `pg_dump` custom format 创建临时备份，恢复到同集群临时库，逐表比较行数、migration checksum 和 66 表 RLS 状态，最后删除临时库。
+脚本拒绝在未带 `test`/`phase13`/`backup` 标记的数据库上演练，使用 `pg_dump` custom format 创建临时备份，恢复到同集群临时库，逐表比较行数、migration checksum 和 68 表 RLS 状态，最后删除临时库。
 
 ## 8. 备份与回滚
 
@@ -206,6 +206,6 @@ Phase 13 基线不提供自动 down migration。企业数据删除不可逆，�
 ## 9. 尚未完成
 
 - Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本/运行、MCP PAT/审批/审计/服务器、Connector 定义/连接/审计与 Plugin/Marketplace 元数据已有显式 PostgreSQL 路由并验证跨节点读取；剩余是真实企业 IdP、HA/read replica 与对象存储等外部验收。
-- SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；插件包文件跨节点同步与真实 HA 演练尚未实现。
+- SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；本机主备 `pnpm test:ha` 已完成，但跨主机网络/VIP、自动故障检测与在线 PITR 仍未验收；插件包文件跨节点同步仍未实现。
 - 对象存储、只读副本、在线 PITR 与真实 HA 演练仍属 P13-02/P13-06；并发迁移锁与连接重试已完成（见 3.1），同版本滚动重启由 `pnpm test:rolling` 覆盖，跨版本升级仍为人工项。
 - 本文件中的 PASS 只适用于 schema/RLS/migration 基线，不适用于完整 P13-01 或 Phase 13。

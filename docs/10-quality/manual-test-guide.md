@@ -88,6 +88,20 @@ HPA_POSTGRES_RUNTIME=1 HPA_ENTERPRISE_MODE=required HPA_NODE_ID=node-b \
 
 ![执行列表](../assets/manual/02-executions.png)
 
+### 路径 C2：重试、幂等与协作取消
+
+1. 运行一条 `succeeded`、`failed` 或 `cancelled` 的 Workflow，打开执行详情，点「重试」。
+2. 观察 URL 切换到一个新的 `exec_...`，新执行从原 Workflow 快照和原输入开始。
+3. 对启动接口连续发送两次带同一 `Idempotency-Key` 和相同 JSON 的请求，应返回同一个 execution；改成不同 input 应返回 `409 IDEMPOTENCY_CONFLICT`。
+4. 运行一个在单步内等待数秒的 Workflow，在状态为 `运行中` 时点「取消」；提示应为“取消请求已接收”，当前步骤结束后状态变为 `已取消`。
+
+```bash
+curl --noproxy '*' -X POST http://127.0.0.1:8787/api/workflows/<workflow-id>/executions \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: manual-run-001' \
+  -d '{"input":{}}'
+```
+
 ### 路径 D：设置页的运行时状态
 
 打开 `/settings`，滚到「运行时状态」。

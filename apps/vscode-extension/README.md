@@ -31,7 +31,7 @@ code --extensionDevelopmentPath=apps/vscode-extension .
 
 ## 命令
 
-`Auralis: Connect Local Runtime`、`Refresh`、`Runtime Status`、`Start Local Runtime`、`Run Workflow`、`Open Execution`、`Cancel Execution`、`Decide Approval`、`Preview Artifact`、`Install Skill`、`Update Skill`、`Remove Skill`、`Register MCP Server`、`Open Web UI`、`Set API Token`、`Clear API Token`、`Open Settings`。
+`Auralis: Connect Local Runtime`、`Refresh`、`Runtime Status`、`Start Local Runtime`、`Run Workflow`、`Open Execution`、`Cancel Execution`、`Retry Execution`、`Decide Approval`、`Preview Artifact`、`Install Skill`、`Update Skill`、`Remove Skill`、`Register MCP Server`、`Open Web UI`、`Set API Token`、`Clear API Token`、`Open Settings`。
 
 ## 设置
 

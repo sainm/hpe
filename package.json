@@ -21,6 +21,7 @@
     "lint": "turbo run lint",
     "test:a11y": "node scripts/check-web-a11y.mjs",
     "test:e2e": "node scripts/run-local-e2e.mjs",
+    "test:approval-branches": "node scripts/approval-branches-e2e.mjs",
     "test:marketplace-ui": "node scripts/phase13-marketplace-ui-e2e.mjs",
     "test:ai-worker-container": "node scripts/phase13-ai-worker-container-smoke.mjs",
     "test:scim-e2e": "node scripts/scim-e2e.mjs",

@@ -16,23 +16,28 @@
 
 ### Added
 
+- Workflow execution controls：终态 `POST /api/executions/{id}/retry` 使用原快照/输入重跑；启动与重试支持 `Idempotency-Key`（SQLite/PostgreSQL 原子映射）；运行中取消通过持久化 `execution_cancel_requests` 协作完成；重复审批决定幂等，相反决定返回 409。
+- Web 与 VS Code 增加执行重试入口；运行中取消会先显示“取消请求已接收”，再由执行 owner 在当前步骤结束后的边界停止。
+- 本地 OpenAPI 现在覆盖 `ApiState::router` 的全部 109 个路径模板及 HTTP 方法；`check:contracts` 增加运行时路由漂移检查。
 - 执行列表服务端分页：`GET /api/executions` 支持 `offset` 与 `status`，`X-Total-Count` 返回过滤后总数；控制台 50 条/页并显示「共 N 条 · 第 X/Y 页」，状态筛选移到服务端（此前只在前 100 条里筛）。
 - 只读副本：`HPA_POSTGRES_REPLICA_URL` 让控制台列表/计数走流复制 standby，写入与强一致读走主库；副本不可用时启动降级、查询回退主库。
 - `pnpm test:ha`：临时目录建真实主备两集群，验证读走副本、复制延迟、副本故障回退、主库宕机后提升备库继续读写。
 - `pnpm test:rolling`：两轮「杀持有待审批执行的节点 → 空 data_dir 起替代节点 → 替代节点批准并跑完」，断言不丢、不重、无偏斜。
-- `hpa doctor` 在配置 `HPA_POSTGRES_URL` 时检查连通性、migration drift、按 schema 拆分的 FORCE RLS 表数（40 租户 + 26 控制面）与插件包缺口（`packagesMissing` + 可执行告警）。
+- `hpa doctor` 在配置 `HPA_POSTGRES_URL` 时检查连通性、migration drift、按 schema 拆分的 FORCE RLS 表数（42 租户 + 26 控制面）与插件包缺口（`packagesMissing` + 可执行告警）。
 - `pnpm test:postgres`：每个 PostgreSQL 测试文件使用独立数据库，消除跨文件配额/会话污染；CI 的 postgres job 与双节点、滚动重启、并发迁移步骤都接到这套脚本上。
 
 ### Fixed
 
-- `db migrate` 原先把 `before`/`after` 计数放在 SQLx 自身锁之外，三进程并发时都报告 `applied: 20`；现在整个窗口持有 `pg_advisory_lock`，实测 `[0,0,20]`。
+- `db migrate` 原先把 `before`/`after` 计数放在 SQLx 自身锁之外，三进程并发时都报告相同非零计数；现在整个窗口持有 `pg_advisory_lock`。
 - `hpa serve` 连接 PostgreSQL 不再直接失败：`HPA_POSTGRES_CONNECT_RETRIES`（默认 5）与 `HPA_POSTGRES_CONNECT_TIMEOUT_SECS`（默认 5s），失败信息为 `cannot connect to PostgreSQL after N attempt(s): …`。
 - CLI 错误不再打印 `Error: CliError("…")`，改为直接输出消息。
 - `postgres_mirror_verify` 在缓存方向反转后存在竞态（100ms 重建期间改 SQLite 可能被覆盖），改为停服改缓存、重启观察修复。
+- `postgres_member_authority` 曾在 100ms 缓存刷新与“SQLite 必须为 0”断言之间竞态；该套件改为验证 PostgreSQL 权威，缓存刷新由 `postgres_control_refresh` 独立覆盖。
 
 ### Tests
 
-- 全量 Rust：默认模式 225 passed / 14 failed / 1 ignored（14 个为本机禁止 `sandbox-exec` 的既有用例：runner 8、bin 3、agents 1、mcp_http 1、mcp_stdio 1）；设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 后 235 passed / 4 failed（4 个是要求沙箱生效的用例，按设计失败）。
-- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**29 / 29 通过**（设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 时；不设置时 28/29，技能用例因沙箱被拦截）。
-- Web：typecheck、11 Vitest、build；扩展：63 Vitest、7 个 Extension Host 检查。
-- 品牌、IR、契约、文档（173 文件 856 链接）、镜像、OTel、供应链门禁通过。
+- 全量 Rust：所有非 ignored 用例通过，1 ignored；Clippy `-D warnings` 与 fmt 通过。
+- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**29 / 29 文件（30 / 30 用例）通过**。
+- PostgreSQL 备份/恢复：21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致。
+- Web：typecheck、12 Vitest、build；扩展：65 Vitest、build。
+- 品牌、IR、契约（含 109 个运行时路由/方法漂移检查）、文档（175 文件 861 链接）、镜像、OTel、供应链门禁通过。

@@ -159,9 +159,9 @@ try {
   if (restoredInventory.rlsWithoutForce !== 0) {
     throw new Error("restored database contains RLS tables without FORCE RLS");
   }
-  if (restoredInventory.rlsTables !== 66) {
+  if (restoredInventory.rlsTables !== 68) {
     throw new Error(
-      `expected 66 FORCE RLS tenant tables, got ${restoredInventory.rlsTables}`,
+      `expected 68 FORCE RLS tenant tables, got ${restoredInventory.rlsTables}`,
     );
   }
   console.log(

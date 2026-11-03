@@ -17,6 +17,7 @@
   "command.workflow.run": "Auralis: 运行工作流",
   "command.execution.open": "Auralis: 打开执行",
   "command.execution.cancel": "Auralis: 取消执行",
+  "command.execution.retry": "Auralis: 重试执行",
   "command.execution.approve": "Auralis: 处理审批",
   "command.artifact.preview": "Auralis: 预览产物",
   "command.skill.install": "Auralis: 安装技能",

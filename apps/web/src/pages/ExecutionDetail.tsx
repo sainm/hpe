@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useParams } from "@tanstack/react-router";
+import { Link, useNavigate, useParams } from "@tanstack/react-router";
 import {
   ArrowLeft,
   ArrowUpRight,
   BadgeCheck,
   Clock3,
   RefreshCw,
+  RotateCcw,
   Timer,
   XCircle,
 } from "lucide-react";
@@ -31,6 +32,7 @@ import { useUiStore } from "../stores/ui";
 export function ExecutionDetailPage() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const params = useParams({ strict: false }) as { executionId?: string };
   const executionId = params.executionId ?? "";
   const pushToast = useUiStore((state) => state.pushToast);
@@ -77,10 +79,28 @@ export function ExecutionDetailPage() {
       pushToast(error instanceof Error ? error.message : t("approvals.error"), "error"),
   });
 
+  const retry = useMutation({
+    mutationFn: () => api.retryExecution(executionId),
+    onSuccess: (detail) => {
+      pushToast(t("executions.retryStarted"), "success");
+      void queryClient.invalidateQueries({ queryKey: ["executions"] });
+      navigate({ to: "/executions/$executionId", params: { executionId: detail.summary.id } });
+    },
+    onError: (error) =>
+      pushToast(error instanceof Error ? error.message : t("errors.unknown"), "error"),
+  });
+
   const cancel = useMutation({
     mutationFn: () => api.cancelExecution(executionId),
-    onSuccess: () => {
-      pushToast(t("status.cancelled"), "info");
+    onSuccess: (detail) => {
+      pushToast(
+        t(
+          detail.summary.status === "running"
+            ? "executions.cancelRequested"
+            : "status.cancelled",
+        ),
+        "info",
+      );
       void queryClient.invalidateQueries({ queryKey: ["execution", executionId] });
       void queryClient.invalidateQueries({ queryKey: ["executions"] });
     },
@@ -127,6 +147,16 @@ export function ExecutionDetailPage() {
             <Button
               variant="secondary"
               size="sm"
+              onClick={() => retry.mutate()}
+              loading={retry.isPending}
+              disabled={!["succeeded", "failed", "cancelled"].includes(summary.status)}
+            >
+              <RotateCcw className="h-3.5 w-3.5" />
+              {t("executions.retry")}
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => {
                 void execution.refetch();
                 void events.refetch();
@@ -135,7 +165,7 @@ export function ExecutionDetailPage() {
               <RefreshCw className="h-3.5 w-3.5" />
               {t("common.refresh")}
             </Button>
-            {summary.status === "waiting_approval" ? (
+            {["running", "waiting_approval"].includes(summary.status) ? (
               <Button
                 variant="danger"
                 size="sm"

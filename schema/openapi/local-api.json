@@ -3,7 +3,7 @@
   "info": {
     "title": "HPA Local API",
     "version": "0.1.0",
-    "description": "Stable local API contract. Product-specific response fields remain documented in docs/08-platform/api-specification.md."
+    "description": "Stable local API contract covering every tenant API route and method registered by ApiState::router. Product-specific response fields remain documented in docs/08-platform/api-specification.md."
   },
   "servers": [
     {
@@ -99,7 +99,10 @@
       }
     },
     "/api/workflows/{id}/executions": {
-      "parameters": [{ "$ref": "#/components/parameters/Id" }],
+      "parameters": [
+        { "$ref": "#/components/parameters/Id" },
+        { "$ref": "#/components/parameters/IdempotencyKey" }
+      ],
       "post": {
         "tags": ["executions"],
         "summary": "Start a workflow execution",
@@ -354,13 +357,6 @@
       "get": {
         "tags": ["plugins"],
         "summary": "List installed plugins",
-        "responses": { "200": { "$ref": "#/components/responses/Json" } }
-      }
-    },
-    "/api/connections": {
-      "get": {
-        "tags": ["plugins"],
-        "summary": "List Connector connections",
         "responses": { "200": { "$ref": "#/components/responses/Json" } }
       }
     },
@@ -823,6 +819,262 @@
         }
       }
     },
+    "/api/openapi.json": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/stats": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/workflows/{id}/versions": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["workflows"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/executions": {
+      "get": {"tags":["executions"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/executions/{id}/approvals": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["executions"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"},"409":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/executions/{id}/retry": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"$ref":"#/components/parameters/IdempotencyKey"}],
+      "post": {"tags":["executions"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"},"409":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/executions/{id}/cancel": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["executions"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"},"409":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/approvals": {
+      "get": {"tags":["executions"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/artifacts": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/artifacts/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/agents/approvals": {
+      "get": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/agents/sessions": {
+      "get": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/agents/sessions/{id}/replay": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/agents/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/agents/{id}/versions/{version}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/agents/{id}/publish": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["agents"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/plugins/key": {
+      "get": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/plugins/keys": {
+      "get": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}},
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/plugins/inspect": {
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/plugins/install": {
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/plugins/sample": {
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/plugins/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/plugins/{id}/versions/{version}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/plugins/{id}/enable": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/plugins/{id}/disable": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/plugins/{id}/rollback": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/plugins/{id}/uninstall": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/marketplace/publish": {
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/marketplace/{id}/versions/{version}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/marketplace/{id}/versions/{version}/review": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/marketplace/{id}/versions/{version}/withdraw": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/marketplace/{id}/versions/{version}/rate": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/marketplace/{id}/versions/{version}/install": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["plugins"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/connectors": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/connectors/sample": {
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/connectors/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/connections": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}},
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/connections/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "delete": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/connections/{id}/test": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/connections/{id}/invoke": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/connector-audit": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skills/runtimes": {
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skills/import": {
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/skills/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skills/{id}/runs": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skills/{id}/versions/{version}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skills/{id}/versions/{version}/publish": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/skills/{id}/versions/{version}/export": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/skills/{id}/versions/{version}/run": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/skills/{id}/versions/{version}/tests": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"version","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/skill-runs/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skill-runs/{id}/artifacts": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/skill-runs/{id}/artifacts/{artifact_id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}},{"name":"artifact_id","in":"path","required":true,"schema":{"type":"string"}}],
+      "get": {"tags":["runtime"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/triggers/{workflow_id}/{trigger_id}/enable": {
+      "parameters": [{"name":"workflow_id","in":"path","required":true,"schema":{"type":"string"}},{"name":"trigger_id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["triggers"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/triggers/{workflow_id}/{trigger_id}/disable": {
+      "parameters": [{"name":"workflow_id","in":"path","required":true,"schema":{"type":"string"}},{"name":"trigger_id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["triggers"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/triggers/{workflow_id}/{trigger_id}/fire": {
+      "parameters": [{"name":"workflow_id","in":"path","required":true,"schema":{"type":"string"}},{"name":"trigger_id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["triggers"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/trigger-fires": {
+      "get": {"tags":["triggers"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/catalog": {
+      "get": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/call": {
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/mcp/resource": {
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/mcp/prompt": {
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/mcp/tokens": {
+      "get": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}},
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/mcp/tokens/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "delete": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/approvals": {
+      "get": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/approvals/{id}/decide": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/mcp/audit": {
+      "get": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/servers": {
+      "get": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}},
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
+    "/api/mcp/servers/{id}": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "delete": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"}}}
+    },
+    "/api/mcp/servers/{id}/probe": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}}}
+    },
+    "/api/mcp/servers/{id}/call": {
+      "parameters": [{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+      "post": {"tags":["mcp"],"summary":"Runtime endpoint","responses":{"200":{"$ref":"#/components/responses/Json"},"400":{"$ref":"#/components/responses/Error"}},"requestBody":{"$ref":"#/components/requestBodies/Json"}}
+    },
     "/api/enterprise/tenants": {
       "get": {
         "tags": ["enterprise"],
@@ -864,6 +1116,13 @@
         "in": "path",
         "required": true,
         "schema": { "type": "string" }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "Replays the original response for the same request content; reuse with different content returns IDEMPOTENCY_CONFLICT.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 255 }
       }
     },
     "requestBodies": {

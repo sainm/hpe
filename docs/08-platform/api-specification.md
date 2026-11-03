@@ -2,7 +2,7 @@
 
 > 风格：REST + JSON + OpenAPI 3.1；执行事件用 SSE；MCP 是独立协议端点，不混入 REST。
 >
-> 当前本地实现使用无版本前缀的 `/api/*`，核心契约在 `schema/openapi/local-api.json` 并由 `/api/openapi.json` 暴露；下文 `/api/v1` 是目标云契约。
+> 当前本地实现使用无版本前缀的 `/api/*`；`schema/openapi/local-api.json` 覆盖 `ApiState::router` 的全部路径和方法，并由 `/api/openapi.json` 暴露，`pnpm check:contracts` 同时检查路由/方法漂移。下文 `/api/v1` 是目标云契约。
 > 版本：`/api/v1`；破坏性变更走 v2。内部 Worker API 使用 `/internal/v1` + mTLS/JWT。
 
 ## 1. 基础
@@ -87,14 +87,15 @@ SCIM 2.0 使用独立租户 Bearer 端点：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/workflows/{id}/executions` | 启动；Idempotency-Key |
+| POST | `/workflows/{id}/executions` | 启动；支持 `Idempotency-Key`，相同内容重放原 execution，不同内容返回 409 |
 | GET | `/executions` | 列表/过滤 |
 | GET | `/executions/{id}` | 状态/输入输出摘要 |
 | GET | `/executions/{id}/events` | 历史事件（分页） |
 | GET | `/executions/{id}/events/stream` | SSE 实时 |
-| POST | `/executions/{id}/cancel` | 取消 |
-| POST | `/executions/{id}/retry` | 重试（策略） |
-| GET | `/executions/{id}/artifacts` | 产物 |
+| POST | `/executions/{id}/cancel` | 等待审批立即取消；运行中持久化协作取消请求，在步骤边界停止 |
+| POST | `/executions/{id}/approvals` | 批准、拒绝或超时恢复；同一节点/决定幂等 |
+| POST | `/executions/{id}/retry` | 使用原快照、输入和环境创建新 execution；支持 `Idempotency-Key` |
+| GET | `/artifacts?executionId={id}` | 产物 |
 
 ### Agent / Skill / MCP / Plugin
 
@@ -175,13 +176,13 @@ data: {"nodeId":"fetch_orders","attempt":1,"at":"..."}
 ## 5. 审批
 
 ```http
-POST /api/v1/approvals/apr_01J.../decide
+POST /api/executions/exec_01J.../approvals
 Content-Type: application/json
 
-{ "decision": "approve", "comment": "ok", "form": { "decision": "approve" } }
+{ "nodeId": "approve", "decision": "approved", "form": { "decision": "approve", "comment": "ok" } }
 ```
 
-- 幂等：approvalId + decision；重复返回原结果。
+- 幂等：execution + node + decision；重复返回当前结果，相反决定返回 `APPROVAL_ALREADY_DECIDED`。
 - 拒绝/超时按执行策略；审计。
 - 高风险需要 step-up 认证（可配置）。
 

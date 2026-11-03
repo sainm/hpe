@@ -599,7 +599,7 @@ async fn database_command(command: DbCommand, data_dir: PathBuf) -> Result<(), B
         DbCommand::Migrate => {
             // Serialize the whole migrate-and-report window. SQLx takes its own
             // advisory lock around `run`, but counting outside that window made
-            // concurrent processes all report "applied: 20".
+            // concurrent processes all report the same non-zero count.
             const MIGRATE_LOCK: i64 = 0x6870_615f_6d69_6772;
             sqlx::query("SELECT pg_advisory_lock($1)")
                 .bind(MIGRATE_LOCK)
@@ -2100,7 +2100,7 @@ async fn check_postgres(database_url: &str, data_dir: &Path) -> Value {
             .await
             .unwrap_or(0);
     // Tenant tables and control-plane tables are both FORCE RLS; reporting the
-    // split keeps "66 tables" in the docs from being read as 66 tenant tables.
+    // split keeps the total from being read as the number of tenant-schema tables.
     let forced_rls_tenant: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_class c
          JOIN pg_namespace n ON n.oid = c.relnamespace

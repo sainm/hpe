@@ -122,6 +122,13 @@ export class RuntimeClient {
     );
   }
 
+  retryExecution(executionId: string): Promise<ExecutionDetail> {
+    return this.request<ExecutionDetail>(
+      `/api/executions/${encodeURIComponent(executionId)}/retry`,
+      { method: "POST", body: "{}" },
+    );
+  }
+
   decideApproval(
     executionId: string,
     nodeId: string,

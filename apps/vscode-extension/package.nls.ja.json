@@ -17,6 +17,7 @@
   "command.workflow.run": "Auralis: ワークフローを実行",
   "command.execution.open": "Auralis: 実行を開く",
   "command.execution.cancel": "Auralis: 実行をキャンセル",
+  "command.execution.retry": "Auralis: 実行を再実行",
   "command.execution.approve": "Auralis: 承認を判断",
   "command.artifact.preview": "Auralis: 成果物をプレビュー",
   "command.skill.install": "Auralis: スキルをインストール",

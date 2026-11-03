@@ -217,6 +217,7 @@ jobs:
       - run: pnpm release:pack -- --profile debug --skip-build --out dist-release
       - run: pnpm release:verify -- dist-release/hpa-*.tar.gz
       - run: pnpm test:e2e
+      - run: pnpm test:approval-branches
       - run: pnpm test:mcp-conformance
       - run: pnpm --dir apps/vscode-extension run test:host
       - run: pnpm --dir apps/vscode-extension run package

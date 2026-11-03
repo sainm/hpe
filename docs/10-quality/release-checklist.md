@@ -30,16 +30,13 @@ cargo test --workspace --no-fail-fast
 (cd apps/vscode-extension && corepack pnpm test && corepack pnpm build)
 (cd services/ai-worker && uv run --frozen pytest -q && uv run --frozen ruff check . && uv run --frozen mypy src)
 
-# PostgreSQL（需要 HPA_POSTGRES_TEST_URL 指向一个可写的空库）
-HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db cargo test -p hpa-local --test postgres_rls \
-  --test postgres_import --test postgres_distributed --test postgres_event_bus \
-  --test postgres_execution_store --test postgres_workflow_store --test postgres_trigger_store \
-  --test postgres_runtime --test postgres_execution_lease --test postgres_execution_recovery \
-  --test postgres_atomic_execution_fire --test postgres_mcp --test postgres_scheduler_leader \
-  --test postgres_worker_registry --test postgres_token_store --test postgres_worker_daemon
+# PostgreSQL（账号需要 CREATEDB；每个测试文件使用独立临时库）
+HPA_POSTGRES_ADMIN_URL=postgresql://user@host:5432/postgres pnpm test:postgres
+HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/hpa_backup_test node scripts/check-postgres-backup.mjs
 
 # 端到端
 node scripts/run-local-e2e.mjs
+node scripts/approval-branches-e2e.mjs
 HPA_POSTGRES_URL=postgresql://user@host:5432/empty_db node scripts/multi-node-e2e.mjs
 HPA_POSTGRES_URL=postgresql://user@host:5432/empty_db2 node scripts/rolling-restart-e2e.mjs
 # PostgreSQL 模式下还应确认控制面无漂移
@@ -48,7 +45,7 @@ hpa --data-dir <data-dir> db verify-mirror
 
 说明：
 
-- 未设置 `HPA_POSTGRES_TEST_URL` 时，PostgreSQL 套件会打印 `skipped` 并返回成功——**这种情况不算发布证据**。
+- 未设置 `HPA_POSTGRES_TEST_URL` 时，直接运行 workspace PostgreSQL 用例会打印 `skipped` 并返回成功——**这种情况不算发布证据**；发布门禁使用 `HPA_POSTGRES_ADMIN_URL` 驱动文件级隔离套件。
 - 在没有 `sandbox-exec` 的环境（容器内嵌套沙箱）中，12 个依赖 seatbelt 的用例会失败并报 `sandbox_apply: Operation not permitted`；发布验收必须在真实主机上跑，不允许据此判断功能回归。
 
 ## 3. 打包
@@ -113,7 +110,7 @@ corepack pnpm run release:verify -- dist-release/hpa-<...>.tar.gz
 ## 7. 已知边界（发布说明必须原文带上）
 
 - 外部 AI 客户端（Claude Code / Codex / Copilot）的真实模型会话调用**未验收**，状态 `BLOCKED_EXTERNAL`。
-- 企业 IdP / CA / Vault / 生产 Collector / 多节点滚动升级**未验收**，同样 `BLOCKED_EXTERNAL`。
+- 企业 IdP / CA / Vault / 生产 Collector / **跨版本**多节点滚动升级**未验收**，同样 `BLOCKED_EXTERNAL`；同版本滚动重启和本机主备切换已有自动演练。
 - 企业控制面的租户、成员、配额、SCIM、浏览器会话已切到 PostgreSQL（SQLite 仅单节点模式或缓存）。**PostgreSQL 模式下 `data_dir/plugins` 必须是共享卷**，插件元数据共享但包文件在节点本地；`hpa doctor` 会报告 `packagesMissing`。
 - 调度器为每节点各自 tick + 数据库乐观锁，不是 leader-only 派发；时间同步依赖宿主机 NTP。
 - MCP `2026-07-28` 的官方 conformance 场景尚未提供；已验收的是 `2025-11-25` 核心矩阵 9/9。

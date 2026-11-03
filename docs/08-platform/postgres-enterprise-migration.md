@@ -17,7 +17,7 @@
 
 | 数据 | SQLite | PostgreSQL | 说明 |
 | --- | --- | --- | --- |
-| Workflow / Execution / Trigger | 旁路 | **权威** | `HPA_POSTGRES_RUNTIME=1` 时不再写 SQLite |
+| Workflow / Execution / Trigger | 旁路 | **权威** | `HPA_POSTGRES_RUNTIME=1` 时不再写 SQLite；执行幂等键与协作取消请求同库 |
 | Worker 注册 / 心跳 / 停用 | 不写 | **权威** | `postgres_worker_registry` |
 | Worker Job / 租约 | 不写 | **权威** | `postgres_worker_daemon` |
 | 平台令牌 | 不写 | **权威** | `postgres_token_store` |

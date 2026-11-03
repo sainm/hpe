@@ -150,6 +150,9 @@
 | P13-EXEC-05 | 每日执行与并发配额按 PostgreSQL execution 计数，不读取旧 SQLite 表 | Repository 测试 |
 | P13-EXEC-06 | execution lease 过期后另一节点接管，旧 holder 的 state commit/release 被拒绝 | 真实 PG fencing 测试 |
 | P13-EXEC-07 | 空 data_dir 节点从 PG 恢复 running execution、执行并释放 lease | 进程级 E2E |
+| P13-EXEC-08 | 启动/重试 `Idempotency-Key` 原子映射；同内容重放原 execution 且不被新增执行配额阻断，不同内容 409；SQLite 与 PostgreSQL 一致 | 并发 + 配额 + 负向集成 |
+| P13-EXEC-09 | RUNNING 取消先持久化请求，owner 在步骤边界写 `execution.cancelled`；API 不覆盖活动 state | SQLite/PostgreSQL + HTTP 集成 |
+| P13-EXEC-10 | 重复审批同 node/decision 返回当前结果，相反决定返回 `APPROVAL_ALREADY_DECIDED` | 并发 HTTP 负向测试 |
 | P13-WORKFLOW-01 | `HPA_POSTGRES_RUNTIME=1` 时 draft/publish/list/get/version 全部走 PostgreSQL | 真实 PG Store + API |
 | P13-WORKFLOW-02 | 相同 workflow/version 内容变化失败关闭；新版本可发布；跨租户不可见 | 负向集成 |
 | P13-EXEC-03 | Workflow、Trigger、Enterprise、Worker、Agent、Skill、MCP 控制面、Connector、Plugin 全部生产 Repository 切换 PostgreSQL | 逐 store 跨节点测试，见 [Phase 13–18 状态台账](phase-13-18-status.md) |
@@ -164,6 +167,7 @@
 | Q-L02 | 强制杀进程后运行中 Workflow 从检查点恢复 | 独立进程恢复测试 |
 | Q-L03 | 关键页面 serious/critical axe 为 0，首个 Tab 可离开 body | Playwright + axe |
 | Q-L04 | 包下载使用国内镜像；容器镜像使用 DaoCloud 且固定 digest；权威漏洞源作为显式例外 | `pnpm check:mirrors` |
+| Q-L05 | `ApiState::router` 的每个运行时路径与 HTTP 方法均出现在本地 OpenAPI | `pnpm check:contracts` 路由漂移检查 |
 
 ## 相关文档
 

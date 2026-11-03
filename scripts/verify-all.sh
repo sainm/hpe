@@ -13,6 +13,15 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root" || exit 1
+if [ -n "${CARGO:-}" ]; then
+  cargo_cmd="$CARGO"
+elif command -v cargo >/dev/null 2>&1; then
+  cargo_cmd="cargo"
+elif [ -x "${HOME}/.cargo/bin/cargo" ]; then
+  cargo_cmd="${HOME}/.cargo/bin/cargo"
+else
+  cargo_cmd="cargo"
+fi
 
 quick=0
 with_ha=0
@@ -75,8 +84,8 @@ echo "verify-all: rust + web + extension + python + gates${quick:+}"
 [ $quick -eq 0 ] && echo "database admin: ${admin_url}"
 
 # ---------------------------------------------------------------- static gates
-step "cargo fmt --check" cargo fmt --all --check
-step "cargo clippy -D warnings" cargo clippy --workspace --all-targets -- -D warnings
+step "cargo fmt --check" "$cargo_cmd" fmt --all --check
+step "cargo clippy -D warnings" "$cargo_cmd" clippy --workspace --all-targets -- -D warnings
 
 gate_script() {
   case "$1" in
@@ -103,7 +112,7 @@ fi
 
 # ------------------------------------------------------------------- rust tests
 echo "cargo test --workspace (no database: PostgreSQL suites skip)"
-if cargo test --workspace --no-fail-fast >/tmp/verify-all-tests.log 2>&1; then
+if "$cargo_cmd" test --workspace --no-fail-fast >/tmp/verify-all-tests.log 2>&1; then
   record_ok "cargo test --workspace"
 else
   counts="$(grep -oE '[0-9]+ failed' /tmp/verify-all-tests.log | awk '{s+=$1} END {print s+0}')"
@@ -162,6 +171,7 @@ if [ -x node_modules/.bin/turbo ] || command -v pnpm >/dev/null 2>&1 || command 
   command -v pnpm >/dev/null 2>&1 || pnpm_cmd="corepack pnpm"
   step "web typecheck + test + build" bash -c "cd apps/web && $pnpm_cmd -s run build && $pnpm_cmd -s test"
   step "extension test" bash -c "cd apps/vscode-extension && $pnpm_cmd -s test"
+  step "approval branch E2E" node scripts/approval-branches-e2e.mjs
 else
   record_skip "web/extension (no pnpm or corepack)"
 fi

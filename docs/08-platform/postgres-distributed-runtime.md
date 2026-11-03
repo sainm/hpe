@@ -156,7 +156,7 @@ ORDER BY updated_at;
 
 ## 10. 尚未完成
 
-- Scheduler 已接入 leader coordination，Workflow/Trigger/Execution 可走 PostgreSQL；Worker Job API、Enterprise 和多数 Agent/Skill 元数据尚未整体切换。
+- Scheduler 已接入 leader coordination；Workflow/Trigger/Execution、Worker Job、Enterprise、Agent、Skill、MCP、Connector 与 Plugin 元数据在 `HPA_POSTGRES_RUNTIME=1` 时均使用 PostgreSQL 权威。
 - 尚无真实两台控制面、两台 Worker 的滚动升级/强杀演练。
 - Topic Event 已接 PostgreSQL outbox；Webhook、schedule 与 MCP task 仍使用各自记录，尚未成为一张统一事件账本。
 - 尚无 Redis Stream 适配器；PostgreSQL queue 是当前选定的“等价可靠队列”，容量上限和多区域复制需在 P13-06 压测。

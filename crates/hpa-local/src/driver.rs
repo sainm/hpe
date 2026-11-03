@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use hpa_core::compiler::compile_workflow;
 use hpa_core::ir::Workflow;
-use hpa_core::runtime::{ExecutionStatus, StepStatus, expire_approval, step};
+use hpa_core::runtime::{ExecutionStatus, StepStatus, cancel_execution, expire_approval, step};
 use hpa_local::postgres_execution::ExecutionLeaseRecord;
 use opentelemetry::trace::FutureExt as _;
 use serde_json::json;
@@ -263,6 +263,20 @@ impl RuntimeManager {
             return Ok(());
         };
         let mut state = parse_state(&row).map_err(|error| error.to_string())?;
+        if !state.status.is_terminal()
+            && self
+                .db
+                .execution_cancel_requested(execution_id)
+                .await
+                .map_err(|error| error.to_string())?
+        {
+            let events =
+                cancel_execution(&mut state).map_err(|error| format!("cannot cancel: {error}"))?;
+            self.db
+                .save_execution_fenced(&state, &events, &lease.holder_id, lease.fencing_token)
+                .await
+                .map_err(|error| format!("cannot persist cancellation: {error}"))?;
+        }
         if state.status.is_terminal() || state.status == ExecutionStatus::WaitingApproval {
             return Ok(());
         }
@@ -290,6 +304,20 @@ impl RuntimeManager {
 
         loop {
             if state.status.is_terminal() || state.status == ExecutionStatus::WaitingApproval {
+                break;
+            }
+            if self
+                .db
+                .execution_cancel_requested(execution_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let events = cancel_execution(&mut state)
+                    .map_err(|error| format!("cannot cancel execution: {error}"))?;
+                self.db
+                    .save_execution_fenced(&state, &events, &lease.holder_id, lease.fencing_token)
+                    .await
+                    .map_err(|error| format!("cannot persist cancellation: {error}"))?;
                 break;
             }
             let started = Instant::now();

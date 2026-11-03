@@ -232,7 +232,7 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ## 8g. Phase 13：生产级补全（当前目标）
 
-> 状态：**IN_PROGRESS**。P13-01～04、Connector/远程 Marketplace 和 OTLP/跨进程 trace 基线已落地并通过真实 PostgreSQL、Redis、MinIO、Git、Python 和 OTLP receiver 测试；业务 API 尚未整体切换 PostgreSQL，Python Worker 已作为显式 `python` planner 接入但未完成 PostgreSQL checkpoint/多副本/mTLS，真实 Collector 部署和外部 AI 客户端仍待验证。完整完成定义见 [Phase 13 生产级补全](phase-13-production-completion.md)。
+> 状态：**IN_PROGRESS**。P13-01～07 的本地代码与自动化基线已落地并通过真实 PostgreSQL、Redis、MinIO、Git、Python 和 OTLP receiver 测试；Worker Job、Enterprise、Agent、Skill、MCP、Connector 与 Plugin 元数据已切到 PostgreSQL 权威。剩余阻塞是统一 outbox、多 IdP/真实企业基础设施、跨主机自动故障切换/PITR、跨版本滚动升级、生产 Collector 和真实外部 AI 客户端。完整完成定义见 [Phase 13 生产级补全](phase-13-production-completion.md)。
 
 范围：
 

@@ -9,6 +9,7 @@
 # Usage:
 #   HPA_POSTGRES_ADMIN_URL=postgresql://user@host:5432/postgres scripts/run-postgres-tests.sh
 #   HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db scripts/run-postgres-tests.sh  # reuse one server, derive per-file DBs
+#   CARGO=/absolute/path/to/cargo ... scripts/run-postgres-tests.sh                # non-login shell
 #
 # The account needs CREATEDB. `--keep` keeps the databases for inspection.
 
@@ -16,6 +17,15 @@ set -uo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root" || exit 1
+if [ -n "${CARGO:-}" ]; then
+  cargo_cmd="$CARGO"
+elif command -v cargo >/dev/null 2>&1; then
+  cargo_cmd="cargo"
+elif [ -x "${HOME}/.cargo/bin/cargo" ]; then
+  cargo_cmd="${HOME}/.cargo/bin/cargo"
+else
+  cargo_cmd="cargo"
+fi
 
 keep=0
 for arg in "$@"; do
@@ -74,7 +84,7 @@ for file in "${files[@]}"; do
     continue
   fi
   printf '  %-36s ' "$name"
-  output="$(HPA_POSTGRES_TEST_URL="${prefix}/${db}" cargo test -q -p hpa-local --test "$name" 2>&1)"
+  output="$(HPA_POSTGRES_TEST_URL="${prefix}/${db}" "$cargo_cmd" test -q -p hpa-local --test "$name" 2>&1)"
   status=$?
   summary="$(printf '%s\n' "$output" | grep -E '^test result' | tail -1)"
   if [ $status -eq 0 ]; then

@@ -40,6 +40,7 @@ function validate(file) {
     if (!value.paths || Object.keys(value.paths).length === 0) {
       errors.push(`${relative}: paths must not be empty`);
     }
+    validateRuntimeRoutes(value, path.join(root, "crates/hpa-local/src/api.rs"));
     return;
   }
   if (value.$schema !== "https://json-schema.org/draft/2020-12/schema") {
@@ -48,6 +49,83 @@ function validate(file) {
   if (!value.$id?.startsWith("https://hpa.dev/schema/")) {
     errors.push(`${relative}: canonical hpa.dev $id is required`);
   }
+}
+
+function validateRuntimeRoutes(openapi, apiSource) {
+  const source = fs.readFileSync(apiSource, "utf8");
+  for (const [runtimePath, methods] of extractRuntimeRoutes(source)) {
+    const openapiPath = `/api${runtimePath}`;
+    const documented = openapi.paths[openapiPath];
+    if (!documented) {
+      errors.push(`openapi/local-api.json: missing runtime path ${openapiPath}`);
+      continue;
+    }
+    for (const method of methods) {
+      if (!documented[method]) {
+        errors.push(
+          `openapi/local-api.json: missing ${method.toUpperCase()} ${openapiPath}`,
+        );
+      }
+    }
+  }
+}
+
+function extractRuntimeRoutes(source) {
+  const routes = [];
+  let offset = 0;
+  while (true) {
+    const start = source.indexOf(".route(", offset);
+    if (start === -1) return routes;
+    const body = balancedBody(source, start + ".route(".length);
+    const match = body.match(/^\s*"([^"]+)"\s*,\s*([\s\S]*)$/);
+    if (match) {
+      routes.push([match[1], routeMethods(match[2])]);
+    }
+    offset = start + ".route(".length + body.length + 1;
+  }
+}
+
+function balancedBody(source, start) {
+  let depth = 1;
+  let quote;
+  let escaped = false;
+  for (let index = start; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "(") depth += 1;
+    else if (char === ")" && --depth === 0) return source.slice(start, index);
+  }
+  return source.slice(start);
+}
+
+function routeMethods(body) {
+  const methods = [];
+  let depth = 0;
+  let quote;
+  let escaped = false;
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === '"' || char === "'") quote = char;
+    else if (char === "(") depth += 1;
+    else if (char === ")") depth -= 1;
+    else if (depth === 0) {
+      const match = body.slice(index).match(/^(get|post|put|patch|delete)\s*\(/);
+      if (match) methods.push(match[1]);
+    }
+  }
+  return methods;
 }
 
 walk(schemaRoot);

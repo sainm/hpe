@@ -12,6 +12,7 @@ import {
 type PanelMessage =
   | { type: "refresh" }
   | { type: "cancel" }
+  | { type: "retry" }
   | { type: "decide"; decision: "approved" | "rejected" };
 
 interface LoadedExecution {
@@ -109,15 +110,54 @@ export async function openExecutionPanel(
     );
     if (choice !== confirmLabel) return;
     try {
-      await services.client.cancelExecution(executionId);
+      const cancelled = await services.client.cancelExecution(executionId);
       if (disposed) return;
       errorText = undefined;
       services.dataEvents.fire("executions");
-      void vscode.window.showInformationMessage(services.i18n.t("executions.cancelled"));
+      void vscode.window.showInformationMessage(
+        services.i18n.t(
+          cancelled.summary.status === "running"
+            ? "executions.cancelRequested"
+            : "executions.cancelled",
+        ),
+      );
       await refresh();
     } catch (error) {
       if (disposed) return;
       errorText = `${services.i18n.t("executions.cancelFailed")} ${describeError(error)}`;
+      render();
+      void vscode.window.showErrorMessage(errorText);
+    }
+  }
+
+  async function retry(): Promise<void> {
+    const summary = loaded?.detail.summary;
+    if (!summary || !isTerminal(summary.status)) return;
+    if (!services.requireTrusted()) {
+      errorText = services.i18n.t("trust.required");
+      render();
+      return;
+    }
+    const confirmLabel = services.i18n.t("common.confirm");
+    const choice = await vscode.window.showWarningMessage(
+      services.i18n.t("executions.retryConfirm", { id: executionId }),
+      { modal: true },
+      confirmLabel,
+      services.i18n.t("common.cancel"),
+    );
+    if (choice !== confirmLabel) return;
+    try {
+      const retried = await services.client.retryExecution(executionId);
+      if (disposed) return;
+      errorText = undefined;
+      services.dataEvents.fire("executions");
+      void vscode.window.showInformationMessage(
+        services.i18n.t("executions.retryStarted", { id: retried.summary.id }),
+      );
+      await openExecutionPanel(context, services, retried.summary.id);
+    } catch (error) {
+      if (disposed) return;
+      errorText = `${services.i18n.t("executions.retryFailed")} ${describeError(error)}`;
       render();
       void vscode.window.showErrorMessage(errorText);
     }
@@ -164,6 +204,10 @@ export async function openExecutionPanel(
       void cancel();
       return;
     }
+    if (message.type === "retry") {
+      void retry();
+      return;
+    }
     void decide(message.decision);
   }
 
@@ -192,6 +236,7 @@ function pageHtml(
   const canCancel =
     summary?.status === "running" || summary?.status === "waiting_approval";
   const canDecide = summary?.status === "waiting_approval" && Boolean(summary.waiting);
+  const canRetry = summary ? isTerminal(summary.status) : false;
   body.push('<div class="actions">');
   body.push(
     `<button type="button" data-action="refresh">${escapeHtml(t.t("executions.refresh"))}</button>`,
@@ -199,6 +244,11 @@ function pageHtml(
   if (canCancel) {
     body.push(
       `<button type="button" class="secondary" data-action="cancel">${escapeHtml(t.t("executions.cancel"))}</button>`,
+    );
+  }
+  if (canRetry) {
+    body.push(
+      `<button type="button" class="secondary" data-action="retry">${escapeHtml(t.t("executions.retry"))}</button>`,
     );
   }
   body.push("</div>");
@@ -282,6 +332,7 @@ function parseMessage(value: unknown): PanelMessage | undefined {
   const keys = Object.keys(record);
   if (keys.length === 1 && record.type === "refresh") return { type: "refresh" };
   if (keys.length === 1 && record.type === "cancel") return { type: "cancel" };
+  if (keys.length === 1 && record.type === "retry") return { type: "retry" };
   if (
     keys.length === 2 &&
     record.type === "decide" &&
@@ -315,6 +366,10 @@ function panelScript(): string {
     }
     if (action === "cancel") {
       vscode.postMessage({ type: "cancel" });
+      return;
+    }
+    if (action === "retry") {
+      vscode.postMessage({ type: "retry" });
       return;
     }
     if (action === "approve") {

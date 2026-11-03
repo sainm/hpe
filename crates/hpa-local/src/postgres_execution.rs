@@ -25,6 +25,8 @@ pub enum PostgresExecutionError {
         workflow_id: String,
         version: String,
     },
+    #[error("idempotency key `{key}` was reused with a different request")]
+    IdempotencyConflict { key: String },
     #[error("execution tenant `{actual}` does not match database tenant `{expected}`")]
     TenantMismatch { expected: String, actual: String },
     #[error("event `{event_id}` does not target execution `{execution_id}`")]
@@ -389,6 +391,247 @@ impl PostgresExecutionStore {
         .await?;
         transaction.commit().await?;
         Ok(())
+    }
+
+    pub async fn insert_execution_idempotent(
+        &self,
+        row: &ExecutionRecord,
+        start_event: &ExecutionEvent,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<Option<ExecutionRecord>, PostgresExecutionError> {
+        let mut lookup = self.begin().await?;
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT request_hash, execution_id
+             FROM hpa_tenant.execution_idempotency
+             WHERE tenant_id = $1 AND idempotency_key = $2",
+        )
+        .bind(&self.tenant_id)
+        .bind(idempotency_key)
+        .fetch_optional(&mut *lookup)
+        .await?;
+        lookup.commit().await?;
+        if let Some((existing_hash, execution_id)) = existing {
+            if existing_hash != request_hash {
+                return Err(PostgresExecutionError::IdempotencyConflict {
+                    key: idempotency_key.to_string(),
+                });
+            }
+            return self.get_execution(&execution_id).await;
+        }
+
+        let workflow: Workflow = serde_json::from_str(&row.workflow_json)?;
+        let workflow_json = serde_json::to_value(&workflow)?;
+        let execution_state: ExecutionState = serde_json::from_str(&row.state_json)?;
+        self.validate_state(&execution_state)?;
+        self.validate_event(&execution_state.id, start_event)?;
+        let state_json = serde_json::to_value(&execution_state)?;
+        let output_json = row.output_json.as_deref().map(parse_value).transpose()?;
+        let error_json = row.error_json.as_deref().map(parse_value).transpose()?;
+        let started_at = parse_time(&row.started_at)?;
+        let updated_at = parse_time(&row.updated_at)?;
+        let mut transaction = self.begin().await?;
+
+        sqlx::query(
+            "INSERT INTO hpa_tenant.workflows (
+                 tenant_id, id, name, version, description, published,
+                 ir_json, yaml, created_at, updated_at
+             )
+             VALUES ($1, $2, $3, $4, $5, TRUE, $6, '', $7, $8)
+             ON CONFLICT (tenant_id, id) DO NOTHING",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.workflow_id)
+        .bind(&workflow.name)
+        .bind(&row.workflow_version)
+        .bind(&workflow.description)
+        .bind(Json(&workflow_json))
+        .bind(started_at)
+        .bind(updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO hpa_tenant.workflow_versions (
+                 tenant_id, workflow_id, version, registry_version,
+                 ir_json, created_at
+             )
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (tenant_id, workflow_id, version) DO NOTHING",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.workflow_id)
+        .bind(&row.workflow_version)
+        .bind(&execution_state.registry_version)
+        .bind(Json(&workflow_json))
+        .bind(started_at)
+        .execute(&mut *transaction)
+        .await?;
+        let stored_workflow: Value = sqlx::query_scalar(
+            "SELECT ir_json FROM hpa_tenant.workflow_versions
+             WHERE tenant_id = $1 AND workflow_id = $2 AND version = $3",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.workflow_id)
+        .bind(&row.workflow_version)
+        .fetch_one(&mut *transaction)
+        .await?;
+        if stored_workflow != workflow_json {
+            transaction.rollback().await?;
+            return Err(PostgresExecutionError::WorkflowSnapshotConflict {
+                workflow_id: row.workflow_id.clone(),
+                version: row.workflow_version.clone(),
+            });
+        }
+        sqlx::query(
+            "INSERT INTO hpa_tenant.executions (
+                 tenant_id, id, workflow_id, workflow_version, status,
+                 state_json, workflow_json, output_json, error_json,
+                 started_at, updated_at
+             )
+             VALUES (
+                 $1, $2, $3, $4, $5,
+                 $6, $7, $8, $9,
+                 $10, $11
+             )",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.id)
+        .bind(&row.workflow_id)
+        .bind(&row.workflow_version)
+        .bind(&row.status)
+        .bind(Json(&state_json))
+        .bind(Json(&workflow_json))
+        .bind(output_json.as_ref().map(Json))
+        .bind(error_json.as_ref().map(Json))
+        .bind(started_at)
+        .bind(updated_at)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO hpa_tenant.events (
+                 tenant_id, execution_id, sequence, payload_json
+             )
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&self.tenant_id)
+        .bind(&row.id)
+        .bind(start_event.sequence as i64)
+        .bind(Json(serde_json::to_value(start_event)?))
+        .execute(&mut *transaction)
+        .await?;
+        let inserted = sqlx::query(
+            "INSERT INTO hpa_tenant.execution_idempotency (
+                 tenant_id, idempotency_key, request_hash, execution_id, created_at
+             )
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (tenant_id, idempotency_key) DO NOTHING",
+        )
+        .bind(&self.tenant_id)
+        .bind(idempotency_key)
+        .bind(request_hash)
+        .bind(&row.id)
+        .bind(started_at)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+        if inserted {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+        transaction.rollback().await?;
+
+        let existing: Option<(String, String)> = sqlx::query_as(
+            "SELECT request_hash, execution_id
+             FROM hpa_tenant.execution_idempotency
+             WHERE tenant_id = $1 AND idempotency_key = $2",
+        )
+        .bind(&self.tenant_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((existing_hash, execution_id)) = existing else {
+            return Err(PostgresExecutionError::Database(sqlx::Error::RowNotFound));
+        };
+        if existing_hash != request_hash {
+            return Err(PostgresExecutionError::IdempotencyConflict {
+                key: idempotency_key.to_string(),
+            });
+        }
+        self.get_execution(&execution_id).await
+    }
+
+    pub async fn request_execution_cancel(
+        &self,
+        execution_id: &str,
+        requested_at: &str,
+    ) -> Result<bool, PostgresExecutionError> {
+        let requested_at = parse_time(requested_at)?;
+        let mut transaction = self.begin().await?;
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT status FROM hpa_tenant.executions
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(&self.tenant_id)
+        .bind(execution_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if !status.is_some_and(|status| matches!(status.as_str(), "running" | "waiting_approval")) {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO hpa_tenant.execution_cancel_requests (
+                 tenant_id, execution_id, requested_at
+             )
+             VALUES ($1, $2, $3)
+             ON CONFLICT (tenant_id, execution_id) DO NOTHING",
+        )
+        .bind(&self.tenant_id)
+        .bind(execution_id)
+        .bind(requested_at)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn execution_cancel_requested(
+        &self,
+        execution_id: &str,
+    ) -> Result<bool, PostgresExecutionError> {
+        let mut transaction = self.begin().await?;
+        let requested: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM hpa_tenant.execution_cancel_requests
+                 WHERE tenant_id = $1 AND execution_id = $2
+             )",
+        )
+        .bind(&self.tenant_id)
+        .bind(execution_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(requested)
+    }
+
+    pub async fn execution_idempotency_exists(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<bool, PostgresExecutionError> {
+        let mut transaction = self.begin().await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM hpa_tenant.execution_idempotency
+                 WHERE tenant_id = $1 AND idempotency_key = $2
+             )",
+        )
+        .bind(&self.tenant_id)
+        .bind(idempotency_key)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(exists)
     }
 
     pub async fn insert_execution_with_trigger(

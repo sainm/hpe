@@ -29,10 +29,11 @@ HPA_POSTGRES_ADMIN_URL=postgresql://user@host:5432/postgres \
 
 要求：账号具备 `CREATEDB`；URL 必须是 `postgresql://user[:pass]@host[:port]/database` 形式（不带 socket 路径）。
 
-## 3. 当前结果（2026-11-03，PostgreSQL 18.4）
+## 3. 当前结果（2026-11-04，PostgreSQL 18.4）
 
-- **28/29 文件通过**。
-- `postgres_skill_cross_node` 失败，原因是技能测试要执行 `scripts/audit.py`，而当前 shell 环境禁止 `sandbox-exec`（`sandbox_apply: Operation not permitted`），与 `tests/runner.rs` 的 8 个失败同源。在允许 seatbelt 的主机上应重跑确认。
+- **29/29 文件（30/30 用例）通过**。
+- 首次运行暴露了 `postgres_member_authority` 的测试竞态：节点配置 100ms 强制缓存刷新，却在长时间操作后断言 SQLite 缓存必须为 0。该套件已改为验证 PostgreSQL 权威，缓存刷新继续由独立 `postgres_control_refresh` 覆盖；复跑全绿。
+- 当前 shell 可以执行 seatbelt，`postgres_skill_cross_node` 不再需要 `HPA_SKILL_ALLOW_UNSANDBOXED=1`。禁止嵌套沙箱的 CI 仍应按失败原因区分平台限制与功能缺陷。
 
 ## 4. CI 约定
 

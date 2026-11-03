@@ -131,6 +131,11 @@
         "icon": "$(debug-stop)"
       },
       {
+        "command": "hpa.execution.retry",
+        "title": "%command.execution.retry%",
+        "icon": "$(debug-restart)"
+      },
+      {
         "command": "hpa.execution.approve",
         "title": "%command.execution.approve%",
         "icon": "$(check)"
@@ -246,11 +251,16 @@
         },
         {
           "command": "hpa.execution.open",
-          "when": "view == hpa.executions && viewItem == hpa.execution"
+          "when": "view == hpa.executions && viewItem =~ /^hpa\\.execution/"
         },
         {
           "command": "hpa.execution.cancel",
           "when": "view == hpa.executions && viewItem == hpa.execution.running",
+          "group": "inline@1"
+        },
+        {
+          "command": "hpa.execution.retry",
+          "when": "view == hpa.executions && viewItem == hpa.execution.finished",
           "group": "inline@1"
         },
         {

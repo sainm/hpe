@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import i18n from "./i18n";
 
@@ -92,6 +92,18 @@ describe("i18n resources", () => {
       for (const key of keys) {
         expect(en).toContain(key);
         expect(zh).toContain(key);
+      }
+    }
+  });
+
+  it("ships every static key used by any page", () => {
+    for (const file of readdirSync(new URL("../pages/", import.meta.url))) {
+      if (!file.endsWith(".tsx")) continue;
+      const source = readFileSync(new URL(`../pages/${file}`, import.meta.url), "utf8");
+      for (const match of source.matchAll(/\bt\("([^"]+)"/g)) {
+        const key = match[1]!;
+        expect(en, `${file}: ${key}`).toContain(key);
+        expect(zh, `${file}: ${key}`).toContain(key);
       }
     }
   });

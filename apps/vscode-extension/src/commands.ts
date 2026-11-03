@@ -153,6 +153,37 @@ export function registerCommands(
         showError(services, error, services.i18n.t("executions.cancelFailed"));
       }
     }),
+    register("hpa.execution.retry", async (argument?: unknown) => {
+      if (!services.requireTrusted()) return;
+      const execution =
+        executionFrom(argument) ??
+        (await pickExecution(services, services.i18n.t("executions.retry")));
+      if (!execution) return;
+      if (!["succeeded", "failed", "cancelled"].includes(execution.status)) {
+        void vscode.window.showErrorMessage(
+          services.i18n.t("executions.retryUnavailable"),
+        );
+        return;
+      }
+      const confirmation = await vscode.window.showWarningMessage(
+        services.i18n.t("executions.retryConfirm", { id: execution.id }),
+        { modal: true },
+        services.i18n.t("common.confirm"),
+        services.i18n.t("common.cancel"),
+      );
+      if (confirmation !== services.i18n.t("common.confirm")) return;
+      try {
+        services.requireOnline();
+        const retried = await services.client.retryExecution(execution.id);
+        services.dataEvents.fire("executions");
+        void vscode.window.showInformationMessage(
+          services.i18n.t("executions.retryStarted", { id: retried.summary.id }),
+        );
+        await openExecutionPanel(context, services, retried.summary.id);
+      } catch (error) {
+        showError(services, error, services.i18n.t("executions.retryFailed"));
+      }
+    }),
     register("hpa.execution.approve", async (argument?: unknown) => {
       if (!services.requireTrusted()) return;
       const approval =

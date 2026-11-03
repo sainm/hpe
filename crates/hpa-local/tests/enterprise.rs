@@ -168,6 +168,36 @@ impl Server {
         self.send(Method::POST, path, token, Some(body)).await
     }
 
+    async fn post_idempotent(
+        &self,
+        path: &str,
+        token: Option<&str>,
+        body: Value,
+        idempotency_key: &str,
+    ) -> Response {
+        let mut request = self
+            .client
+            .post(self.url(path))
+            .header("Idempotency-Key", idempotency_key)
+            .json(&body);
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.expect("http request");
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response.text().await.unwrap_or_default();
+        Response {
+            status,
+            content_type,
+            body,
+        }
+    }
+
     async fn put(&self, path: &str, token: Option<&str>, body: Value) -> Response {
         self.send(Method::PUT, path, token, Some(body)).await
     }
@@ -1737,6 +1767,89 @@ async fn concurrent_run_quota_enforced() {
         blocked.body
     );
     assert_eq!(blocked.json()["error"]["code"], "TENANT_CONCURRENCY");
+    server.stop();
+}
+
+#[tokio::test]
+async fn idempotent_replay_bypasses_new_execution_quota() {
+    let data_dir = temp_dir("idempotent-quota");
+    let admin = init_admin(&data_dir);
+    let mut server = Server::start(&data_dir, true).await;
+    let alpha = create_tenant(&server, &admin, "Idempotent quota").await;
+    let (owner, _) = create_token(&server, &admin, &alpha, "owner", "owner").await;
+
+    let workflow = server
+        .post(
+            "/api/workflows",
+            Some(&owner),
+            json!({"ir": fixture_workflow("01_sequence.json")}),
+        )
+        .await;
+    assert_eq!(workflow.status, 200, "create failed: {}", workflow.body);
+    let published = server
+        .post(
+            "/api/workflows/wf_fixture_sequence/publish",
+            Some(&owner),
+            json!({}),
+        )
+        .await;
+    assert_eq!(published.status, 200, "publish failed: {}", published.body);
+    let quota = server
+        .put(
+            &format!("/api/enterprise/quotas/{alpha}"),
+            Some(&admin),
+            json!({
+                "maxWorkflows": 100,
+                "maxExecutionsPerDay": 1,
+                "maxSkills": 100,
+                "maxAgents": 100,
+                "maxPlugins": 50,
+                "maxConnections": 100,
+                "maxConcurrentRuns": 10
+            }),
+        )
+        .await;
+    assert_eq!(quota.status, 200, "quota update failed: {}", quota.body);
+
+    let body = json!({"input": {"value": 41}});
+    let first = server
+        .post_idempotent(
+            "/api/workflows/wf_fixture_sequence/executions",
+            Some(&owner),
+            body.clone(),
+            "quota-replay",
+        )
+        .await;
+    assert_eq!(first.status, 200, "first start failed: {}", first.body);
+    let first_id = first.json()["summary"]["id"]
+        .as_str()
+        .expect("first execution id")
+        .to_string();
+    let replay = server
+        .post_idempotent(
+            "/api/workflows/wf_fixture_sequence/executions",
+            Some(&owner),
+            body,
+            "quota-replay",
+        )
+        .await;
+    assert_eq!(replay.status, 200, "replay failed: {}", replay.body);
+    assert_eq!(replay.json()["summary"]["id"], json!(first_id));
+
+    let distinct = server
+        .post_idempotent(
+            "/api/workflows/wf_fixture_sequence/executions",
+            Some(&owner),
+            json!({"input": {"value": 42}}),
+            "quota-new-request",
+        )
+        .await;
+    assert_eq!(
+        distinct.status, 429,
+        "quota denial expected: {}",
+        distinct.body
+    );
+    assert_eq!(distinct.json()["error"]["code"], "TENANT_QUOTA");
     server.stop();
 }
 

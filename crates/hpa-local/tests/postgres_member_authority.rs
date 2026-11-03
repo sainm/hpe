@@ -64,7 +64,10 @@ impl Server {
             .env("HPA_POSTGRES_URL", database_url)
             .env("HPA_POSTGRES_RUNTIME", "1")
             .env("HPA_ENTERPRISE_MODE", "required")
-            .env("HPA_CONTROL_SYNC_INTERVAL_MS", "100")
+            // This suite verifies PostgreSQL authority, not cache refresh timing.
+            // A short interval legitimately repopulates SQLite and makes the
+            // zero-row assertions race with the periodic synchronizer.
+            .env("HPA_CONTROL_SYNC_INTERVAL_MS", "60000")
             .env("HPA_SCHEDULER_TICK_MS", "200")
             .spawn()
             .expect("spawn server");

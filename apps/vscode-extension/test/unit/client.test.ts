@@ -204,6 +204,18 @@ describe("RuntimeClient request construction", () => {
     });
   });
 
+  it("builds retryExecution requests", async () => {
+    const { calls, fetchImpl } = installFetch(() => jsonResponse({ summary: {}, state: {} }));
+    const client = createClient(fetchImpl);
+
+    await client.retryExecution("exec 1");
+
+    const call = calls[0];
+    expect(call?.url).toBe("http://127.0.0.1:8787/api/executions/exec%201/retry");
+    expect(call?.init.method).toBe("POST");
+    expect(call?.init.body).toBe("{}");
+  });
+
   it("builds exportSkill requests", async () => {
     const { calls, fetchImpl } = installFetch(() =>
       jsonResponse({ exported: true, path: "/tmp/skills/demo" }),

@@ -162,6 +162,70 @@ async fn server_routes_execution_events_and_artifacts_to_postgres_across_restart
     let completed = wait_execution(&client, runtime_port, &execution_id).await;
     assert_eq!(completed["summary"]["workflowId"], "wf_fixture_sequence");
 
+    let idempotent_start = || {
+        client
+            .post(format!(
+                "http://127.0.0.1:{runtime_port}/api/workflows/wf_fixture_sequence/executions"
+            ))
+            .header("Idempotency-Key", "pg-start-idempotent")
+            .json(&json!({"input": {"value": 12}}))
+            .send()
+    };
+    let first: Value = idempotent_start()
+        .await
+        .expect("first idempotent start")
+        .json()
+        .await
+        .expect("first idempotent response");
+    let replay: Value = idempotent_start()
+        .await
+        .expect("replayed idempotent start")
+        .json()
+        .await
+        .expect("replayed idempotent response");
+    assert_eq!(first["summary"]["id"], replay["summary"]["id"]);
+    let conflict = client
+        .post(format!(
+            "http://127.0.0.1:{runtime_port}/api/workflows/wf_fixture_sequence/executions"
+        ))
+        .header("Idempotency-Key", "pg-start-idempotent")
+        .json(&json!({"input": {"value": 99}}))
+        .send()
+        .await
+        .expect("conflicting idempotent start");
+    assert_eq!(conflict.status(), 409);
+    let conflict: Value = conflict.json().await.expect("conflict response");
+    assert_eq!(conflict["error"]["code"], "IDEMPOTENCY_CONFLICT");
+    let replay_id = first["summary"]["id"]
+        .as_str()
+        .expect("idempotent execution id");
+    let _ = wait_execution(&client, runtime_port, replay_id).await;
+    let retry = || {
+        client
+            .post(format!(
+                "http://127.0.0.1:{runtime_port}/api/executions/{replay_id}/retry"
+            ))
+            .header("Idempotency-Key", "pg-retry-idempotent")
+            .send()
+    };
+    let first_retry: Value = retry()
+        .await
+        .expect("first retry")
+        .json()
+        .await
+        .expect("first retry response");
+    let replay_retry: Value = retry()
+        .await
+        .expect("replayed retry")
+        .json()
+        .await
+        .expect("replayed retry response");
+    assert_eq!(first_retry["summary"]["id"], replay_retry["summary"]["id"]);
+    assert_ne!(
+        first_retry["summary"]["id"],
+        Value::String(replay_id.to_string())
+    );
+
     let stored: bool = sqlx::query_scalar(
         "SELECT EXISTS(
              SELECT 1 FROM hpa_tenant.executions

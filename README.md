@@ -29,10 +29,10 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 
 **Phase 1 至 Phase 12 的本地 MVP 子集已实现并通过当前自动化验收。** 这不等于原路线图的全部企业/云端退出标准；逐项差异见 [实现状态与验收边界](docs/10-quality/implementation-status.md)。产品代码位于 `crates/`、`apps/web/` 与 `apps/vscode-extension/`。
 
-**Phase 14 至 Phase 18：Skill、MCP、Connector、Plugin 元数据与 Agent 会话租约已完成本地验收。** Skill 包与版本、文件、运行和产物元数据，MCP PAT、审批、审计与外部服务器元数据，Connector 定义、连接与审计，插件包、安装状态、能力、事件、本地/远程 Marketplace 与插件贡献的 Connector/MCP server，以及 Agent 会话 owner lease，在 `HPA_POSTGRES_RUNTIME=1` 时切到 PostgreSQL，支持跨节点读取、启停、发布、审核、评分、撤回、token/审批/连接管理、审计与单写者会话执行；插件包文件、签名私钥与安装目录仍在节点本地，本地 SQLite 模式不变。Phase 13 的其余生产级工作包仍为 IN_PROGRESS。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、66 张租户表的 FORCE RLS、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease 和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Worker 注册/心跳/停用与 Worker Job API、平台令牌、审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本元数据、MCP PAT/审批/审计/服务器元数据、Connector 定义/连接/审计与 Plugin 生命周期/Marketplace 元数据均已切到 PostgreSQL（PostgreSQL 模式下对应 SQLite 表保持 0 行或仅作缓存）；Phase 13 的其余工作包不能视为整阶段完成。
+**Phase 14 至 Phase 18：Skill、MCP、Connector、Plugin 元数据与 Agent 会话租约已完成本地验收。** Skill 包与版本、文件、运行和产物元数据，MCP PAT、审批、审计与外部服务器元数据，Connector 定义、连接与审计，插件包、安装状态、能力、事件、本地/远程 Marketplace 与插件贡献的 Connector/MCP server，以及 Agent 会话 owner lease，在 `HPA_POSTGRES_RUNTIME=1` 时切到 PostgreSQL，支持跨节点读取、启停、发布、审核、评分、撤回、token/审批/连接管理、审计与单写者会话执行；插件包文件、签名私钥与安装目录仍在节点本地，本地 SQLite 模式不变。Phase 13 的其余生产级工作包仍为 IN_PROGRESS。PostgreSQL 18 已建立 schema、SQLx checksum migration、角色分离、68 张租户相关表的 FORCE RLS（42 张 `hpa_tenant` + 26 张 `hpa_control`）、幂等 SQLite 导入、outbox/fencing lease 和持久 MCP 状态原语；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution owner lease、协作取消请求与执行幂等键和 remote marker 已切到 PostgreSQL，`HPA_POSTGRES_EVENT_BUS=1` 再启用 Topic Event outbox consumer。Worker 注册/心跳/停用与 Worker Job API、平台令牌、审计、浏览器会话、OAuth 2.1 AS、企业租户/配额/成员/SCIM Group、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本元数据、MCP PAT/审批/审计/服务器元数据、Connector 定义/连接/审计与 Plugin 生命周期/Marketplace 元数据均已切到 PostgreSQL（PostgreSQL 模式下对应 SQLite 表保持 0 行或仅作缓存）；Phase 13 的其余工作包不能视为整阶段完成。
 
 - Rust Core：Canonical Workflow IR、JSON Schema 校验、Saphyr YAML 解析/输出、jaq 表达式、编译器与执行计划；Schema/静态/表达式/依赖/权限与执行策略五类校验；Node Registry（13 类节点、`typeVersion` 解析、旧版 `http.request@0.9.0` 迁移）。
-- Runtime：顺序/条件/多路分支/循环/并行节点、重试/退避、节点超时、错误回退、人工审批暂停与恢复、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。
+- Runtime：顺序/条件/多路分支/循环/并行节点、节点重试/退避、节点超时、错误回退、人工审批暂停与恢复、终态执行重试、运行中协作取消、内联子流程、HTTP/HTTPS 客户端、jq 脚本与变量节点；并行分支真并发（`maxConcurrency`），分支进度随检查点持久化；审批 SLA 到点自动按 `onTimeout` 恢复；启动和重试支持 `Idempotency-Key`；工作流级 `errorHandling.graph` 在未处理失败后执行并保留原始错误。
 - 安全边界：HTTP 默认仅允许回环；外部主机必须在节点 `permissions.network` 显式声明，重定向关闭，URL 禁止 userinfo；DNS 解析后拦截私网地址，除非规则显式允许；脚本仅执行 jq，禁止 `env`/`input`/`input_filename` 等越界函数。
 - 持久化：SQLite 保存工作流、发布版本、执行快照、追加事件与输出产物；发布版本冻结 IR 与 Node Registry 版本，同版本内容不可改写；执行可按发布版本启动；进程被强杀后可从最近检查点恢复。
 - Local API：127.0.0.1 上的 JSON API、SSE 事件流、审批中心接口、节点注册表 `/api/nodes`、OpenAPI `/api/openapi.json`、YAML validation SourceMap、技能源码/签名接口与嵌入式 Web UI。
@@ -50,7 +50,7 @@ Auralis 是一个统一的自动化与 AI 能力平台：用一套 Workflow IR �
 - Agent Platform：不可变 AgentVersion（`hpa.agent/v1`）、Agent Center/Designer/Test、会话与审批；Rust Agent Runtime 支持离线确定性 planner 与可选 OpenAI 兼容模型 planner；Skill/Workflow/MCP 工具调用、步骤/工具/token/成本/时间/深度预算、重复计划防护、检查点与 interrupt/resume、多 Agent handoff 预算继承、确定性 trace 回放；高风险工具强制审批，Workflow 审批保持独立。
 - Plugin & Connector Ecosystem：`hpa.plugin/v1` 声明式插件包、tar `.hplugin`、内容哈希与 Ed25519 签名/信任、依赖/兼容性/许可检查、安装/升级/回滚/启停/卸载；本地 Marketplace 的发布/审核/评分/撤回，以及签名 HTTP/离线远程索引、发布者/索引 key 轮换与撤回传播、Remote Marketplace Web/VS Code source/publisher/key/install 管理、持久 SSE 撤回推送；`hpa.connector/v1` 的 HTTP/File/PostgreSQL/Git/Redis MQ/S3 连接器；插件可贡献 Connector/MCP/Skill/Agent，且不在 API 进程加载插件代码。
 - Enterprise 基座：`control.db` 管理租户、API 令牌、OIDC/SCIM 成员目录、组角色映射、配额、Worker、备份与审计；每个租户使用独立 SQLite 与独立 API Router，TenantGate 按令牌租户路由，跨租户访问通过测试验证为 0；固定 8 角色 RBAC（`owner/admin/developer/publisher/operator/approver/auditor/viewer`）按 read/write/execute/approve 动作判定；OIDC JWT/JWKS Bearer（EdDSA/RS256/ES256）与 `hpa_ent_` 本地令牌并存；[SCIM 2.0](docs/08-platform/scim.md) Users/Groups 支持 filter、PATCH、ETag 与事务化角色映射；配额覆盖 Workflow/日执行/Skill/Agent/插件/连接/并发；审计支持 JSON/CSV 导出；Worker 注册/心跳/离线派生/禁用；租户备份、恢复、保留、删除与清理。默认本地模式匿名映射为 `local` 租户 owner；`HPA_ENTERPRISE_MODE=1|true|required` 强制 Bearer。
-- VS Code & Copilot 集成：`apps/vscode-extension`（`hpa.workbench`）薄客户端，10 个 Tree View、状态栏、Runtime 发现/重连、Workflow 运行与执行 Webview、事件/审批/取消、产物预览；Skill 安装/更新/移除到 `.github/skills` 或个人目录，备份回滚与本地修改检测；官方 `mcpServerDefinitionProviders` 注册本地 MCP Server，PAT 仅存 SecretStorage；`X-HPA-Tool-Name-Style: slug` 适配 VS Code 工具名限制。扩展不执行工作区脚本，未信任工作区只读。
+- VS Code & Copilot 集成：`apps/vscode-extension`（`hpa.workbench`）薄客户端，10 个 Tree View、状态栏、Runtime 发现/重连、Workflow 运行与执行 Webview、事件/审批/取消/重试、产物预览；Skill 安装/更新/移除到 `.github/skills` 或个人目录，备份回滚与本地修改检测；官方 `mcpServerDefinitionProviders` 注册本地 MCP Server，PAT 仅存 SecretStorage；`X-HPA-Tool-Name-Style: slug` 适配 VS Code 工具名限制。扩展不执行工作区脚本，未信任工作区只读。
 - Hybrid Worker：`hpa worker` 出站轮询控制面，同一 Rust Runtime 执行 Workflow 快照；一次性 `hpa_wrk_` token（租户绑定、SHA-256）、能力/并发、30s 租约、心跳续租、租约过期重排、旧 lease 409、协作取消；start/events/complete 先写本地持久 outbox，崩溃重启后继续上报；远程审批 SLA 自动恢复并重排；首次 start 写回租户 execution/events/artifacts，`remote_executions` 阻止本地 Runtime 接管。
 - Browser SSO：OIDC Authorization Code + PKCE（S256，public client）、state/nonce/redirect 校验、EdDSA/RS256/ES256 ID Token、JWKS/OKP/RSA/P-256；服务端 session 只存 token 哈希，refresh/ID token 使用 AES-256-GCM 加密，支持刷新轮换、静默续期和 RP-initiated logout；`hpa_session` HttpOnly/SameSite=Lax Cookie、CSRF header、成员/租户状态复核与平台管理员 allowlist；本地匿名模式与 Bearer/Worker/VS Code 认证不回归。
 - 可观测性：`/metrics` Prometheus 文本（HTTP 路由/状态/延迟、执行与节点直方图、调度器心跳与延迟、触发器发火、跨租户聚合 gauge）、`/api/ready` 真依赖探针、W3C/OTLP traces 与 Rust→Python/Worker/MCP 跨进程 traceId、执行详情步骤时间线（最慢步骤高亮）与设置页运行时状态卡片。
@@ -70,6 +70,9 @@ npx -y pnpm@12.16.1 --filter @hpa/web test
 npx -y pnpm@12.16.1 --filter @hpa/web build
 cargo build -p hpa-local
 npx -y pnpm@12.16.1 test:e2e
+npx -y pnpm@12.16.1 test:approval-branches
+npx -y pnpm@12.16.1 test:postgres
+npx -y pnpm@12.16.1 test:postgres:backup
 npx -y pnpm@12.16.1 --filter workbench test
 npx -y pnpm@12.16.1 --dir apps/vscode-extension run test:host
 npx -y pnpm@12.16.1 --dir apps/vscode-extension run package
@@ -291,7 +294,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npx -y pnpm@12.16.1 dev
 - 发布版本冻结 IR 与 Node Registry 版本；同一 `workflowVersion` 不能改写已发布内容（API 返回 `VERSION_FROZEN`）。执行默认运行最新草稿，也可在请求中带 `version` 运行指定发布版本。
 - Node Registry 当前版本 `2026.11.1`；手写配置必须先通过五类校验。`compensate` 错误模式、非 jq 脚本、未知权限与未注册版式会被拒绝。
 - 本地运行时限制：100,000 步、每节点默认 30s 超时、工作流可选总超时、HTTP 响应 8 MiB、500 节点/2,000 边、嵌套深度受限。
-- Phase 1/2 不包含 Agent；Phase 4 已加入本地 Agent Platform，Phase 5 已加入本地 Plugin/Connector/Marketplace，Phase 6 已加入本地 Enterprise 控制面，Phase 7 已加入本地 VS Code & Copilot 集成，Phase 8 已加入本地/私有 Hybrid Worker 执行，Phase 9 已加入本地 Enterprise Browser SSO。云端多节点 Control Plane、跨租户市场、远程发布者账号、OIDC SSO refresh token/SCIM 与计费仍属于后续阶段。
+- Phase 1/2 不包含 Agent；Phase 4 已加入本地 Agent Platform，Phase 5 已加入本地 Plugin/Connector/Marketplace，Phase 6 已加入本地 Enterprise 控制面，Phase 7 已加入本地 VS Code & Copilot 集成，Phase 8 已加入本地/私有 Hybrid Worker 执行，Phase 9 已加入本地 Enterprise Browser SSO。云端多节点 Control Plane、跨租户市场和计费仍属于后续阶段；浏览器 SSO refresh/logout 与 SCIM Users/Groups 已实现。
 
 ## Phase 2 行为边界
 
@@ -338,7 +341,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npx -y pnpm@12.16.1 dev
 ## Phase 6 行为边界
 
 - 默认本地模式无登录：匿名请求映射为 `local` 租户的 `owner` 且视为平台管理员；只有设置 `HPA_ENTERPRISE_MODE` 后才强制 Bearer。把本地端口暴露给他人等同于交出控制面。
-- 默认运行路径仍是“每租户独立 SQLite 文件 + TenantGate 路由”；TenantGate 缓存无 TTL，长期运行大量租户会增加内存与文件句柄。`HPA_POSTGRES_RUNTIME=1` 已把 Workflow/Execution/Trigger、execution lease 和 remote marker 切到 PostgreSQL并验证跨重启与 topic 幂等，但 Enterprise/Worker Job 等仍走 SQLite，完整多节点切换尚未完成，见 [PostgreSQL 控制面基线](docs/08-platform/postgres-control-plane.md)。
+- 默认本地运行路径仍是“每租户独立 SQLite 文件 + TenantGate 路由”；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger、execution lease、协作取消请求、执行幂等键、Enterprise/Worker Job、令牌/审计、浏览器会话、OAuth AS、成员/SCIM、Agent、Skill、MCP、Connector 与 Plugin 元数据均以 PostgreSQL 为权威，SQLite 只作单节点模式或可重建缓存。TenantGate 缓存无 TTL，长期运行大量租户会增加内存与文件句柄。
 - RBAC 是固定 8 角色 + 4 个路径近似动作（read/write/execute/approve），没有资源级 ACL、自定义角色或 ABAC；`owner/admin/developer/publisher` 对租户 API 实际等价。
 - Phase 6 时 OIDC 只接受 EdDSA/Ed25519 Bearer JWT 与 JWKS，没有浏览器 SSO、授权码回调、登录会话、刷新令牌或登出；Phase 9 已加入浏览器 SSO 与 EdDSA/RS256/ES256。成员目录只覆盖 OIDC 主体的角色/禁用状态，没有密码、组、邀请或成员自服务；未登记 OIDC 主体按 claims 认证。
 - 配额检查针对特定创建路径与当日计数；日计数按 UTC；并发数统计 `running` + `waiting_approval`。配额不是权限，也不含计量/计费或付费计划。
@@ -395,7 +398,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npx -y pnpm@12.16.1 dev
 
 ## Phase 8 行为边界
 
-- Worker 与控制面均为单节点 SQLite；没有 Redis/Postgres 队列、HA、自动扩缩容或跨机控制库共享。Worker 必须能通过 loopback HTTP 或 HTTPS 访问控制面。
+- Worker 可由共享 PostgreSQL 的控制面派发；没有 Redis Stream、自动扩缩容、mTLS 或跨主机自动故障切换。Worker 必须能通过 loopback HTTP 或 HTTPS 访问控制面。
 - `hpa_wrk_` token 绑定 worker/tenant，明文只返回一次；轮换/禁用/租户删除会吊销。Worker 不得跨租户 lease；任务 snapshot 含 Workflow 定义，禁止把 secret 写进 Workflow。
 - 同一 Rust Runtime 执行，不引入第二执行引擎；副作用按至少一次语义。daemon 使用 `<data_dir>/worker-outbox.db` 持久化 start/events/complete，进程重启后先排空 outbox；HTTP 成功但删除确认前崩溃会安全重放，旧 lease 的迟到上报返回 409 并清理。
 - 审批等待释放并发槽；审批后 Job 重新入队并从保存 state 继续。远程审批 SLA 由控制面后台扫描后自动按 `onTimeout` 恢复并重新入队。
@@ -411,7 +414,7 @@ cd apps/web && HPA_API_URL=http://127.0.0.1:8787 npx -y pnpm@12.16.1 dev
 - Skill 安装调用 Runtime 的 export API 写快照，扩展与 Runtime 必须共享文件系统；没有在线 Marketplace 下载、自动更新或跨设备签名信任同步。替换前备份、失败回滚，安装后本地修改需显式确认。
 - MCP PAT 与 API token 只在 SecretStorage；不写 settings/workspace/日志/Webview。未信任工作区只读，运行/审批/取消/Skill 写入均被拒绝。
 - 实测 VS Code 1.143.1；未建立 1.140–1.143 的运行时/高对比/Remote 兼容矩阵。Copilot Chat 可发现 `.github/skills` 中的 Skill，但模型驱动的 MCP `tools/call` 未验证，也未准备登录会话。
-- 未实现 Custom Instructions/Custom Agents 生成、完整 Designer、远程工作区高级支持、Marketplace 发布或自动升级。
+- 未实现 Custom Instructions/Custom Agents 生成、完整 Designer、远程工作区高级支持、Marketplace 发布或自动升级；执行重试已覆盖命令、Tree View 和执行 Webview。
 
 ## 技术栈
 

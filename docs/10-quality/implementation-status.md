@@ -1,6 +1,6 @@
 # 实现状态与验收边界
 
-> 核对日期：2026-11-02。本文是当前代码、README 与路线图之间唯一的完成度口径。
+> 核对日期：2026-11-04。本文是当前代码、README 与路线图之间唯一的完成度口径。
 
 ## 1. 结论
 
@@ -14,14 +14,14 @@ Phase 1～12 的**本地 MVP 子集**已经实现并通过仓库内自动化；�
 
 | Phase | 当前可验证范围 | 仍未完成或未证明 |
 | --- | --- | --- |
-| 1 Core Workflow | IR、13 类节点、发布冻结、分支/循环/并行/审批/子流程/错误图；YAML SourceMap；强杀进程恢复；OpenAPI 与 JSON Schema 契约；键盘/axe 基础检查 | 完整跨浏览器矩阵、全量属性测试、所有节点组合的 UI E2E |
+| 1 Core Workflow | IR、13 类节点、发布冻结、分支/循环/并行/审批/子流程/错误图；运行中协作取消；启动/重试幂等；终态重试；YAML SourceMap；强杀进程恢复；与运行时路由一致的 OpenAPI 与 JSON Schema 契约；键盘/axe 基础检查 | 完整跨浏览器矩阵、全量属性测试、所有节点组合的 UI E2E |
 | 2 Skill | 导入/测试/运行/发布/导出、三运行时沙箱、源码编辑生成新版本、本地 Ed25519 签名与篡改拒绝 | Claude Code 真实模型会话加载、在线依赖安装、容器级便携沙箱 |
 | 3 MCP | modern/legacy、MRTR、PAT/OAuth、鉴权 GET SSE、`subscriptions/listen`、企业租户路由、schema/artifact 资源；PostgreSQL 持久 session/subscription/notification/task、跨节点 task update 命令与双进程强停 SSE 恢复、有界慢消费者背压与 sequence 重放；PAT/审批/审计/外部服务器元数据在 `HPA_POSTGRES_RUNTIME=1` 时 PostgreSQL 权威且跨节点一致；官方 2025-11-25 核心 conformance 9/9 | 真实外部模型工具调用、官方 2026-07-28 server suite、统一事件总线、跨节点低延迟通知传输 |
 | 4 Agent | Rust deterministic/OpenAI 兼容 planner；显式 Python 3.13 LangGraph planner、预算、审批/恢复、跨请求取消、控制面强停恢复、SQLite 与租户隔离 PostgreSQL checkpoint、实际 ToolService 与工具幂等账本、预算继承 sub-agent handoff、PostgreSQL 会话 owner lease 与过期接管、只读 rootfs/cgroup/无网络容器演练、LiteLLM 受控端到端 | 真实云模型、受控模型网络/容器 mTLS 与多副本 session 路由 |
 | 5 Plugin | 声明式插件、Ed25519、安装/升级/回滚；HTTP/File/PostgreSQL/Git/Redis MQ/S3 Connector；签名远程/离线 Marketplace、发布者/索引 key 轮换与撤回、Remote Marketplace Web/VS Code UI、持久 SSE 撤回推送；Connector 定义/连接/审计与 Plugin 生命周期/Marketplace 元数据在 `HPA_POSTGRES_RUNTIME=1` 时 PostgreSQL 权威且跨节点一致；SBOM/许可/静态扫描、在线 OSV/离线漏洞库门禁、key-based cosign bundle + OCI digest provenance | 可执行 TS handler、恶意软件情报、Fulcio/Rekor keyless、OCI Registry attestation 拉取、跨控制面 federation、插件包文件跨节点同步 |
-| 6 Enterprise | 单节点 SQLite 多租户、8 角色、配额、审计、备份、成员目录、SCIM Users/Groups、单节点 SSO；PostgreSQL 18 schema、SQLx migration、角色分离、66 表 FORCE RLS、幂等 SQLite 导入；`HPA_POSTGRES_RUNTIME=1` 的 Workflow/Execution/Trigger Repository、execution lease、重启读取与 topic 幂等 | Enterprise/Worker Job/Agent 等其余 API 切换、双写核对、HA/多节点、控制库在线备份、SaaS 计费、完整合规评审 |
+| 6 Enterprise | 本地 SQLite 与共享 PostgreSQL 两种模式；8 角色、配额、审计、备份、成员目录、SCIM Users/Groups、单节点 SSO；PostgreSQL 18 schema、21 个 SQLx migration、角色分离、68 表 FORCE RLS、幂等 SQLite 导入；`HPA_POSTGRES_RUNTIME=1` 的 Workflow/Execution/Trigger、Worker Job、Enterprise、Agent、Skill、MCP、Connector、Plugin Repository 与 execution lease | 真实企业 IdP/SCIM/CA/Vault、跨主机自动故障切换与 VIP 切换、在线 PITR、跨版本滚动升级、SaaS 计费、完整合规评审 |
 | 7 VS Code | 扩展、10 个 Tree View、Runtime/MCP/Skill 集成、7 个 Host 检查 | Copilot 模型主动 MCP 工具调用、跨 VS Code 版本矩阵、Remote 工作区高级场景 |
-| 8 Hybrid Worker | 远程执行、租约、审批恢复、取消、本地持久 outbox、远程审批 SLA；PostgreSQL outbox、幂等账本、Scheduler/Worker fencing lease、实际 Scheduler 双进程 leader election/failover 与 re-drive 原语 | 触发器/Worker 生产路由切换、双 Worker 强杀与滚动升级、mTLS、对象存储、远程 Agent/Plugin、自动扩缩容 |
+| 8 Hybrid Worker | 远程执行、租约、审批恢复、协作取消、本地持久 outbox、远程审批 SLA；PostgreSQL Worker/Job 权威、幂等账本、Scheduler/Worker fencing lease、双进程 leader election/failover 与 re-drive | 双 Worker 强杀与跨版本滚动升级、mTLS、对象存储、远程 Agent/Plugin、自动扩缩容 |
 | 9 Browser SSO | OIDC Code+PKCE、三种 ID Token 算法、服务端 session/CSRF、成员目录、加密 refresh token、会话轮换、silent renew、RP-initiated logout；SCIM 2.0 Users/Groups 与组角色映射 | 多 IdP、真实企业 IdP/SCIM 验收 |
 | 10 OAuth AS | Code+PKCE、DCR、同意、refresh 轮换/复用检测、吊销/内省/JWKS | ID Token、CIMD、PAR、JARM、DPoP、RS256、跨节点吊销同步 |
 | 11 Triggers | cron、webhook、topic event、幂等、固定偏移时区、历史；PostgreSQL trigger state/fire 与可选 Topic Event outbox consumer | IANA/DST、webhook/schedule/task 统一 outbox、mTLS/IP 白名单、直接远程 Worker 派发 |
@@ -39,12 +39,12 @@ Phase 1～12 的**本地 MVP 子集**已经实现并通过仓库内自动化；�
 - `event` trigger 支持 topic 订阅与 `/api/events/{topic}` 幂等发布。
 - 前端补齐严重/关键 axe 规则和首 Tab 焦点检查；浏览器脚本改用项目依赖，不再引用其他仓库的绝对路径。
 - 根目录提交 `pnpm-lock.yaml`，CI 执行 fmt/clippy/test、Web/扩展、Playwright E2E、cargo-deny、SBOM/许可扫描和 npm audit。
-- PostgreSQL 18 迁移由 SQLx checksum/lock 管理；七个 NOLOGIN 角色分离迁移、租户运行时、Worker、Scheduler、平台管理、运维和只读审计权限。集成测试验证 66 张租户表的 FORCE RLS、双租户隔离、默认拒绝、连接复用、只读限制和 checksum mismatch。
+- PostgreSQL 18 迁移由 SQLx checksum/lock 管理；七个 NOLOGIN 角色分离迁移、租户运行时、Worker、Scheduler、平台管理、运维和只读审计权限。集成测试验证 68 张租户相关表的 FORCE RLS、双租户隔离、默认拒绝、连接复用、只读限制和 checksum mismatch。
 - SCIM 2.0 提供 ServiceProviderConfig、ResourceTypes、Schemas、Users/Groups CRUD、精确 `eq` filter、分页、PATCH、弱 ETag 和事务化固定角色映射；角色冲突、重复 userName、跨租户 ID 与 If-Match 失配均有 HTTP 负向测试。
 - MCP 持久 task 使用稳定 `HPA_NODE_ID` 绑定执行 owner；跨节点取消命令持久化并按 owner/lease 消费。双进程测试强停 owner 后由另一节点提交命令，owner 重启完成本地 execution 取消和 PostgreSQL task 投影更新。
 - Remote Marketplace Web UI 通过只读 source/publisher 目录 API 展示签名 key、index sequence、刷新状态、远程包和安装入口；Playwright 在 1440/607 验证 source/publisher/key 可见、无横向溢出和 serious/critical axe=0。
 - `hpa db import-sqlite` 以只读方式导入控制库和租户库，覆盖 JSON、Blob、时间戳与复合外键；业务目标租户由源目录强制注入，重复执行不新增行。短生命周期 OIDC/OAuth 状态不复用，升级要求重新登录。
-- PostgreSQL backup rehearsal 使用真实 `pg_dump`/`pg_restore` 恢复到临时库，并比较 migration checksum、69 个业务关系行数和 66 张 FORCE RLS 表。
+- PostgreSQL backup rehearsal 使用真实 `pg_dump`/`pg_restore` 恢复到临时库，并比较 migration checksum、业务关系行数和 68 张 FORCE RLS 表。
 - PostgreSQL transactional outbox、tenant 幂等账本、Scheduler leader lease 和 Worker Job fencing 已实现；测试验证并发消费者仅一方领取、过期接管递增 token、旧 token 提交失败、重试进入 dead、幂等 hash 冲突拒绝和 job re-drive。
 - MCP 的 PostgreSQL session/subscription/notification/task 状态实现 tenant + token 绑定、TTL、sequence 恢复和终态约束；`HPA_POSTGRES_MCP=1` 时 session、subscription、目录/task SSE 和 owner-node task update 消费者均已接入。
 - 可选 Python Worker 使用 LangGraph；显式 `python` planner 通过认证 JSONL 启动/恢复/取消独立进程，工具调用回到 Rust ToolService。模型风险由 Rust 元数据覆盖，审批能力绑定调用哈希，工具账本拒绝重复 in-progress/参数变化；LiteLLM 通过本地受控 OpenAI-compatible 网关完成模型→Python→Rust→Workflow 端到端，控制面强停后 `continue` 可从 SQLite 或租户独立 PostgreSQL schema 恢复。
@@ -105,4 +105,4 @@ npx -y pnpm@12.16.1 check
 
 ## 6. 下一个目标
 
-Phase 13“生产级补全”是当前 active 目标，范围和退出标准见 [Phase 13 路线图](../11-roadmap/phase-13-production-completion.md)。整体状态为 `IN_PROGRESS`；P13-01 的 schema/RLS/checksum migration/SQLite 导入、PostgreSQL Workflow/Execution/Trigger Repository 与 execution owner lease、P13-02 的 outbox/fencing、Topic Event consumer 与双进程 Scheduler leader failover、P13-03 的持久 MCP 与慢消费者重放、Python Worker、四类新 Connector、Remote Marketplace Web UI、Browser SSO refresh/logout、SCIM Users/Groups 和 OTLP traces/metrics/logs/tail sampling/属性门禁已有当前环境证据，但 Enterprise/Worker Job 等其他生产 API 未切换 PostgreSQL，webhook/schedule/task 尚未统一到同一 outbox，多 IdP、真实企业 SCIM、HA/VS Code Remote UI/真实外部客户端仍未闭合，不提前标记 PASS。国内包镜像与容器 digest 有独立静态门禁，npm audit 的权威公告源是显式安全例外。
+Phase 13“生产级补全”是当前 active 目标，范围和退出标准见 [Phase 13 路线图](../11-roadmap/phase-13-production-completion.md)。整体状态为 `IN_PROGRESS`；PostgreSQL 控制面、执行幂等与协作取消、outbox/fencing、Topic Event consumer、Scheduler leader failover、持久 MCP、Python Worker、Connector/Marketplace、Browser SSO、SCIM 和 OTLP 已有本地证据。剩余阻塞集中在 webhook/schedule/task 统一 outbox、多 IdP、真实企业 SCIM/IdP/CA/Vault、跨主机自动故障切换/PITR、跨版本滚动升级、生产 Collector、VS Code Remote UI 与真实外部 AI 客户端，不能提前标记 PASS。

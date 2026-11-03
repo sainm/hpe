@@ -49,6 +49,9 @@ export class ExecutionsProvider extends ViewProvider {
 function contextForStatus(status: string): string {
   if (status === "running") return "hpa.execution.running";
   if (status === "waiting_approval") return "hpa.execution.waiting";
+  if (["succeeded", "failed", "cancelled"].includes(status)) {
+    return "hpa.execution.finished";
+  }
   return "hpa.execution";
 }
 

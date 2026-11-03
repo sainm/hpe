@@ -1,6 +1,6 @@
 # Phase 7 本地 VS Code & Copilot 集成：实现与边界
 
-> 本页描述 2026-11-01 实际落地的 `apps/vscode-extension`。扩展是薄客户端：只做发现、认证、MCP provider、Skill 安装、查看与跳转；Workflow/Skill 脚本/Agent/插件执行仍由 Rust Local Runtime 完成。
+> 本页描述 2026-11-04 当前 `apps/vscode-extension`。扩展是薄客户端：只做发现、认证、MCP provider、Skill 安装、查看、审批、取消、重试与跳转；Workflow/Skill 脚本/Agent/插件执行仍由 Rust Local Runtime 完成。
 
 ## 1. 实际形态
 
@@ -10,7 +10,7 @@
 | VS Code | `engines.vscode: ^1.143.0`；本机 1.143.1 实测 |
 | 类型 | `@types/vscode 1.140.0`（低于最低版本以避免使用未发布 API） |
 | 构建 | esbuild 单 bundle `dist/extension.js`，`vscode` external |
-| 测试 | Vitest 60；`@vscode/test-electron` 7 项 Extension Host 检查 |
+| 测试 | Vitest 65；`@vscode/test-electron` 7 项 Extension Host 检查 |
 | 打包 | `@vscode/vsce 4.1.0` → `hpa-workbench.vsix` |
 | UI 文档 | 10 个 Tree View、执行/产物 Webview、状态栏、Command Palette |
 | 本地 API | `http://127.0.0.1:8787/api/*`（不是早期文档示例的 4780/`/api/v1`） |
@@ -27,7 +27,7 @@ apps/vscode-extension/
 ├── src/
 │   ├── extension.ts          # activation、服务装配、测试导出
 │   ├── controller.ts         # Runtime 发现/健康轮询/SecretStorage/MCP token
-│   ├── commands.ts           # 命令与 QuickPick/审批/取消/运行
+│   ├── commands.ts           # 命令与 QuickPick/审批/取消/重试/运行
 │   ├── config.ts             # 端点/模式/语言/安装目标校验
 │   ├── i18n.ts               # ja/en/zh 运行时消息
 │   ├── contracts.ts          # HpaServices 与安装记录
@@ -62,14 +62,14 @@ apps/vscode-extension/
 | MCP Servers | `/api/mcp/overview`、`/api/mcp/servers` | 刷新、注册 provider、打开 MCP Center |
 | Plugins | `/api/plugins` | 打开 Marketplace |
 | Local Runtime | health | 重连、显示版本/端点 |
-| Executions | `/api/executions` | 打开详情、取消、审批、打开 Web |
+| Executions | `/api/executions` | 打开详情、取消、审批、重试、打开 Web |
 | Artifacts | `/api/artifacts` | JSON 预览、打开 Web |
 | Settings | 本地配置与 token 状态 | 打开扩展设置 |
 
 - 所有数据视图监听 Runtime 状态和 `dataEvents`，在连接/配置/写操作后刷新。
 - Workflow 运行要求工作区已信任；输入为 JSON 文本，空输入等价 `{}`。已发布 Workflow 传入冻结版本，草稿运行最新内容。
-- 执行详情 Webview 每 2 秒刷新非终态执行；审批使用当前 `waiting.nodeId`，取消/审批都要求信任并二次确认。
-- Webview 使用 `default-src 'none'`、nonce style/script、无远程资源；所有 Runtime 数据 HTML 转义；消息严格匹配 `refresh|cancel|decide`。
+- 执行详情 Webview 每 2 秒刷新非终态执行；审批使用当前 `waiting.nodeId`，取消/审批/重试都要求信任并二次确认。
+- Webview 使用 `default-src 'none'`、nonce style/script、无远程资源；所有 Runtime 数据 HTML 转义；消息严格匹配 `refresh|cancel|retry|decide`。
 
 ## 5. MCP provider 与 VS Code 工具名适配
 
@@ -102,8 +102,8 @@ Skill 内容不进入扩展 bundle，扩展也不执行脚本。流程：
 
 ## 7. 安全与信任
 
-- `workspace.isTrusted=false`：可查看；运行/取消/审批/Skill 写入被拒绝。Personal Skill 写入也要求信任。
-- 所有写操作前二次确认；取消/审批使用服务端返回的当前 nodeId；扩展不伪造审批。
+- `workspace.isTrusted=false`：可查看；运行/取消/审批/重试/Skill 写入被拒绝。Personal Skill 写入也要求信任。
+- 所有写操作前二次确认；取消/审批使用服务端返回的当前 nodeId；重试只接受终态执行；扩展不伪造审批。
 - 扩展不调用 shell 执行 Workflow/Skill；`hpa.runtime.start` 只启动显式配置的机器级 binary，参数来自机器级设置，用户先确认。
 - 扩展不存密码/OIDC token；MCP PAT 与 API token 只在 SecretStorage。日志只记录端点与错误摘要。
 - VSIX 不含 Secret、测试夹具或源码；`.vscodeignore` 排除 `src/`、`test/`、source map 等。
@@ -119,7 +119,7 @@ Skill 内容不进入扩展 bundle，扩展也不执行脚本。流程：
 已执行：
 
 ```text
-npm test                     # 60 Vitest passed
+npm test                     # 65 Vitest passed
 pnpm --dir apps/vscode-extension run test:host   # 7 checks; starts local Runtime
 pnpm --dir apps/vscode-extension run package     # hpa-workbench.vsix
 code --install-extension ... # 临时 extensions-dir 安装/升级成功

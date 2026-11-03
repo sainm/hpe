@@ -17,6 +17,7 @@
   "command.workflow.run": "Auralis: Run Workflow",
   "command.execution.open": "Auralis: Open Execution",
   "command.execution.cancel": "Auralis: Cancel Execution",
+  "command.execution.retry": "Auralis: Retry Execution",
   "command.execution.approve": "Auralis: Decide Approval",
   "command.artifact.preview": "Auralis: Preview Artifact",
   "command.skill.install": "Auralis: Install Skill",

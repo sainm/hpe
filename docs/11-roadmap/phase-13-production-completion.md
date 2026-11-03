@@ -1,6 +1,6 @@
 # Phase 13：生产级补全
 
-> 状态：**P13-01～P13-07 本地验收完成；P13-08 仅外部客户端与外部基础设施部分 `BLOCKED_EXTERNAL`**（2026-11-03 复核）。逐项证据见 [Phase 13–18 状态台账](../10-quality/phase-13-18-status.md)。
+> 状态：**P13-01～P13-07 本地验收完成；P13-08 仅外部客户端与外部基础设施部分 `BLOCKED_EXTERNAL`**（2026-11-04 复核）。逐项证据见 [Phase 13–18 状态台账](../10-quality/phase-13-18-status.md)。
 >
 > 完成判据：代码、迁移、自动化测试、可重复 E2E、部署/运维文档和证据同时存在。外部账号或基础设施缺失时标记 `BLOCKED_EXTERNAL`，不得用 mock、截图或本地单节点结果替代生产验收。
 
@@ -20,7 +20,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-01 PostgreSQL 控制面与租户 RLS
 
-> 进度：**IN_PROGRESS**。PostgreSQL 18 schema、SQLx checksum migration、七个 NOLOGIN 角色、40 张租户表 + 26 张控制面表的 FORCE RLS、checksum mismatch、双租户隔离、幂等 SQLite 导入和临时库 dump/restore 校验已建立；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution lease、remote marker 与 **Worker 注册/心跳/停用**均已切到 PostgreSQL（`/api/enterprise/workers` 不再写 SQLite 镜像，见下方 `postgres_worker_registry` 证据）。Enterprise 的**平台令牌与审计事件**、**浏览器会话**、**OAuth 2.1 AS 状态**（clients/codes/tokens/consents/signing keys）、**租户/配额/成员/SCIM Group 读写**与 **Agent 版本/会话/事件/审批/工具调用**均已切到 PostgreSQL；SQLite 控制表降级为可重建缓存（周期任务从 PostgreSQL 重建），API 请求不再写 SQLite 权威行。`postgres_oauth_cross_node` 验证 A 注册授权、B 兑换并内省；`postgres_scim_cross_node` 验证成员/组跨节点一致；`postgres_member_authority` 验证成员角色覆盖与租户暂停跨节点生效；`postgres_agent_cross_node` 验证 Agent 版本、会话恢复/取消、审批与工具幂等跨节点一致；`postgres_agent_lease_cross_node` 验证会话 owner lease、过期接管与旧 token 围栏。Skill、MCP、Connector 与 Plugin 元数据已分别由 [Phase 14](phase-14-skill-postgres.md)、[Phase 15](phase-15-mcp-control-postgres.md)、[Phase 16](phase-16-connector-postgres.md) 与 [Phase 17](phase-17-plugin-postgres.md) 切到 PostgreSQL，Agent 会话租约由 [Phase 18](phase-18-agent-lease.md) 补齐；剩余差距见 [企业控制面迁移](../08-platform/postgres-enterprise-migration.md)。运维契约见 [PostgreSQL 控制面基线](../08-platform/postgres-control-plane.md)。
+> 进度：**IN_PROGRESS**。PostgreSQL 18 schema、21 个 SQLx checksum migration、七个 NOLOGIN 角色、42 张租户表 + 26 张控制面表的 FORCE RLS、checksum mismatch、双租户隔离、幂等 SQLite 导入和临时库 dump/restore 校验已建立；`HPA_POSTGRES_RUNTIME=1` 时 Workflow/Execution/Trigger Repository、execution lease、执行幂等键、协作取消请求、remote marker 与 **Worker 注册/心跳/停用**均已切到 PostgreSQL（`/api/enterprise/workers` 不再写 SQLite 镜像，见下方 `postgres_worker_registry` 证据）。Enterprise 的**平台令牌与审计事件**、**浏览器会话**、**OAuth 2.1 AS 状态**（clients/codes/tokens/consents/signing keys）、**租户/配额/成员/SCIM Group 读写**与 **Agent 版本/会话/事件/审批/工具调用**均已切到 PostgreSQL；SQLite 控制表降级为可重建缓存（周期任务从 PostgreSQL 重建），API 请求不再写 SQLite 权威行。`postgres_oauth_cross_node` 验证 A 注册授权、B 兑换并内省；`postgres_scim_cross_node` 验证成员/组跨节点一致；`postgres_member_authority` 验证成员角色覆盖与租户暂停跨节点生效；`postgres_agent_cross_node` 验证 Agent 版本、会话恢复/取消、审批与工具幂等跨节点一致；`postgres_agent_lease_cross_node` 验证会话 owner lease、过期接管与旧 token 围栏。Skill、MCP、Connector 与 Plugin 元数据已分别由 [Phase 14](phase-14-skill-postgres.md)、[Phase 15](phase-15-mcp-control-postgres.md)、[Phase 16](phase-16-connector-postgres.md) 与 [Phase 17](phase-17-plugin-postgres.md) 切到 PostgreSQL，Agent 会话租约由 [Phase 18](phase-18-agent-lease.md) 补齐；剩余差距见 [企业控制面迁移](../08-platform/postgres-enterprise-migration.md)。运维契约见 [PostgreSQL 控制面基线](../08-platform/postgres-control-plane.md)。
 
 交付：
 
@@ -183,7 +183,7 @@ Phase 13 必须保持以下不变量：
 
 ## 5. 当前环境证据（2026-11-02）
 
-- PostgreSQL 18.4：19 个 SQLx migration 从空库应用成功，第二次 applied=0；66 张 FORCE RLS 租户表，备份恢复后 69 个业务关系行数与 checksum 一致。
+- PostgreSQL 18.4：21 个 SQLx migration 从空库应用成功，第二次 applied=0；68 张 FORCE RLS 租户相关表，备份恢复后业务关系行数与 checksum 一致。
 - PostgreSQL tests：RLS、checksum mismatch、幂等导入、outbox/fencing、持久 MCP、HTTP SSE 路由全部通过。
 - Scheduler leadership：两个独立 `hpa serve` 进程共享 PostgreSQL lease，启动后只有一个 `hpa_scheduler_leader=1`；强杀 leader 后 standby 在 2 秒 TTL 内接管，旧 leader 重启仍为 standby，未形成并发 leader。
 - Connector：真实 PostgreSQL 参数化读写、Git、Redis pub/sub 与 MinIO SigV4 往返通过；负向测试覆盖跨租户/SQL 写误用/路径/通道/篡改。
@@ -195,20 +195,21 @@ Phase 13 必须保持以下不变量：
 - OTLP sampling/security：Collector 示例保留 error、慢于 5 秒和 10% 基线 trace，限制 `decision_wait`/`num_traces`/新 trace 速率；traces/metrics/logs 均删除已知 Authorization、Cookie、API key、模型 key、SQL statement 和 checkpoint 属性，`pnpm check:otel` 验证策略存在及有界。
 - Browser SSO：AES-256-GCM token-at-rest、refresh 轮换/旧 Cookie 失效/上游拒绝撤销、Web silent renewal、RP-initiated logout 与一次性 state 通过 Rust HTTP 和 Playwright E2E。
 - SCIM 2.0：Users/Groups CRUD、精确 eq filter、分页、PATCH、ETag、租户隔离、重复身份冲突、角色映射事务回滚与删除组恢复直接角色通过 Rust HTTP 和独立 E2E；真实企业 IdP 推送仍为 `BLOCKED_EXTERNAL`。
-- PostgreSQL SCIM：`0010`～`0013` migration 已应用；当前 schema 共 66 张 FORCE RLS 租户表，备份恢复后 69 个业务关系、migration checksum 与 RLS 数量一致。
+- PostgreSQL SCIM：`0010`～`0013` migration 已应用；当前 schema 共 68 张 FORCE RLS 租户相关表，备份恢复后业务关系、migration checksum 与 RLS 数量一致。
 - PostgreSQL ExecutionRuntime：真实 `hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 下完成 workflow snapshot/registry version 物化、execution insert/update、event 追加和 output artifact；PostgreSQL 中可直接核对 execution/events/artifact。强停并重启后 API 仍从 PostgreSQL 读取 execution 与 events。相同 workflow/version 的 IR 内容变化返回 `WorkflowSnapshotConflict`，跨租户查询为 0 行；remote execution marker 同库保存，本地 recovery 不接管远程执行；每日/并发配额也按 PostgreSQL execution 计数。
 - PostgreSQL WorkflowRepository：draft upsert、publish、current/list/version、workflow count 全部 PG；同版本变更失败关闭，新版本可追加，跨租户不可见。`hpa serve` E2E 证明发布版本不在 SQLite，API versions 与 Event Bus consumer 均从 PG 读取。
 - Execution Lease：每 step 前续租，state/events 提交匹配 holder/token/未过期 lease。lease 过期后节点 B 递增 token 接管，节点 A 的 save/release 失败；空 data_dir 节点可从 PG running execution + workflow snapshot 恢复完成并释放 lease。
-- 发布产物：`pnpm release:pack --profile debug --skip-build` 生成 `hpa-0.1.0-<sha>-darwin-arm64.tar.gz`（51 个文件、19 个迁移、12 个前端资源、2 份 CycloneDX SBOM），`pnpm release:verify` 校验压缩包 sha256、逐文件 `SHA256SUMS`，并在临时 data dir 上跑通 `hpa doctor`（status ok）。
+- 发布产物：`pnpm release:pack --profile debug --skip-build` 生成 `hpa-0.1.0-<sha>-darwin-arm64.tar.gz`（包含 `migrations/postgres/`、Web 资源与 CycloneDX SBOM），`pnpm release:verify` 校验压缩包 sha256、逐文件 `SHA256SUMS`，并在临时 data dir 上跑通 `hpa doctor`（status ok）。
 - Hybrid Worker + PostgreSQL 端到端：真实 `hpa worker` daemon 在 `HPA_POSTGRES_RUNTIME=1` 下从 PostgreSQL 领取任务、上报 `start`、执行完成并写回 `hpa_tenant.executions`/`events`，SQLite `enterprise_worker_jobs` 保持 0 行（`postgres_worker_daemon`）。该测试暴露并修复了一个只在 PostgreSQL 出现的缺陷：`remote_executions` 外键要求执行行先存在，而 worker `start` 原先在插入执行行之前就写远端标记，导致守护进程一直 500 重试。
 - 缓存漂移检查：`hpa db verify-mirror` 比对 PostgreSQL 权威与 SQLite 缓存（租户/配额/成员），输出分类漂移并以非零退出码结束；`postgres_mirror_verify` 证明「缓存收敛后为零 → 直接改 SQLite 报 `member.attrMismatch` → PG→SQLite 缓存重建后归零」。
 - 控制面缓存重建：`HPA_POSTGRES_RUNTIME=1` 下周期任务（`HPA_CONTROL_SYNC_INTERVAL_MS`，默认 30 秒）从 PostgreSQL 全量重建 SQLite 租户/配额/成员缓存并删除多余行；不再把 SQLite 写回 PostgreSQL。`postgres_control_refresh` 验证 SCIM 成员无需重启即出现在 `hpa_control.members`。
 - 配额权威：`PUT /api/enterprise/quotas/{tenant}` 先写 `hpa_control.quotas`（失败即请求失败），SQLite 仅作缓存；`postgres_control_mirror` 验证空 data dir 节点可为未见过的租户写配额，另一节点读到同一值。
-- 全量门禁复核（2026-11-03，P13-01 收口）：`cargo test --workspace` 235 passed / 1 ignored（未设置 `HPA_POSTGRES_TEST_URL` 时 PG 集成用例跳过）；真实 PostgreSQL 18.4 上 25 个 PG 集成测试文件（26 用例，含 Agent/Skill 跨节点）（RLS、镜像/缓存、OAuth/SCIM/成员/Agent/Skill 跨节点、Worker、Session、Token、Scheduler、Event Bus、MCP、Execution/Workflow/Trigger、Import）全部通过。Web typecheck、11 Vitest 与 build 通过；扩展 63 Vitest、7 个 Extension Host 检查通过；品牌/IR/契约/文档（168 文件 843 链接）/镜像/OTel/供应链 7 项门禁通过。
+- 全量门禁复核（2026-11-04）：Rust workspace 所有非 ignored 用例通过，1 ignored；真实 PostgreSQL 18.4 上 `pnpm test:postgres` **29/29 文件（30/30 用例）**通过。Web typecheck、12 Vitest、build；扩展 65 Vitest、build；契约门禁覆盖 109 个运行时路由/方法；文档 175 文件 861 链接；备份恢复 21 migration、71 业务关系、68 FORCE RLS 表。
 - 双节点验收：`scripts/multi-node-e2e.mjs` 启动两个共享 PostgreSQL 的控制面节点，断言共享管理员令牌、租户、配额、工作流执行、Worker 跨节点执行、令牌吊销与后加入节点共 9 项全部通过。
 - 浏览器会话：`HPA_POSTGRES_RUNTIME=1` 时会话读取、创建、`last_seen` 触碰、refresh 轮换（保留 token_hash + version 围栏）、登出与按租户吊销全部走 `hpa_control.sessions`；`postgres_session_store` 验证空 data dir 节点用另一节点签发的 Cookie 通过认证、登出后两节点均拒绝，SQLite 会话表保持 0 行。
 - 企业租户权威：`list/get/create/status/delete` 在 PG 模式只写/读 `hpa_control.tenants`；删除改为状态 `deleted` 并吊销 PG token/浏览器会话；SQLite 租户行由缓存重建产生，API 请求不再写入。`postgres_member_authority` 验证节点 A 建租户后节点 B 立即可见、租户暂停使节点 B 的既有 session 失效。
-- 企业成员权威：Enterprise 成员 CRUD、SCIM User/Group 与浏览器登录的成员查询均走 PostgreSQL；成员 disabled 在登录与既有 session 检查中跨节点生效，SCIM Group 角色映射在 PG 事务内重算 effective role。`postgres_member_authority`/`postgres_scim_cross_node` 验证跨节点读、角色覆盖、禁用、删除与 SQLite 成员表 0 行。
+- 企业成员权威：Enterprise 成员 CRUD、SCIM User/Group 与浏览器登录的成员查询均走 PostgreSQL；成员 disabled 在登录与既有 session 检查中跨节点生效，SCIM Group 角色映射在 PG 事务内重算 effective role。`postgres_member_authority` 验证 API 请求不直接写 SQLite，`postgres_control_refresh` 单独验证 PG→SQLite 缓存重建。
+- 执行幂等与协作取消：`execution_idempotency` 在 SQLite/PostgreSQL 中与 execution 原子提交；相同 key/hash 重放原 execution，不同内容返回 `IDEMPOTENCY_CONFLICT`。`execution_cancel_requests` 让任一节点记录 RUNNING 取消请求，execution owner/恢复节点在步骤边界写 `execution.cancelled`；顺序、并发、SQLite、PostgreSQL 均有回归。
 - OAuth AS 状态：`oauth_clients/requests/codes/tokens/consents/signing_keys` 在 PG 模式全部读写 `hpa_control`；`postgres_oauth_cross_node` 验证节点 A 注册/授权/同意、节点 B 兑换 code、JWKS 与签名 key 一致、refresh 轮换、复用触发整链吊销、revoke/内省与 SQLite OAuth 表 0 行。
 - Agent 状态：`hpa_tenant.agents/agent_versions/agent_sessions/agent_events/agent_approvals/agent_tool_calls` 在 PG 模式全部读写 PostgreSQL；`postgres_agent_cross_node` 验证 A 发布版本、B 读取；B 恢复 interrupted 会话为 succeeded、取消 running 会话；审批跨节点可见、工具调用重复 begin 幂等、finish 跨节点生效；两节点 SQLite Agent 表 0 行。
 - Agent owner lease（Phase 18）：`agent_sessions` 增加 `lease_owner/lease_token/lease_expires_at`；`postgres_agent_lease_cross_node` 验证 B 启动不中断 A 持有的 running 会话、伪造 token 写入失败、过期接管 token 递增、旧 token 写入失败、C 接管空闲会话并写 `agent.interrupted`、终态拒绝迟到写入；两节点 SQLite Agent 表 0 行。

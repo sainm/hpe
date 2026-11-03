@@ -250,3 +250,271 @@ async fn forcefully_killed_server_recovers_running_workflow_from_checkpoint() {
     );
     mock.abort();
 }
+
+#[tokio::test]
+async fn execution_start_and_retry_are_idempotent() {
+    let data_dir = temp_dir();
+    let server = Server::start(&data_dir).await;
+    let workflow: Value = serde_json::from_str(include_str!("../../../fixtures/01_sequence.json"))
+        .expect("sequence fixture");
+    let created = server
+        .client
+        .post(server.url("/api/workflows"))
+        .json(&json!({"ir": workflow}))
+        .send()
+        .await
+        .expect("create workflow");
+    assert_eq!(created.status(), 200);
+    let published = server
+        .client
+        .post(server.url("/api/workflows/wf_fixture_sequence/publish"))
+        .send()
+        .await
+        .expect("publish workflow");
+    assert_eq!(published.status(), 200);
+
+    let start = || {
+        server
+            .client
+            .post(server.url("/api/workflows/wf_fixture_sequence/executions"))
+            .header("Idempotency-Key", "start-sequence-1")
+            .json(&json!({"input": {"value": 4}}))
+            .send()
+    };
+    let first: Value = start()
+        .await
+        .expect("first start")
+        .json()
+        .await
+        .expect("json");
+    let second: Value = start()
+        .await
+        .expect("second start")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(first["summary"]["id"], second["summary"]["id"]);
+
+    let conflict = server
+        .client
+        .post(server.url("/api/workflows/wf_fixture_sequence/executions"))
+        .header("Idempotency-Key", "start-sequence-1")
+        .json(&json!({"input": {"value": 5}}))
+        .send()
+        .await
+        .expect("conflicting start");
+    assert_eq!(conflict.status(), 409);
+    let conflict: Value = conflict.json().await.expect("conflict JSON");
+    assert_eq!(conflict["error"]["code"], "IDEMPOTENCY_CONFLICT");
+
+    let concurrent = |idempotency_key: &'static str, value: i64| {
+        server
+            .client
+            .post(server.url("/api/workflows/wf_fixture_sequence/executions"))
+            .header("Idempotency-Key", idempotency_key)
+            .json(&json!({"input": {"value": value}}))
+            .send()
+    };
+    let (left, right) = tokio::join!(
+        concurrent("start-race-same", 8),
+        concurrent("start-race-same", 8)
+    );
+    let left = left.expect("left concurrent start");
+    let right = right.expect("right concurrent start");
+    assert_eq!(left.status(), 200, "{}", left.text().await.unwrap());
+    assert_eq!(right.status(), 200, "{}", right.text().await.unwrap());
+    let left: Value = left.json().await.expect("left JSON");
+    let right: Value = right.json().await.expect("right JSON");
+    assert_eq!(left["summary"]["id"], right["summary"]["id"]);
+
+    let source_id = first["summary"]["id"].as_str().expect("execution id");
+    let mut status = String::new();
+    for _ in 0..200 {
+        let detail: Value = server
+            .client
+            .get(server.url(&format!("/api/executions/{source_id}")))
+            .send()
+            .await
+            .expect("read execution")
+            .json()
+            .await
+            .expect("execution JSON");
+        status = detail["summary"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status == "succeeded" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, "succeeded");
+
+    let retry = || {
+        server
+            .client
+            .post(server.url(&format!("/api/executions/{source_id}/retry")))
+            .header("Idempotency-Key", "retry-sequence-1")
+            .send()
+    };
+    let first_retry: Value = retry()
+        .await
+        .expect("first retry")
+        .json()
+        .await
+        .expect("json");
+    let second_retry: Value = retry()
+        .await
+        .expect("second retry")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(first_retry["summary"]["id"], second_retry["summary"]["id"]);
+    assert_ne!(first_retry["summary"]["id"], first["summary"]["id"]);
+}
+
+#[tokio::test]
+async fn running_execution_accepts_cooperative_cancel() {
+    let data_dir = temp_dir();
+    let (mock_port, requests, mock) = slow_http_server().await;
+    let server = Server::start(&data_dir).await;
+    let workflow = workflow(mock_port);
+    let created = server
+        .client
+        .post(server.url("/api/workflows"))
+        .json(&json!({"ir": workflow}))
+        .send()
+        .await
+        .expect("create workflow");
+    assert_eq!(created.status(), 200);
+    let published = server
+        .client
+        .post(server.url("/api/workflows/wf_crash_recovery/publish"))
+        .send()
+        .await
+        .expect("publish workflow");
+    assert_eq!(published.status(), 200);
+    let started: Value = server
+        .client
+        .post(server.url("/api/workflows/wf_crash_recovery/executions"))
+        .json(&json!({"input": {}}))
+        .send()
+        .await
+        .expect("start execution")
+        .json()
+        .await
+        .expect("execution JSON");
+    let execution_id = started["summary"]["id"]
+        .as_str()
+        .expect("execution id")
+        .to_string();
+    for _ in 0..100 {
+        if requests.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let cancelled = server
+        .client
+        .post(server.url(&format!("/api/executions/{execution_id}/cancel")))
+        .send()
+        .await
+        .expect("cancel running execution");
+    assert_eq!(cancelled.status(), 200);
+    let mut status = String::new();
+    for _ in 0..200 {
+        let detail: Value = server
+            .client
+            .get(server.url(&format!("/api/executions/{execution_id}")))
+            .send()
+            .await
+            .expect("read execution")
+            .json()
+            .await
+            .expect("execution JSON");
+        status = detail["summary"]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status == "cancelled" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, "cancelled");
+    mock.abort();
+}
+
+#[tokio::test]
+async fn repeated_approval_decision_is_idempotent() {
+    let data_dir = temp_dir();
+    let server = Server::start(&data_dir).await;
+    let workflow: Value = serde_json::from_str(include_str!("../../../fixtures/08_approval.json"))
+        .expect("approval fixture");
+    let created = server
+        .client
+        .post(server.url("/api/workflows"))
+        .json(&json!({"ir": workflow}))
+        .send()
+        .await
+        .expect("create workflow");
+    assert_eq!(created.status(), 200);
+    let published = server
+        .client
+        .post(server.url("/api/workflows/wf_fixture_approval/publish"))
+        .send()
+        .await
+        .expect("publish workflow");
+    assert_eq!(published.status(), 200);
+    let started: Value = server
+        .client
+        .post(server.url("/api/workflows/wf_fixture_approval/executions"))
+        .json(&json!({"input": {}}))
+        .send()
+        .await
+        .expect("start execution")
+        .json()
+        .await
+        .expect("execution JSON");
+    let execution_id = started["summary"]["id"]
+        .as_str()
+        .expect("execution id")
+        .to_string();
+    let decision_url = server.url(&format!("/api/executions/{execution_id}/approvals"));
+    for _ in 0..200 {
+        let detail: Value = server
+            .client
+            .get(server.url(&format!("/api/executions/{execution_id}")))
+            .send()
+            .await
+            .expect("read execution")
+            .json()
+            .await
+            .expect("execution JSON");
+        if detail["summary"]["status"] == "waiting_approval" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let decide = |decision: &'static str| {
+        server
+            .client
+            .post(&decision_url)
+            .json(&json!({
+                "nodeId": "approve",
+                "decision": decision,
+                "form": {"decision": if decision == "approved" { "approve" } else { "reject" }}
+            }))
+            .send()
+    };
+    let (first, replay) = tokio::join!(decide("approved"), decide("approved"));
+    let first = first.expect("first decision");
+    let replay = replay.expect("replayed decision");
+    assert_eq!(first.status(), 200);
+    assert_eq!(replay.status(), 200);
+    let conflict = decide("rejected").await.expect("conflicting decision");
+    assert_eq!(conflict.status(), 409);
+    let conflict: Value = conflict.json().await.expect("conflict JSON");
+    assert_eq!(conflict["error"]["code"], "APPROVAL_ALREADY_DECIDED");
+}

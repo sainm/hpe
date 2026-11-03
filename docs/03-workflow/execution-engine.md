@@ -138,6 +138,9 @@ async function execute(plan, ctx) {
 - 可重试错误：网络/5xx/限流/超时；不可重试：认证/权限/校验/4xx（可配置）。
 - 超时：节点/容器/执行；超时触发取消 + 错误策略。
 - 重试不重置已产生副作用；幂等键保持稳定。
+- 终态执行重试创建一个新 execution，复用原 Workflow snapshot、input 与 env，并保留来源 execution ID；它不是把旧 execution 原地重置。
+- 启动与执行重试接受 `Idempotency-Key`：同 key/hash 返回原 execution，不同内容 fail-closed。
+- RUNNING 取消是协作式的：请求先持久化，execution owner 在当前不可中断步骤结束后检查；QUEUED/LEASED/WAITING 可立即取消。
 
 ## 10. 人工审批与信号
 
