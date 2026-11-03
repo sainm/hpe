@@ -347,6 +347,32 @@ impl EnterpriseState {
         Ok(true)
     }
 
+    /// Keeps the PostgreSQL mirror in step with control-plane tables that are
+    /// still written to SQLite (SCIM group changes, direct member updates).
+    pub fn spawn_control_mirror(
+        &self,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick fires immediately; startup already mirrored.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                match state.sync_postgres_control().await {
+                    Ok(count) => {
+                        tracing::debug!(rows = count, "control plane mirror refreshed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error.message, "control plane mirror refresh failed");
+                    }
+                }
+            }
+        })
+    }
+
     /// Mirrors the SQLite control plane (tenants, quotas, members) into
     /// PostgreSQL. Idempotent; runs once per start in PostgreSQL mode so that
     /// quota reads and foreign keys work for tenants created before the switch.

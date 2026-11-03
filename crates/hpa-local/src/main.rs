@@ -1710,6 +1710,17 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+    let control_mirror = if enterprise.uses_postgres() {
+        let interval = std::env::var("HPA_CONTROL_SYNC_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 50)
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(30));
+        Some(enterprise.spawn_control_mirror(interval))
+    } else {
+        None
+    };
     let scheduler = scheduler::spawn(enterprise.clone(), scheduler_coordination);
     let event_bus = if postgres_event_bus && postgres_event_bus_consumer {
         Some(event_bus::spawn(
@@ -1764,6 +1775,9 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     remote_approval_monitor.abort();
     if let Some(monitor) = task_update_monitor {
         monitor.abort();
+    }
+    if let Some(control_mirror) = control_mirror {
+        control_mirror.abort();
     }
     Ok(())
 }

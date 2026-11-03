@@ -31,9 +31,11 @@
 
 ## 3. 镜像实现
 
-### 3.1 启动镜像
+### 3.1 启动镜像 + 周期刷新
 
 `hpa serve` 在 `HPA_POSTGRES_RUNTIME=1` 时执行一次 `sync_postgres_control()`：把 SQLite 的租户、配额、成员全量 upsert 进 `hpa_control.tenants/quotas/members`。它是幂等的，失败会让启动失败（避免“以为在跑 PostgreSQL，实际只有半套数据”）。
+
+启动之后，同一个函数由后台任务周期性重跑（默认 30 秒，`HPA_CONTROL_SYNC_INTERVAL_MS` 可调，最小 50ms），把仍然只写 SQLite 的路径（SCIM 的成员/组变更、部分直连 `enterprise_members` 的写入）收敛进 PostgreSQL。刷新失败只记 `warn`，不影响请求——它是对账，不是请求路径。
 
 ### 3.2 写穿
 
@@ -105,6 +107,10 @@
 | `shared-revocation` | A 吊销令牌后 B 立即 401 |
 | `late-node-joins` | 后启动的第三个节点直接可用 |
 
+### 4.2 周期镜像
+
+`HPA_CONTROL_SYNC_INTERVAL_MS`（默认 `30000`）控制后台对账间隔。测试 `postgres_control_refresh` 用 100ms 间隔启动节点，通过 `/scim/v2/Users` 创建成员（只写 SQLite），断言该成员在不重启的前提下出现在 `hpa_control.members`。
+
 ## 5. 验证
 
 ```bash
@@ -119,5 +125,5 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 ## 6. 风险
 
 - 双写窗口内 SQLite 与 PG 可能不一致，且目前只有启动镜像做兜底对账；翻转前应加一个“差异检查”命令（比对三张表的行数与关键字段）。
-- 成员镜像只覆盖 `enterprise.rs` 的四条写路径；SCIM 直接写 `enterprise_members`，其变更要到下次启动才会出现在 PG 里——这是当前的已知偏差。
+- 成员镜像的即时性：`enterprise.rs` 的四条写路径是同步写穿；SCIM 直接写 `enterprise_members`，其变更依赖周期镜像（默认 30 秒）才会出现在 PG 里，最大滞后一个间隔。
 - `hpa_control.members` 有 `(tenant_id, subject)` 唯一约束与 `user_name` / `external_id` 两个部分唯一索引；翻转时若历史 SQLite 数据存在重复，会在这里首次暴露。
