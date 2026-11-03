@@ -1951,14 +1951,24 @@ async fn doctor(data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let writable = std::fs::metadata(&data_dir)
         .map(|metadata| !metadata.permissions().readonly())
         .unwrap_or(false);
+    let postgres =
+        match std::env::var("HPA_POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL")) {
+            Ok(database_url) => Some(check_postgres(&database_url).await),
+            Err(_) => None,
+        };
+    let degraded = postgres
+        .as_ref()
+        .map(|report| report["status"] == "degraded")
+        .unwrap_or(false);
     let report = json!({
-        "status": "ok",
+        "status": if degraded { "degraded" } else { "ok" },
         "internalId": "hpa",
         "version": env!("CARGO_PKG_VERSION"),
         "dataDir": data_dir,
         "database": db_path,
         "writable": writable,
         "stats": stats,
+        "postgres": postgres,
         "checks": {
             "sqlite": "ok",
             "embeddedUi": true,
@@ -1967,6 +1977,69 @@ async fn doctor(data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Connectivity, migration drift and RLS coverage for the PostgreSQL control
+/// plane. `doctor` stays diagnostic: it reports the problem instead of failing.
+async fn check_postgres(database_url: &str) -> Value {
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            return json!({
+                "status": "degraded",
+                "connected": false,
+                "error": error.to_string(),
+            });
+        }
+    };
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations/postgres");
+    let available = MIGRATOR.migrations.len() as i64;
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM public._sqlx_migrations WHERE success")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
+    // Tenant tables and control-plane tables are both FORCE RLS; reporting the
+    // split keeps "66 tables" in the docs from being read as 66 tenant tables.
+    let forced_rls_tenant: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'hpa_tenant' AND c.relkind = 'r'
+           AND c.relrowsecurity AND c.relforcerowsecurity",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    let forced_rls_control: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'hpa_control' AND c.relkind = 'r'
+           AND c.relrowsecurity AND c.relforcerowsecurity",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_or(0);
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM hpa_control.tenants")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+    let drift = available - applied;
+    pool.close().await;
+    json!({
+        "status": if drift == 0 && applied > 0 { "ok" } else { "degraded" },
+        "connected": true,
+        "migrations": { "applied": applied, "available": available, "drift": drift },
+        "forcedRls": {
+            "tenant": forced_rls_tenant,
+            "control": forced_rls_control,
+            "total": forced_rls_tenant + forced_rls_control,
+        },
+        "tenants": tenants,
+    })
 }
 
 fn validate_file(path: &Path) -> Result<(), Box<dyn Error>> {
