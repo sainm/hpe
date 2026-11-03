@@ -58,6 +58,25 @@ cargo run -p hpa-local -- db status
 
 已发布 migration 不得修改。需要修复时增加新版本；checksum 不一致必须停止发布并由人工恢复正确版本。
 
+### 3.2 只读副本与故障切换
+
+`HPA_POSTGRES_REPLICA_URL` 指定一个只读副本（主备流复制的 standby）。行为与边界：
+
+| 方面 | 行为 |
+| --- | --- |
+| 路由范围 | 只有控制台的执行列表与计数（`list_executions_page` / `count_executions`）走副本；执行详情、写入、配额、调度器一律走主库 |
+| 副本不可用 | 启动时用 2 秒超时探测一次，失败只记 `warn` 并继续启动；运行中查询失败会回退主库并记 `warn` |
+| 一致性 | 副本有复制延迟：刚创建的执行可能暂时不在列表里（实测暂停 WAL 回放后列表停在 3，恢复后变 4） |
+| 未覆盖 | 跨主机网络、VIP/连接串切换、自动故障检测与切换编排 |
+
+演练脚本（需要本机 `initdb`/`pg_ctl`/`pg_basebackup`/`psql`）：
+
+```bash
+pnpm test:ha        # scripts/postgres-replica-failover-e2e.sh
+```
+
+它会在临时目录建两个真实集群（主 + 流复制备），然后依次验证：**基线 3 条执行 → 暂停 WAL 回放后列表仍为 3（证明读走副本）→ 恢复后 4 条 → 副本端口不可达时列表仍为 4（回退主库）→ 强停主库、`pg_ctl promote` 备库、节点指向提升后的库，读到 4 条并成功写入第 5 条**。
+
 ## 4. 租户上下文
 
 应用连接池必须先 `SET ROLE hpa_tenant_runtime` 或 `hpa_worker_runtime`，并在同一个事务内设置租户：

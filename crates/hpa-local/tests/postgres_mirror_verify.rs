@@ -164,6 +164,9 @@ async fn verify_mirror_detects_and_clears_drift() {
     let report = in_sync.unwrap_or_else(|| panic!("SQLite cache did not converge"));
     assert_eq!(report["counts"]["tenants"]["sqlite"], json!(2));
 
+    // Stop the server first: the cache rebuilds from PostgreSQL every 100ms, so a
+    // mutation made while it runs can be overwritten before verify-mirror reads it.
+    drop(server);
     // A SQLite-cache change must be reported as drift.
     let control_db = data_dir.join("control.db");
     let sqlite = sqlx::sqlite::SqlitePoolOptions::new()
@@ -196,7 +199,8 @@ async fn verify_mirror_detects_and_clears_drift() {
         "expected a member attribute mismatch, got {kinds:?}"
     );
 
-    // The periodic mirror repairs it; drift returns to zero.
+    // Restarting rebuilds the cache from PostgreSQL; drift returns to zero.
+    let server = Server::start(&data_dir, &database_url).await;
     let mut repaired = false;
     for _ in 0..100 {
         let (ok, stdout) = run_cli(&data_dir, &["db", "verify-mirror"], &database_url);

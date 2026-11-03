@@ -59,6 +59,7 @@ pub struct EnterpriseState {
     oauth: OauthService,
     workers: crate::worker::WorkerService,
     postgres_execution: Option<sqlx::postgres::PgPool>,
+    postgres_replica: Option<sqlx::postgres::PgPool>,
     postgres_event_bus: Option<sqlx::postgres::PgPool>,
     cache: Arc<tokio::sync::Mutex<HashMap<String, TenantEntry>>>,
 }
@@ -145,6 +146,7 @@ impl EnterpriseState {
             oauth,
             workers,
             postgres_execution: None,
+            postgres_replica: None,
             postgres_event_bus: None,
             cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
@@ -155,6 +157,13 @@ impl EnterpriseState {
         self.browser_auth = self.browser_auth.clone().with_postgres(pool.clone());
         self.oauth = self.oauth.clone().with_postgres(pool.clone());
         self.postgres_execution = Some(pool);
+        self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        self
+    }
+
+    /// Attaches an optional read replica used by console listings.
+    pub fn with_postgres_replica(mut self, pool: sqlx::postgres::PgPool) -> Self {
+        self.postgres_replica = Some(pool);
         self.cache = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         self
     }
@@ -1005,6 +1014,9 @@ impl EnterpriseState {
             .map_err(|error| ApiError::internal(error.to_string()))?;
         if let Some(pool) = self.postgres_execution.as_ref() {
             db = db.with_postgres_execution(pool.clone(), tenant_id);
+        }
+        if let Some(replica) = self.postgres_replica.as_ref() {
+            db = db.with_postgres_replica(replica.clone(), tenant_id);
         }
         let event_bus = self
             .postgres_event_bus

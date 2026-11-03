@@ -520,6 +520,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// One-shot connect for optional dependencies (read replicas): a short timeout
+/// keeps startup fast when the standby is down, and the caller falls back.
+async fn connect_postgres_once(
+    database_url: &str,
+    max_connections: u32,
+    timeout: Duration,
+) -> Result<sqlx::postgres::PgPool, sqlx::Error> {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(timeout)
+        .connect(database_url)
+        .await
+}
+
 /// Connects with bounded retries so a control-plane restart during a database
 /// restart does not fail permanently. `HPA_POSTGRES_CONNECT_RETRIES` overrides
 /// the attempt count (default 5).
@@ -1848,6 +1862,19 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
             .into());
         }
         enterprise = enterprise.with_postgres_execution(pool.clone());
+        // The replica is optional: an unreachable standby must degrade listing
+        // latency, not block the control plane from starting.
+        if let Ok(replica_url) = std::env::var("HPA_POSTGRES_REPLICA_URL")
+            && !replica_url.trim().is_empty()
+        {
+            match connect_postgres_once(&replica_url, 4, Duration::from_secs(2)).await {
+                Ok(replica) => enterprise = enterprise.with_postgres_replica(replica),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "read replica is unreachable; console listings will use the primary"
+                ),
+            }
+        }
         if postgres_event_bus {
             let installed: bool = sqlx::query_scalar(
                 "SELECT to_regprocedure(

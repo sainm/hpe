@@ -61,6 +61,7 @@ pub type DbResult<T> = Result<T, DbError>;
 pub struct Db {
     pub pool: SqlitePool,
     postgres_execution: Option<PostgresExecutionStore>,
+    postgres_replica: Option<PostgresExecutionStore>,
     postgres_trigger: Option<PostgresTriggerStore>,
     postgres_agent: Option<PostgresAgentStore>,
     postgres_skill: Option<PostgresSkillStore>,
@@ -1345,6 +1346,7 @@ impl Db {
         Ok(Self {
             pool,
             postgres_execution: None,
+            postgres_replica: None,
             postgres_trigger: None,
             postgres_agent: None,
             postgres_skill: None,
@@ -1352,6 +1354,18 @@ impl Db {
             postgres_connector: None,
             postgres_plugin: None,
         })
+    }
+
+    /// Optional read replica for console listings. Queries fall back to the
+    /// primary when the replica errors, so a standby outage degrades latency
+    /// rather than availability.
+    pub fn with_postgres_replica(
+        mut self,
+        pool: sqlx::postgres::PgPool,
+        tenant_id: impl Into<String>,
+    ) -> Self {
+        self.postgres_replica = Some(PostgresExecutionStore::new(pool, tenant_id.into()));
+        self
     }
 
     pub fn with_postgres_execution(
@@ -2193,6 +2207,14 @@ impl Db {
         offset: i64,
         status: Option<&str>,
     ) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(replica) = self.postgres_replica.as_ref() {
+            match replica.list_executions_page(limit, offset, status).await {
+                Ok(rows) => return Ok(rows.into_iter().map(Into::into).collect()),
+                Err(error) => {
+                    tracing::warn!(error = %error, "read replica failed, falling back to primary");
+                }
+            }
+        }
         if let Some(store) = self.postgres_execution.as_ref() {
             return store
                 .list_executions_page(limit, offset, status)
@@ -2216,6 +2238,14 @@ impl Db {
     }
 
     pub async fn count_executions(&self, status: Option<&str>) -> DbResult<i64> {
+        if let Some(replica) = self.postgres_replica.as_ref() {
+            match replica.count_executions(status).await {
+                Ok(count) => return Ok(count),
+                Err(error) => {
+                    tracing::warn!(error = %error, "read replica failed, falling back to primary");
+                }
+            }
+        }
         if let Some(store) = self.postgres_execution.as_ref() {
             return store
                 .count_executions(status)

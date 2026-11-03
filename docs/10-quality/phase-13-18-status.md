@@ -106,7 +106,10 @@
 | 并发迁移序列化 | `db migrate` 在整个窗口持有 `pg_advisory_lock` | 三进程并发：`applied` = `[0, 0, 20]`，迁移表 20 行；CI 有对应步骤 |
 | 启动连接重试 | `HPA_POSTGRES_CONNECT_RETRIES` / `HPA_POSTGRES_CONNECT_TIMEOUT_SECS` | 指向空端口时输出 `cannot connect to PostgreSQL after N attempt(s): …`（默认 ~26s，可调） |
 
-**仍缺**：只读副本路由、在线 PITR、真实主备切换演练——都依赖实际的主备环境。
+- **只读副本**：`HPA_POSTGRES_REPLICA_URL` 让控制台列表/计数走副本，副本不可用自动回退主库（2 秒探测 + 运行期 warn）。
+- **本机主备演练**：`pnpm test:ha` 用两个真实集群验证「读走副本 → 复制延迟 → 副本故障回退 → 主库宕机提升备库后继续读写」。
+
+**仍缺**：跨主机网络与 VIP/连接串切换、自动故障检测（当前靠运维手动 promote）、在线 PITR。
 
 ## 3. 如何复现本表
 
