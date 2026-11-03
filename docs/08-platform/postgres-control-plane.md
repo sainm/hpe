@@ -50,6 +50,12 @@ cargo run -p hpa-local -- db status
 
 重复运行 `db migrate` 必须输出 `"applied": 0`。命令不打印数据库 URL；也可使用 `DATABASE_URL` 作为后备环境变量。
 
+### 3.1 并发迁移与连接重试
+
+- `hpa db migrate` 在读取 `before`、执行迁移、读取 `after` 的**整个窗口**上持有 `pg_advisory_lock`（固定 key），所以并发运行多个实例时只有一个会 `applied > 0`，其余为 `0`，且 `applied` 数值可信。输出里带 `"lock": "pg_advisory_lock"` 便于确认走的是加锁路径。
+- `hpa serve` 连接 PostgreSQL 时有界重试：`HPA_POSTGRES_CONNECT_RETRIES`（默认 5 次）与 `HPA_POSTGRES_CONNECT_TIMEOUT_SECS`（单次 5 秒）。数据库重启期间控制面会等待并重试，最终失败时输出 `cannot connect to PostgreSQL after N attempt(s): …`，不再只抛 `PoolTimedOut`。
+- 验证：三个进程同时 `db migrate` 于空库 → `applied` 分别为 `[0, 0, 20]`，`_sqlx_migrations` 恰好 20 行；CI 的 `concurrent migrations serialize` 步骤固化这条断言。
+
 已发布 migration 不得修改。需要修复时增加新版本；checksum 不一致必须停止发布并由人工恢复正确版本。
 
 ## 4. 租户上下文
@@ -182,5 +188,5 @@ Phase 13 基线不提供自动 down migration。企业数据删除不可逆，�
 
 - Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本/运行、MCP PAT/审批/审计/服务器、Connector 定义/连接/审计与 Plugin/Marketplace 元数据已有显式 PostgreSQL 路由并验证跨节点读取；剩余是真实企业 IdP、HA/read replica 与对象存储等外部验收。
 - SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；插件包文件跨节点同步与真实 HA 演练尚未实现。
-- 对象存储、只读副本、在线 PITR、连接重试和多控制面部署属于后续 P13-02/P13-06。
+- 对象存储、只读副本、在线 PITR 与真实 HA 演练仍属 P13-02/P13-06；并发迁移锁与连接重试已完成（见 3.1），同版本滚动重启由 `pnpm test:rolling` 覆盖，跨版本升级仍为人工项。
 - 本文件中的 PASS 只适用于 schema/RLS/migration 基线，不适用于完整 P13-01 或 Phase 13。

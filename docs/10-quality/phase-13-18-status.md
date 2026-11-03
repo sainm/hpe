@@ -99,6 +99,15 @@
 
 **边界**：这是同版本滚动重启。跨版本（旧二进制对新 schema）没有自动化，发布清单里仍是人工项；迁移是前向 only，回滚需要备份恢复。
 
+## 2.6 迁移锁与连接重试（HA 的两块本地部分）
+
+| 能力 | 实现 | 证据 |
+| --- | --- | --- |
+| 并发迁移序列化 | `db migrate` 在整个窗口持有 `pg_advisory_lock` | 三进程并发：`applied` = `[0, 0, 20]`，迁移表 20 行；CI 有对应步骤 |
+| 启动连接重试 | `HPA_POSTGRES_CONNECT_RETRIES` / `HPA_POSTGRES_CONNECT_TIMEOUT_SECS` | 指向空端口时输出 `cannot connect to PostgreSQL after N attempt(s): …`（默认 ~26s，可调） |
+
+**仍缺**：只读副本路由、在线 PITR、真实主备切换演练——都依赖实际的主备环境。
+
 ## 3. 如何复现本表
 
 ```bash

@@ -48,8 +48,15 @@ use crate::mcp_http::McpGatewayState;
 use crate::plugin::{BundleOptions, PluginService};
 use crate::skills::{SkillService, sandbox_label};
 
-#[derive(Debug)]
 struct CliError(String);
+
+// Print CLI failures as the message itself; the default Debug output would be
+// `Error: CliError("...")`, which leaks the type name into operator-facing text.
+impl fmt::Debug for CliError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
 
 impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -513,6 +520,55 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Connects with bounded retries so a control-plane restart during a database
+/// restart does not fail permanently. `HPA_POSTGRES_CONNECT_RETRIES` overrides
+/// the attempt count (default 5).
+async fn connect_postgres_with_retry(
+    database_url: &str,
+    max_connections: u32,
+) -> Result<sqlx::postgres::PgPool, CliError> {
+    let timeout_secs = std::env::var("HPA_POSTGRES_CONNECT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    let attempts = std::env::var("HPA_POSTGRES_CONNECT_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(5);
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(timeout_secs))
+            .connect(database_url)
+            .await
+        {
+            Ok(pool) => return Ok(pool),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < attempts {
+                    let delay = Duration::from_millis(200 * u64::from(attempt.min(10)));
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        "PostgreSQL connect failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+    Err(CliError(format!(
+        "cannot connect to PostgreSQL after {attempts} attempt(s): {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no attempt was made".to_string())
+    )))
+}
+
 async fn database_command(command: DbCommand, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
     let database_url = std::env::var("HPA_POSTGRES_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
@@ -527,15 +583,29 @@ async fn database_command(command: DbCommand, data_dir: PathBuf) -> Result<(), B
 
     match command {
         DbCommand::Migrate => {
+            // Serialize the whole migrate-and-report window. SQLx takes its own
+            // advisory lock around `run`, but counting outside that window made
+            // concurrent processes all report "applied: 20".
+            const MIGRATE_LOCK: i64 = 0x6870_615f_6d69_6772;
+            sqlx::query("SELECT pg_advisory_lock($1)")
+                .bind(MIGRATE_LOCK)
+                .execute(&pool)
+                .await?;
             let before = postgres_migration_count(&pool).await?;
-            MIGRATOR.run(&pool).await?;
+            let outcome = MIGRATOR.run(&pool).await;
             let after = postgres_migration_count(&pool).await?;
+            let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(MIGRATE_LOCK)
+                .execute(&pool)
+                .await;
+            outcome?;
             print_json(&json!({
                 "database": "postgresql",
                 "before": before,
                 "after": after,
                 "applied": after - before,
                 "available": MIGRATOR.migrations.len(),
+                "lock": "pg_advisory_lock",
             }));
         }
         DbCommand::Status => {
@@ -1756,10 +1826,9 @@ async fn serve(port: u16, data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
                 )
             })?;
         Some(
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(8)
-                .connect(&database_url)
-                .await?,
+            connect_postgres_with_retry(&database_url, 8)
+                .await
+                .map_err(Box::new)?,
         )
     } else {
         None

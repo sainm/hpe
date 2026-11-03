@@ -96,6 +96,22 @@ jobs:
       - run: |
           grep -q '"applied": 0' migration-second.json
       - run: cargo run -q -p hpa-local -- db status
+      # Three processes upgrade the same schema at once: the advisory lock must
+      # let exactly one apply and the others report zero.
+      - name: concurrent migrations serialize
+        run: |
+          psql "$HPA_POSTGRES_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE hpa_migrate_race"
+          export HPA_POSTGRES_URL="postgresql://postgres:postgres@127.0.0.1:5432/hpa_migrate_race"
+          for i in 1 2 3; do cargo run -q -p hpa-local -- db migrate > "race-$i.json" & done
+          wait
+          python3 - <<'PY'
+          import glob
+          import json
+
+          applied = sorted(json.load(open(name))["applied"] for name in glob.glob("race-*.json"))
+          assert applied[0] == 0 and applied[1] == 0 and applied[2] > 0, applied
+          print("applied per process:", applied)
+          PY
       # Two nodes on one database: shared tokens, tenants, quotas, executions,
       # worker leases and revocation.
       - name: multi-node acceptance
