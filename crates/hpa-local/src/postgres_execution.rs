@@ -710,6 +710,51 @@ impl PostgresExecutionStore {
         rows.into_iter().map(execution_from_row).collect()
     }
 
+    /// Paged listing for the console: status filter plus stable ordering.
+    pub async fn list_executions_page(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> Result<Vec<ExecutionRecord>, PostgresExecutionError> {
+        let mut transaction = self.begin().await?;
+        let rows = sqlx::query(
+            "SELECT id, workflow_id, workflow_version, status,
+                    state_json, workflow_json, output_json, error_json,
+                    started_at, updated_at
+             FROM hpa_tenant.executions
+             WHERE tenant_id = $1
+               AND ($2::text IS NULL OR status = $2)
+             ORDER BY started_at DESC, id DESC
+             LIMIT $3 OFFSET $4",
+        )
+        .bind(&self.tenant_id)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        rows.into_iter().map(execution_from_row).collect()
+    }
+
+    pub async fn count_executions(
+        &self,
+        status: Option<&str>,
+    ) -> Result<i64, PostgresExecutionError> {
+        let mut transaction = self.begin().await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM hpa_tenant.executions
+             WHERE tenant_id = $1 AND ($2::text IS NULL OR status = $2)",
+        )
+        .bind(&self.tenant_id)
+        .bind(status)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(count)
+    }
+
     pub async fn running_executions(&self) -> Result<Vec<ExecutionRecord>, PostgresExecutionError> {
         self.executions_with_status("running", true).await
     }

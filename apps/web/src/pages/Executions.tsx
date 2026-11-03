@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { Activity, ArrowUpRight, RefreshCw } from "lucide-react";
+import { Activity, ArrowUpRight, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -23,19 +23,29 @@ const filters: Array<ExecutionStatus | "all"> = [
   "failed",
 ];
 
+const PAGE_SIZE = 50;
+
 export function ExecutionsPage() {
   const { t } = useTranslation();
   const [filter, setFilter] = useState<ExecutionStatus | "all">("all");
+  const [page, setPage] = useState(0);
   const executions = useQuery({
-    queryKey: ["executions", 100],
-    queryFn: () => api.listExecutions(100),
+    queryKey: ["executions", filter, page],
+    // Paging and the status filter happen on the server so the console can show
+    // more than one page of history (the old client-side filter only saw 100).
+    queryFn: () =>
+      api.listExecutionsPage({ limit: PAGE_SIZE, offset: page * PAGE_SIZE, status: filter }),
     refetchInterval: 4_000,
   });
 
-  const rows = useMemo(() => {
-    const list = executions.data ?? [];
-    return filter === "all" ? list : list.filter((execution) => execution.status === filter);
-  }, [executions.data, filter]);
+  const rows = useMemo(() => executions.data?.data ?? [], [executions.data]);
+  const total = executions.data?.total ?? 0;
+  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const selectFilter = (next: ExecutionStatus | "all") => {
+    setFilter(next);
+    setPage(0);
+  };
 
   return (
     <div className="mx-auto grid max-w-[1560px] gap-3">
@@ -55,7 +65,7 @@ export function ExecutionsPage() {
           <button
             key={entry}
             type="button"
-            onClick={() => setFilter(entry)}
+            onClick={() => selectFilter(entry)}
             className={cn(
               "inline-flex h-6 items-center gap-1.5 rounded-sm border px-2 text-[11px] transition-colors",
               filter === entry
@@ -64,11 +74,6 @@ export function ExecutionsPage() {
             )}
           >
             {entry === "all" ? t("common.all") : t(`status.${entry}`)}
-            <span className="font-mono text-[9.5px] text-faint">
-              {entry === "all"
-                ? executions.data?.length ?? 0
-                : (executions.data ?? []).filter((execution) => execution.status === entry).length}
-            </span>
           </button>
         ))}
       </div>
@@ -80,8 +85,8 @@ export function ExecutionsPage() {
           <div className="p-3">
             <EmptyState
               icon={<Activity className="h-4 w-4" />}
-              title={executions.data?.length ? t("executions.noMatch") : t("executions.empty")}
-              hint={executions.data?.length ? undefined : t("executions.emptyHint")}
+              title={total > 0 ? t("executions.noMatch") : t("executions.empty")}
+              hint={total > 0 ? undefined : t("executions.emptyHint")}
             />
           </div>
         ) : (
@@ -123,6 +128,35 @@ export function ExecutionsPage() {
             </ul>
           </>
         )}
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line px-3 py-2">
+          <span className="text-[10.5px] text-faint">
+            {t("executions.pageSummary", {
+              total,
+              current: Math.min(page + 1, pageCount),
+              pages: pageCount,
+            })}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page === 0}
+              onClick={() => setPage((current) => Math.max(0, current - 1))}
+            >
+              <ChevronLeft className="h-3.5 w-3.5" />
+              {t("common.prev")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={page + 1 >= pageCount}
+              onClick={() => setPage((current) => current + 1)}
+            >
+              {t("common.next")}
+              <ChevronRight className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
       </Panel>
     </div>
   );

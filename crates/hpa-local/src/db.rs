@@ -2185,6 +2185,51 @@ impl Db {
         .await?)
     }
 
+    /// Paged listing with an optional status filter; the caller supplies `count_executions`
+    /// for the total so the header and the page agree.
+    pub async fn list_executions_page(
+        &self,
+        limit: i64,
+        offset: i64,
+        status: Option<&str>,
+    ) -> DbResult<Vec<ExecutionRow>> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .list_executions_page(limit, offset, status)
+                .await
+                .map(|rows| rows.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(sqlx::query_as::<_, ExecutionRow>(
+            "SELECT id, workflow_id, workflow_version, status, state_json, workflow_json,
+                    output_json, error_json, started_at, updated_at
+             FROM executions
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY started_at DESC, id DESC
+             LIMIT ?2 OFFSET ?3",
+        )
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn count_executions(&self, status: Option<&str>) -> DbResult<i64> {
+        if let Some(store) = self.postgres_execution.as_ref() {
+            return store
+                .count_executions(status)
+                .await
+                .map_err(Self::map_postgres_execution);
+        }
+        Ok(
+            sqlx::query_scalar("SELECT count(*) FROM executions WHERE (?1 IS NULL OR status = ?1)")
+                .bind(status)
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     pub async fn list_executions(&self, limit: i64) -> DbResult<Vec<ExecutionRow>> {
         if let Some(store) = self.postgres_execution.as_ref() {
             return store

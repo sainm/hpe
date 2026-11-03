@@ -191,6 +191,36 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T;
 }
 
+async function requestWithMeta<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; total: number }> {
+  const headers = new Headers(init?.headers);
+  if (init?.body && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  applyEnterpriseAuth(headers);
+  applyCsrf(headers, init?.method ?? "GET");
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  } catch (error) {
+    throw new ApiError(0, "NETWORK", error instanceof Error ? error.message : String(error));
+  }
+  const text = await response.text();
+  const body = text ? (JSON.parse(text) as T) : (undefined as T);
+  if (!response.ok) {
+    const payload = body as unknown as { error?: { code?: string; message?: string } } | undefined;
+    throw new ApiError(
+      response.status,
+      payload?.error?.code ?? "HTTP_ERROR",
+      payload?.error?.message ?? `request failed with ${response.status}`,
+    );
+  }
+  const total = Number.parseInt(response.headers.get("x-total-count") ?? "", 10);
+  return { data: body, total: Number.isNaN(total) ? 0 : total };
+}
+
 async function requestBlob(path: string): Promise<Blob> {
   const headers = new Headers();
   applyEnterpriseAuth(headers);
@@ -701,6 +731,13 @@ export const api = {
 
   listExecutions: (limit = 50) =>
     request<ExecutionSummary[]>(`/executions?limit=${limit}`),
+  listExecutionsPage: (params: { limit?: number; offset?: number; status?: string }) => {
+    const search = new URLSearchParams();
+    search.set("limit", String(params.limit ?? 50));
+    search.set("offset", String(params.offset ?? 0));
+    if (params.status && params.status !== "all") search.set("status", params.status);
+    return requestWithMeta<ExecutionSummary[]>(`/executions?${search.toString()}`);
+  },
   getExecution: (id: string) =>
     request<ExecutionDetail>(`/executions/${encodeURIComponent(id)}`),
   listEvents: (id: string, after = 0) =>

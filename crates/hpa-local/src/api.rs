@@ -947,20 +947,36 @@ async fn start_execution(
 struct ListQuery {
     limit: Option<i64>,
     after: Option<i64>,
+    offset: Option<i64>,
+    status: Option<String>,
 }
 
 async fn list_executions(
     State(state): State<ApiState>,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Vec<ExecutionSummary>>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let rows = state.db.list_executions(limit).await?;
+    let offset = query.offset.unwrap_or(0).max(0);
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let rows = state.db.list_executions_page(limit, offset, status).await?;
+    let total = state.db.count_executions(status).await?;
     let mut summaries = Vec::with_capacity(rows.len());
     for row in rows {
         let execution = parse_state(&row)?;
         summaries.push(ExecutionSummary::from_state(&execution));
     }
-    Ok(Json(summaries))
+    let mut response = Json(summaries).into_response();
+    // The body stays a bare array so existing clients keep working; the total
+    // travels in a header for the pager.
+    response.headers_mut().insert(
+        "x-total-count",
+        HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+    );
+    Ok(response)
 }
 
 async fn get_execution(

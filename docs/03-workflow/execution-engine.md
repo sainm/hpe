@@ -214,6 +214,22 @@ Temporal 适配器：通用 `HishaWorkflow` 解释器读取 IR 快照；每个�
 
 ## 17. 相关文档
 
+## 8. 执行列表查询（分页与过滤）
+
+`GET /api/executions` 返回**裸数组**以保持旧客户端兼容，分页元数据放在响应头：
+
+| 参数 | 说明 |
+| --- | --- |
+| `limit` | 1–200，默认 50 |
+| `offset` | 默认 0；与 `limit` 组成页码 `offset / limit` |
+| `status` | 可选，`running` / `waiting_approval` / `succeeded` / `failed` / `cancelled` |
+
+响应头 `X-Total-Count` 是该过滤条件下的总条数（分页前）。排序为 `started_at DESC, id DESC`，保证翻页时顺序稳定。
+
+控制台（`/executions`）用 50 条/页做服务端分页，页脚显示「共 N 条 · 第 X/Y 页」；状态筛选也在服务端执行，因此不再是「只在前 100 条里筛选」。
+
+验收：`node scripts/executions-pagination-e2e.mjs`（造 55 条执行 → 第 1 页 50 行、第 2 页 5 行、末页禁用「次へ」、1440/607 无横向溢出）。
+
 - [Workflow IR](workflow-ir.md)
 - [节点规范](node-specification.md)
 - [表达式与数据映射](expression-and-mapping.md)
