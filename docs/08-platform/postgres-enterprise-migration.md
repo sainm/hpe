@@ -125,6 +125,15 @@ PostgreSQL 写入失败会直接返回错误；不会出现“本地成功、共
 
 `HPA_CONTROL_SYNC_INTERVAL_MS`（默认 `30000`）控制 PG→SQLite 缓存重建间隔。测试 `postgres_control_refresh` 用 100ms 间隔启动节点，通过 `/scim/v2/Users` 创建成员（直接写 PostgreSQL），断言该成员无需重启即出现在 `hpa_control.members`，并在缓存中收敛。
 
+## 4.2 双节点与滚动重启
+
+| 脚本 | 覆盖 |
+| --- | --- |
+| `pnpm test:multi-node` | 两节点共享库：管理员令牌、租户、配额、工作流执行、Worker 跨节点执行、令牌吊销、后加入节点 |
+| `pnpm test:rolling` | 两轮「杀掉持有待审批执行的节点 → 用空 data dir 起替代节点 → 在替代节点批准并跑完」；断言执行不丢、列表里只有一条、幸存节点状态不偏斜 |
+
+`test:rolling` 是**同版本滚动重启**的演练：它证明 PostgreSQL 中的执行状态、审批与租约能在节点被杀后由新节点接管。**跨版本兼容（旧二进制读新 schema）不在其中**，仍需人工按发布清单演练。
+
 ## 4.3 漂移检查
 
 ```bash

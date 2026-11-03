@@ -103,6 +103,12 @@ jobs:
           psql "$HPA_POSTGRES_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE hpa_multi"
           HPA_POSTGRES_URL="postgresql://postgres:postgres@127.0.0.1:5432/hpa_multi" \
             node scripts/multi-node-e2e.mjs
+      # Kill a node while an approval is pending and let a replacement finish it.
+      - name: rolling restart rehearsal
+        run: |
+          psql "$HPA_POSTGRES_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE hpa_rolling"
+          HPA_POSTGRES_URL="postgresql://postgres:postgres@127.0.0.1:5432/hpa_rolling" \
+            node scripts/rolling-restart-e2e.mjs
 
   s3-connector:
     runs-on: ubuntu-latest

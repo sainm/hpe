@@ -26,6 +26,7 @@
     "test:scim-e2e": "node scripts/scim-e2e.mjs",
     "test:mcp-conformance": "node scripts/mcp-conformance.mjs",
     "test:multi-node": "node scripts/multi-node-e2e.mjs",
+    "test:rolling": "node scripts/rolling-restart-e2e.mjs",
     "test:postgres": "bash scripts/run-postgres-tests.sh",
     "test:postgres:backup": "node scripts/check-postgres-backup.mjs",
     "release:pack": "node scripts/release-pack.mjs",

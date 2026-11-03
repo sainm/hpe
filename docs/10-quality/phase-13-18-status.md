@@ -10,7 +10,7 @@
 - 本机可复现的自动化证据：
   - 默认（沙箱按平台策略启用）：Rust 全量 **225 passed / 14 failed / 1 ignored**，PostgreSQL 隔离 **28 / 29**。
   - 设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1`（受限环境专用）：**235 passed / 4 failed / 1 ignored**，PostgreSQL 隔离 **29 / 29**；4 个失败是 `runner.rs` 里**要求沙箱生效**的用例，在降级模式下按设计失败。
-- 仍需外部环境的只有四类：真实 AI 客户端、企业 IdP/CA/Vault、生产 Collector/HA、多节点滚动升级。
+- 仍需外部环境的只有四类：真实 AI 客户端、企业 IdP/CA/Vault、生产 Collector/HA、**跨版本**多节点滚动升级（同版本重启已由 `pnpm test:rolling` 覆盖）。
 
 ## 1. 逐阶段台账
 
@@ -79,6 +79,12 @@
 - PostgreSQL：默认 28/29，降级 29/29
 
 另外「66 张 FORCE RLS 表」指的是 **40 张 `hpa_tenant` + 26 张 `hpa_control`**，不是 66 张租户表；`hpa doctor` 现在按 schema 分开报告。
+
+## 2.5 滚动重启演练
+
+`pnpm test:rolling`（需要空库的 `HPA_POSTGRES_URL`）跑两轮：起两个节点 → 发起带审批的执行 → 等待 `waiting_approval` → `SIGKILL` 持有它的节点 → 用**空 data dir** 起替代节点 → 在替代节点批准 → 执行 `succeeded`，且幸存节点看到同一状态、执行列表里只有一条记录。17 项断言全过。
+
+**边界**：这是同版本滚动重启。跨版本（旧二进制对新 schema）没有自动化，发布清单里仍是人工项；迁移是前向 only，回滚需要备份恢复。
 
 ## 3. 如何复现本表
 
