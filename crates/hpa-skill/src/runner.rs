@@ -499,11 +499,39 @@ fn substitute_arg(
     Ok(value)
 }
 
+/// Explicit escape hatch for environments that cannot nest a sandbox (containers
+/// without `bwrap`, CI images where `sandbox-exec` is denied). Isolation is then
+/// reported as `process` in the run result so audits can see the degraded mode.
+fn sandbox_disabled_by_env() -> bool {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let disabled = std::env::var("HPA_SKILL_ALLOW_UNSANDBOXED")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false);
+    if disabled {
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "HPA_SKILL_ALLOW_UNSANDBOXED is set: skill scripts run without a sandbox"
+            );
+        });
+    }
+    disabled
+}
+
 fn sandbox_command(
     runtime: &Path,
     mut args: Vec<String>,
     workdir: &Path,
 ) -> SkillResult<PreparedCommand> {
+    if sandbox_disabled_by_env() {
+        let mut full = vec![runtime.display().to_string()];
+        full.append(&mut args);
+        return Ok(PreparedCommand {
+            program: runtime.to_path_buf(),
+            args: full.into_iter().skip(1).collect(),
+            runtime: runtime.to_path_buf(),
+            sandbox: SandboxKind::Process,
+        });
+    }
     #[cfg(target_os = "macos")]
     {
         let sandbox = Path::new("/usr/bin/sandbox-exec");

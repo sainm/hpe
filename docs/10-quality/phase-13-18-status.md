@@ -22,7 +22,7 @@
 | P13-06 | 企业认证、SCIM、租户暂停、遗留 SSO | `enterprise.rs`、`browser_auth.rs`、`oidc_verify.rs` | `enterprise`、`enterprise_ops`、`browser_sso`、`postgres_scim_cross_node` | 全绿（真实企业 IdP/CA/Vault `BLOCKED_EXTERNAL`） |
 | P13-07 | OTLP traces/metrics/logs、跨进程传播 | `telemetry.rs`、`services/ai-worker` | `otel`（2 用例）、`otel_metrics_logs`、`otel_cross_process`（需 `HPA_AI_WORKER_BIN`）、`check:otel` | `otel`/`otel_metrics_logs` 无需变量实跑通过；`otel_cross_process` 设置变量后 0.86s 实跑通过。生产 Collector/HA `BLOCKED_EXTERNAL` |
 | P13-08 | 发布产物、checksums、回滚手册 | `scripts/release-pack.mjs`、`scripts/release-verify.mjs`、`docs/10-quality/release-checklist.md` | `release:pack` + `release:verify`（`hpa doctor` 冒烟） | 打包链路完成；真实客户端验收 `BLOCKED_EXTERNAL` |
-| P14 | Skill 包/版本/文件/运行元数据权威 | `postgres_skill.rs` | `postgres_skill_cross_node` | **本机失败**：技能测试要执行 `scripts/audit.py`，沙箱禁止 `sandbox-exec`；需在允许 seatbelt 的主机复跑 |
+| P14 | Skill 包/版本/文件/运行元数据权威 | `postgres_skill.rs` | `postgres_skill_cross_node` | 默认失败（技能测试执行 `scripts/audit.py`，本机禁止 `sandbox-exec`）；设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 后**通过**（运行结果记为 `sandbox=process`） |
 | P15 | MCP 控制面（PAT/审批/审计/外部服务器） | `postgres_mcp_meta.rs` | `postgres_mcp_meta_cross_node` | 全绿 |
 | P16 | Connector 定义/连接/审计 | `postgres_connector.rs` | `postgres_connector_cross_node` | 全绿 |
 | P17 | Plugin 生命周期/Marketplace/信任元数据 | `postgres_plugin.rs` | `postgres_plugin_cross_node` | 全绿（包文件与签名私钥仍节点本地） |
@@ -36,7 +36,7 @@
 | `hpa-local` bin 单测（mcp ×2、skills ×1） | 3 | 同源：脚本执行经过 seatbelt |
 | `tests/agents.rs` | 1 | 同源 |
 | `tests/mcp_http.rs`、`tests/mcp_stdio.rs` | 各 1 | 同源 |
-| `tests/postgres_skill_cross_node.rs` | 1（PG 套件里的唯一失败） | 同源：技能测试执行 python |
+| `tests/postgres_skill_cross_node.rs` | 0（设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 后通过） | 同源：技能测试执行 python；该开关只用于受限环境，生产禁用 |
 
 判据：这些用例在允许 `sandbox-exec` 的 macOS 主机上应通过；在 Linux CI 上会走不同沙箱实现，需单独确认（当前 CI 只跑 `cargo test --workspace`，未覆盖 `hpa-skill` 的 seatbelt 用例）。
 
@@ -62,6 +62,8 @@ cargo test --workspace --no-fail-fast
 
 # 2. PostgreSQL：每个测试文件独立库
 HPA_POSTGRES_ADMIN_URL=postgresql://user@host:5432/postgres pnpm test:postgres
+#    无法嵌套沙箱的环境（本机 / 受限 CI）加 HPA_SKILL_ALLOW_UNSANDBOXED=1 让技能用例跑起来，
+#    此时 29/29 全通过；真机上不要设置它，隔离性由 runner.rs 覆盖
 
 # 3. 双节点验收（共享一个库）
 HPA_POSTGRES_URL=postgresql://user@host:5432/empty_db pnpm test:multi-node

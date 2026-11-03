@@ -45,6 +45,21 @@
 - 资源：CPU/内存/时长/输出/进程数；超限终止。
 - 环境：最小变量；secret 短期注入；进程退出清理。
 
+### 4.1 降级模式（仅限无法嵌套沙箱的环境）
+
+`crates/hpa-skill/src/runner.rs` 默认在 macOS 用 `sandbox-exec`（seatbelt）、在 Linux 用 `bwrap`。某些环境无法嵌套：受限容器、被外层 sandbox 拒绝的 CI、没有 user namespace 的镜像。此时可以显式设置：
+
+```
+HPA_SKILL_ALLOW_UNSANDBOXED=1
+```
+
+行为与约束：
+
+- 只对**当前进程**生效，默认关闭；设置后每个进程首次使用时打印一条 `warn`。
+- 运行结果里的 `sandbox` 字段会是 `process` 而不是 `macos_seatbelt` / `linux_bubblewrap`，审计与回放可以直接看出这次执行没有隔离。
+- **生产环境禁止设置**。它把「未知 Skill 的脚本」变成普通子进程，网络/文件策略只剩应用层校验。
+- 它只用于让依赖「技能能跑起来」的测试在受限环境完成验证；隔离性本身由 `crates/hpa-skill/tests/runner.rs` 在真机（允许 seatbelt / 有 bwrap）覆盖。
+
 ## 5. Prompt Injection
 
 - SKILL.md/references/脚本输出/工具结果都视为不可信数据。
