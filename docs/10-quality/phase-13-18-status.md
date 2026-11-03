@@ -7,7 +7,9 @@
 ## 0. 一句话结论
 
 - 控制面元数据在 `HPA_POSTGRES_RUNTIME=1` 下**基本全部**以 PostgreSQL 为权威；SQLite 退化为单节点模式或可重建缓存。
-- 本机可复现的自动化证据：Rust 全量 **225 passed / 14 failed / 1 ignored**（14 个全部是沙箱限制），PostgreSQL 文件级隔离 **28 / 29** 通过。
+- 本机可复现的自动化证据：
+  - 默认（沙箱按平台策略启用）：Rust 全量 **225 passed / 14 failed / 1 ignored**，PostgreSQL 隔离 **28 / 29**。
+  - 设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1`（受限环境专用）：**235 passed / 4 failed / 1 ignored**，PostgreSQL 隔离 **29 / 29**；4 个失败是 `runner.rs` 里**要求沙箱生效**的用例，在降级模式下按设计失败。
 - 仍需外部环境的只有四类：真实 AI 客户端、企业 IdP/CA/Vault、生产 Collector/HA、多节点滚动升级。
 
 ## 1. 逐阶段台账
@@ -28,17 +30,31 @@
 | P17 | Plugin 生命周期/Marketplace/信任元数据 | `postgres_plugin.rs` | `postgres_plugin_cross_node` | 全绿（包文件与签名私钥仍节点本地） |
 | P18 | Agent 会话 owner lease（migration `0020`） | `agent.rs`、`postgres_agent.rs` | `postgres_agent_cross_node`、`postgres_agent_lease_cross_node` | 全绿 |
 
-## 2. 本机失败清单（全部为环境限制）
+## 2. 本机失败清单
+
+### 2.1 默认模式（沙箱启用）
 
 | 位置 | 数量 | 原因 |
 | --- | --- | --- |
-| `crates/hpa-skill/tests/runner.rs` | 8 | `sandbox-exec: sandbox_apply: Operation not permitted` |
+| `crates/hpa-skill/tests/runner.rs` | 8 | `sandbox-exec: sandbox_apply: Operation not permitted`（本 shell 不允许嵌套沙箱） |
 | `hpa-local` bin 单测（mcp ×2、skills ×1） | 3 | 同源：脚本执行经过 seatbelt |
 | `tests/agents.rs` | 1 | 同源 |
 | `tests/mcp_http.rs`、`tests/mcp_stdio.rs` | 各 1 | 同源 |
-| `tests/postgres_skill_cross_node.rs` | 0（设置 `HPA_SKILL_ALLOW_UNSANDBOXED=1` 后通过） | 同源：技能测试执行 python；该开关只用于受限环境，生产禁用 |
+| `tests/postgres_skill_cross_node.rs` | 1 | 同源：技能测试执行 `scripts/audit.py` |
 
-判据：这些用例在允许 `sandbox-exec` 的 macOS 主机上应通过；在 Linux CI 上会走不同沙箱实现，需单独确认（当前 CI 只跑 `cargo test --workspace`，未覆盖 `hpa-skill` 的 seatbelt 用例）。
+### 2.2 降级模式（`HPA_SKILL_ALLOW_UNSANDBOXED=1`）
+
+| 位置 | 数量 | 原因 |
+| --- | --- | --- |
+| `crates/hpa-skill/tests/runner.rs` | 4 | `seatbelt_denies_*` 与 `deterministic_script_runs_in_sandbox_*` **要求沙箱生效**，降级后按设计失败 |
+
+其余 10 个用例在该模式下转为通过（含 `postgres_skill_cross_node`、bin 的 mcp/skills、`agents`、`mcp_http`、`mcp_stdio`）。
+
+**解释**：两组数字不能互相替代。默认模式证明「隔离策略按平台生效」；降级模式证明「功能链路在受限环境可跑」。发布证据应以默认模式为准，降级模式只用于补齐功能覆盖。
+
+### 2.3 已知偶发
+
+`tests/plugins.rs` 在整包并行运行时偶发失败（约 5 次全量中出现 1 次），单独运行 12/12 通过（并发与单线程均通过）。初步判断为测试间共享资源冲突，尚未定位；遇到时以单独复跑为准，并记录触发条件。
 
 ## 2.1 会「静默跳过」的测试
 
