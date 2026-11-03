@@ -79,18 +79,30 @@ jobs:
     env:
       DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/hpa
       HPA_POSTGRES_TEST_URL: postgresql://postgres:postgres@127.0.0.1:5432/hpa
+      HPA_POSTGRES_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y redis-server
+      - run: sudo apt-get update && sudo apt-get install -y redis-server postgresql-client
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.1
-      - run: cargo test -p hpa-local --test postgres_rls --test postgres_import --test postgres_distributed --test postgres_workflow_store --test postgres_execution_store --test postgres_execution_lease --test postgres_execution_recovery --test postgres_trigger_store --test postgres_atomic_execution_fire --test postgres_event_bus --test postgres_runtime --test postgres_scheduler_leader --test postgres_mcp --test mcp_http --test mcp_multinode --test connectors_extended
+      # Each PostgreSQL test file gets its own database: sharing one database
+      # lets quota/session state leak between files (see
+      # docs/10-quality/postgres-test-isolation.md).
+      - run: bash scripts/run-postgres-tests.sh
+      - run: cargo test -p hpa-local --test mcp_http --test mcp_multinode --test connectors_extended
       - run: cargo run -q -p hpa-local -- db migrate | tee migration-first.json
       - run: cargo run -q -p hpa-local -- db migrate | tee migration-second.json
       - run: |
           grep -q '"applied": 0' migration-second.json
       - run: cargo run -q -p hpa-local -- db status
+      # Two nodes on one database: shared tokens, tenants, quotas, executions,
+      # worker leases and revocation.
+      - name: multi-node acceptance
+        run: |
+          psql "$HPA_POSTGRES_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE hpa_multi"
+          HPA_POSTGRES_URL="postgresql://postgres:postgres@127.0.0.1:5432/hpa_multi" \
+            node scripts/multi-node-e2e.mjs
 
   s3-connector:
     runs-on: ubuntu-latest
