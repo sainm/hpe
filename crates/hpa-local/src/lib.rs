@@ -5,6 +5,7 @@ pub mod postgres_agent;
 pub mod postgres_control;
 pub mod postgres_execution;
 pub mod postgres_import;
+pub mod postgres_skill;
 pub mod postgres_trigger;
 pub mod postgres_worker;
 pub mod telemetry;

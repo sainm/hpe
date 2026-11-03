@@ -28,7 +28,8 @@
 | SCIM Group / 映射 | 不写 | **权威** | 角色重算在同一 PG 事务 |
 | 浏览器会话 | 不写 | **权威** | 读/写/轮换/登出/按租户吊销全部走 PostgreSQL |
 | OAuth AS 状态（clients/codes/tokens/consents/signing keys） | 不写 | **权威** | `postgres_oauth_cross_node` |
-| Agent 会话 / 版本 / 事件 / 审批 / 工具调用 | 不写 | **权威** | `postgres_agent_cross_node`；Skill 元数据仍为 SQLite |
+| Agent 会话 / 版本 / 事件 / 审批 / 工具调用 | 不写 | **权威** | `postgres_agent_cross_node` |
+| Skill 包 / 版本 / 文件 / 运行 / 产物 | 不写 | **权威** | `postgres_skill_cross_node`；签名文件仍为本地 |
 
 ## 3. 权威写入与缓存
 
@@ -72,7 +73,7 @@ PostgreSQL 写入失败会直接返回错误；不会出现“本地成功、共
 4. ~~浏览器会话与 OAuth AS~~（完成）：session 与 OAuth clients/codes/tokens/consents/signing keys 全部走 PostgreSQL。
 5. ~~停止双写~~（完成）：API 不再写 SQLite 权威行；`sync_postgres_control` 只做 PG→SQLite 缓存重建，不再反向覆盖 PostgreSQL。
 
-剩余：Skill 元数据仍以租户 SQLite 为权威；真实企业 SCIM/IdP、HA/read replica 与外部 Vault/CA 仍未验收。
+剩余：真实企业 SCIM/IdP、HA/read replica 与外部 Vault/CA 仍未验收。
 
 ### 3.4 会话（已完成）
 
@@ -145,6 +146,7 @@ HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_scim_cross_nod
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_member_authority
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_mirror_verify
 HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_agent_cross_node
+HPA_POSTGRES_TEST_URL=... cargo test -p hpa-local --test postgres_skill_cross_node
 node scripts/scim-e2e.mjs                                  # 需要运行中的服务与管理员令牌
 ```
 
@@ -152,6 +154,7 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 - `postgres_scim_cross_node`：A 创建 User/Group，B 读取角色映射与成员；SQLite SCIM 表 0 行。
 - `postgres_member_authority`：A 建租户/成员，B 立即可见；目录角色覆盖 session；disabled 成员与 suspended 租户使 B 的 session 失效；SQLite 无权威行。
 - `postgres_agent_cross_node`：A 建/发布 Agent，B 读取版本；B 恢复 interrupted 会话为 succeeded、取消 running 会话；审批与工具调用跨节点可见，重复 begin 幂等；两节点 SQLite Agent 表 0 行。
+- `postgres_skill_cross_node`：A 导入 Skill，B 读取版本与包文件；A 发布后 B 看到 published；B 运行 Skill 后 A 读取 run 与 `summary.json` artifact；SQLite Skill 表 0 行；Skill 配额按 PG 计数。
 - `postgres_control_mirror`：跨节点配额与租户读取、空 data dir 节点为未见租户注册 Worker。
 
 ## 6. 风险
@@ -160,4 +163,4 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 - `hpa_control.members` 有 `(tenant_id, subject)`、email、user_name、external_id 唯一约束；历史重复数据在首次写入/导入时会失败关闭，需先清理。
 - SCIM Group 的 SQLite 表在 PG 模式不再写入；依赖 SQLite 直读的自定义脚本应改用 SCIM/PostgreSQL。
 - 删除租户只标记 `deleted` 并吊销 PG token/session；历史 SQLite 行由缓存重建清理，租户业务库目录由删除流程移除。
-- Agent 版本/会话/事件/审批/工具调用在 PG 模式走 `hpa_tenant.agent_*`，跨节点发布、恢复、取消、审批与工具幂等由 `postgres_agent_cross_node` 验证；Agent 配额也按 PostgreSQL 行计数。Skill 包/版本元数据仍为 SQLite 权威，跨节点 Agent 使用 Skill 时需先导入目标节点；`hpa agent ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。Agent 主动执行尚无 owner lease，多个控制面同时启动时 `recover` 可能把其他节点的 running 会话标记为 interrupted；生产部署需单写者或后续 owner lease。
+- Agent 版本/会话/事件/审批/工具调用在 PG 模式走 `hpa_tenant.agent_*`，跨节点发布、恢复、取消、审批与工具幂等由 `postgres_agent_cross_node` 验证；Agent 配额也按 PostgreSQL 行计数。Skill 包/版本/文件/运行/产物元数据由 Phase 14 切到 `hpa_tenant.skill_*`，签名文件与 artifact 内容仍在节点本地；`hpa agent/skill ...` CLI 仍只操作本地 SQLite，PG 模式应使用 HTTP API。Agent 主动执行尚无 owner lease，多个控制面同时启动时 `recover` 可能把其他节点的 running 会话标记为 interrupted；生产部署需单写者或后续 owner lease。

@@ -9,6 +9,10 @@ use hpa_local::postgres_execution::{
     ArtifactRecord, ExecutionLeaseRecord, ExecutionRecord, PostgresExecutionError,
     PostgresExecutionStore, WorkflowRecord, WorkflowVersionRecord,
 };
+use hpa_local::postgres_skill::{
+    PostgresSkillError, PostgresSkillStore, SkillArtifactRecord, SkillFileRecord, SkillRunRecord,
+    SkillSummaryRecord, SkillVersionRecord,
+};
 use hpa_local::postgres_trigger::{
     PostgresTriggerError, PostgresTriggerStore, TriggerFireRecord, TriggerRecord, TriggerSeedRecord,
 };
@@ -39,6 +43,8 @@ pub enum DbError {
     PostgresTrigger(String),
     #[error("PostgreSQL agent error: {0}")]
     PostgresAgent(String),
+    #[error("PostgreSQL skill error: {0}")]
+    PostgresSkill(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -49,6 +55,7 @@ pub struct Db {
     postgres_execution: Option<PostgresExecutionStore>,
     postgres_trigger: Option<PostgresTriggerStore>,
     postgres_agent: Option<PostgresAgentStore>,
+    postgres_skill: Option<PostgresSkillStore>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -183,6 +190,86 @@ pub struct SkillArtifactRow {
     #[serde(skip_serializing)]
     pub stored_path: String,
     pub created_at: String,
+}
+
+impl From<SkillSummaryRecord> for SkillSummaryRow {
+    fn from(record: SkillSummaryRecord) -> Self {
+        Self {
+            id: record.id,
+            name: record.name,
+            latest_version: record.latest_version,
+            license: record.license,
+            status: record.status,
+            updated_at: record.updated_at,
+        }
+    }
+}
+
+impl From<SkillVersionRecord> for SkillVersionRow {
+    fn from(record: SkillVersionRecord) -> Self {
+        Self {
+            skill_id: record.skill_id,
+            version: record.version,
+            name: record.name,
+            license: record.license,
+            manifest_json: record.manifest_json,
+            skill_md: record.skill_md,
+            report_json: record.report_json,
+            content_hash: record.content_hash,
+            status: record.status,
+            source_path: record.source_path,
+            imported_at: record.imported_at,
+            published_at: record.published_at,
+        }
+    }
+}
+
+impl From<SkillFileRecord> for SkillFileRow {
+    fn from(record: SkillFileRecord) -> Self {
+        Self {
+            path: record.path,
+            sha256: record.sha256,
+            size: record.size,
+            content: record.content,
+        }
+    }
+}
+
+impl From<SkillRunRecord> for SkillRunRow {
+    fn from(record: SkillRunRecord) -> Self {
+        Self {
+            id: record.id,
+            skill_id: record.skill_id,
+            version: record.version,
+            script_id: record.script_id,
+            status: record.status,
+            input_json: record.input_json,
+            output_json: record.output_json,
+            stdout: record.stdout,
+            stderr: record.stderr,
+            exit_code: record.exit_code,
+            error_json: record.error_json,
+            sandbox: record.sandbox,
+            duration_ms: record.duration_ms,
+            started_at: record.started_at,
+            finished_at: record.finished_at,
+        }
+    }
+}
+
+impl From<SkillArtifactRecord> for SkillArtifactRow {
+    fn from(record: SkillArtifactRecord) -> Self {
+        Self {
+            id: record.id,
+            run_id: record.run_id,
+            name: record.name,
+            sha256: record.sha256,
+            size: record.size,
+            mime_type: record.mime_type,
+            stored_path: record.stored_path,
+            created_at: record.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, FromRow, Serialize)]
@@ -1152,6 +1239,7 @@ impl Db {
             postgres_execution: None,
             postgres_trigger: None,
             postgres_agent: None,
+            postgres_skill: None,
         })
     }
 
@@ -1163,6 +1251,7 @@ impl Db {
         let tenant_id = tenant_id.into();
         self.postgres_execution = Some(PostgresExecutionStore::new(pool.clone(), &tenant_id));
         self.postgres_agent = Some(PostgresAgentStore::new(pool.clone(), &tenant_id));
+        self.postgres_skill = Some(PostgresSkillStore::new(pool.clone(), &tenant_id));
         self.postgres_trigger = Some(PostgresTriggerStore::new(pool, tenant_id));
         self
     }
@@ -1181,6 +1270,15 @@ impl Db {
                 DbError::AgentVersionFrozen { agent_id, version }
             }
             other => DbError::PostgresAgent(other.to_string()),
+        }
+    }
+
+    fn map_postgres_skill(error: PostgresSkillError) -> DbError {
+        match error {
+            PostgresSkillError::VersionFrozen { skill_id, version } => {
+                DbError::SkillVersionFrozen { skill_id, version }
+            }
+            other => DbError::PostgresSkill(other.to_string()),
         }
     }
 
@@ -1352,6 +1450,12 @@ impl Db {
         source_path: Option<&str>,
         imported_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .import_skill(snapshot, report, source_path, imported_at)
+                .await
+                .map_err(Self::map_postgres_skill);
+        }
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT content_hash FROM skill_versions WHERE skill_id = ? AND version = ?",
         )
@@ -1425,6 +1529,13 @@ impl Db {
     }
 
     pub async fn list_skills(&self) -> DbResult<Vec<SkillSummaryRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .list_skills()
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillSummaryRow>(
             "SELECT id, name, latest_version, license, status, updated_at
              FROM skills ORDER BY updated_at DESC",
@@ -1434,6 +1545,13 @@ impl Db {
     }
 
     pub async fn get_skill(&self, skill_id: &str) -> DbResult<Option<SkillSummaryRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .get_skill(skill_id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillSummaryRow>(
             "SELECT id, name, latest_version, license, status, updated_at
              FROM skills WHERE id = ?",
@@ -1444,6 +1562,13 @@ impl Db {
     }
 
     pub async fn list_skill_versions(&self, skill_id: &str) -> DbResult<Vec<SkillVersionRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .list_skill_versions(skill_id)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillVersionRow>(
             "SELECT skill_id, version, name, license, manifest_json, skill_md, report_json,
                     content_hash, status, source_path, imported_at, published_at
@@ -1459,6 +1584,13 @@ impl Db {
         skill_id: &str,
         version: &str,
     ) -> DbResult<Option<SkillVersionRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .get_skill_version(skill_id, version)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillVersionRow>(
             "SELECT skill_id, version, name, license, manifest_json, skill_md, report_json,
                     content_hash, status, source_path, imported_at, published_at
@@ -1475,6 +1607,13 @@ impl Db {
         skill_id: &str,
         version: &str,
     ) -> DbResult<Vec<SkillFileRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .get_skill_files(skill_id, version)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillFileRow>(
             "SELECT path, sha256, size, content FROM skill_files
              WHERE skill_id = ? AND version = ? ORDER BY path ASC",
@@ -1491,6 +1630,12 @@ impl Db {
         version: &str,
         published_at: &str,
     ) -> DbResult<bool> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .publish_skill_version(skill_id, version, published_at)
+                .await
+                .map_err(Self::map_postgres_skill);
+        }
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             "UPDATE skill_versions SET status = 'published', published_at = ?
@@ -1519,6 +1664,12 @@ impl Db {
         outcome: &RunOutcome,
         input: &serde_json::Value,
     ) -> DbResult<()> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .insert_skill_run(outcome, input)
+                .await
+                .map_err(Self::map_postgres_skill);
+        }
         let input_json = serde_json::to_string(input)?;
         let output_json = outcome
             .output
@@ -1590,6 +1741,13 @@ impl Db {
         skill_id: Option<&str>,
         limit: i64,
     ) -> DbResult<Vec<SkillRunRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .list_skill_runs(skill_id, limit)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_skill);
+        }
         let limit = limit.clamp(1, 200);
         match skill_id {
             Some(skill_id) => Ok(sqlx::query_as::<_, SkillRunRow>(
@@ -1613,6 +1771,13 @@ impl Db {
     }
 
     pub async fn get_skill_run(&self, run_id: &str) -> DbResult<Option<SkillRunRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .get_skill_run(run_id)
+                .await
+                .map(|record| record.map(Into::into))
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillRunRow>(
             "SELECT id, skill_id, version, script_id, status, input_json, output_json, stdout,
                     stderr, exit_code, error_json, sandbox, duration_ms, started_at, finished_at
@@ -1624,6 +1789,13 @@ impl Db {
     }
 
     pub async fn list_skill_run_artifacts(&self, run_id: &str) -> DbResult<Vec<SkillArtifactRow>> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store
+                .list_skill_run_artifacts(run_id)
+                .await
+                .map(|records| records.into_iter().map(Into::into).collect())
+                .map_err(Self::map_postgres_skill);
+        }
         Ok(sqlx::query_as::<_, SkillArtifactRow>(
             "SELECT id, run_id, name, sha256, size, mime_type, stored_path, created_at
              FROM skill_run_artifacts WHERE run_id = ? ORDER BY name ASC",
@@ -2574,6 +2746,15 @@ impl Db {
                 .fetch_one(&self.pool)
                 .await?,
         )
+    }
+
+    pub async fn skill_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_skill.as_ref() {
+            return store.count_skills().await.map_err(Self::map_postgres_skill);
+        }
+        Ok(sqlx::query_scalar("SELECT COUNT(DISTINCT id) FROM skills")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn list_agents(&self) -> DbResult<Vec<AgentSummaryRow>> {

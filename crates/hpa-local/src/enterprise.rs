@@ -1166,11 +1166,7 @@ impl EnterpriseState {
         let (label, count, limit) = if method == "POST" && path == "/workflows" {
             ("workflows", db.workflow_count().await?, quota.max_workflows)
         } else if method == "POST" && path == "/skills/import" {
-            (
-                "skills",
-                count_query(db, "SELECT COUNT(DISTINCT id) FROM skills").await?,
-                quota.max_skills,
-            )
+            ("skills", db.skill_count().await?, quota.max_skills)
         } else if method == "POST" && path == "/agents" {
             ("agents", db.agent_count().await?, quota.max_agents)
         } else if method == "POST" && path == "/plugins/install" {

@@ -128,6 +128,7 @@
 - [Phase 10 OAuth 2.1 授权服务器](08-platform/oauth-authorization-server.md)
 - [Phase 12 可观测性](08-platform/observability.md)
 - [企业控制面 PostgreSQL 迁移](08-platform/postgres-enterprise-migration.md)
+- [Phase 14 Skill 元数据 PostgreSQL 权威](11-roadmap/phase-14-skill-postgres.md)
 - [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI

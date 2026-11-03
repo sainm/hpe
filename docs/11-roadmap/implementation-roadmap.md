@@ -246,6 +246,10 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 首个里程碑：P13-01 PostgreSQL schema/RLS 契约和迁移测试。
 
+## 8h. Phase 14：Skill 元数据 PostgreSQL 权威
+
+> 状态：**本地验收完成**（2026-11-03）。Skill 包与版本元数据（skills/skill_versions/skill_files/skill_runs/skill_run_artifacts）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威，支持跨节点导入、版本/文件读取、发布状态、运行与产物；本地 SQLite 模式与 Skill API/CLI/MCP 路径不改变。签名文件、跨节点 Skill 文件同步与 Skill 执行所有权不在本阶段。完整契约见 [Phase 14 Skill PostgreSQL](phase-14-skill-postgres.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid
