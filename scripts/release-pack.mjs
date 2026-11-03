@@ -15,7 +15,9 @@ import os from "node:os";
 
 const root = path.resolve(new URL("..", import.meta.url).pathname);
 
-function parseArgs(argv) {
+function parseArgs(rawArgv) {
+  // `pnpm <script> -- --flag` forwards a literal `--`; ignore it.
+  const argv = rawArgv.filter((arg) => arg !== "--");
   const options = { profile: "release", build: true, out: path.join(root, "dist-release") };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];

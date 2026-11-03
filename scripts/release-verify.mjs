@@ -10,9 +10,26 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const args = process.argv.slice(2);
-const tarball = args.find((arg) => !arg.startsWith("--"));
+const args = process.argv.slice(2).filter((arg) => arg !== "--");
 const keep = args.includes("--keep");
+
+// Accept a glob from callers that cannot rely on shell expansion.
+function expandGlob(pattern) {
+  if (!pattern.includes("*")) return pattern;
+  const dir = path.dirname(pattern);
+  const mask = new RegExp(
+    `^${path.basename(pattern).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`,
+  );
+  const match = fs
+    .readdirSync(dir)
+    .filter((entry) => mask.test(entry))
+    .sort()
+    .pop();
+  return match ? path.join(dir, match) : pattern;
+}
+
+const rawTarball = args.find((arg) => !arg.startsWith("--"));
+const tarball = rawTarball ? expandGlob(rawTarball) : undefined;
 
 if (!tarball) {
   console.error("usage: release-verify.mjs <hpa-*.tar.gz> [--keep]");

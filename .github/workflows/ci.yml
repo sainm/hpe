@@ -190,6 +190,10 @@ jobs:
       - run: pnpm --filter workbench build
       - run: pnpm --filter workbench test
       - run: cargo build -p hpa-local
+      # The release bundle is a deliverable: exercise pack + verify on every run
+      # so a broken manifest, checksum list or missing migration cannot ship.
+      - run: pnpm release:pack -- --profile debug --skip-build --out dist-release
+      - run: pnpm release:verify -- dist-release/hpa-*.tar.gz
       - run: pnpm test:e2e
       - run: pnpm test:mcp-conformance
       - run: pnpm --dir apps/vscode-extension run test:host
