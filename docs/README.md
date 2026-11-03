@@ -153,6 +153,7 @@
 - [测试策略](10-quality/test-strategy.md)
 - [发布清单](10-quality/release-checklist.md)
 - [Phase 13–18 状态台账](10-quality/phase-13-18-status.md)
+- [手动测试指南](10-quality/manual-test-guide.md)
 - [验收标准](10-quality/acceptance-criteria.md)
 - [实现状态与验收边界](10-quality/implementation-status.md)
 - [性能要求](10-quality/performance-requirements.md)
