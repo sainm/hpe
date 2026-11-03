@@ -1953,7 +1953,7 @@ async fn doctor(data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
         .unwrap_or(false);
     let postgres =
         match std::env::var("HPA_POSTGRES_URL").or_else(|_| std::env::var("DATABASE_URL")) {
-            Ok(database_url) => Some(check_postgres(&database_url).await),
+            Ok(database_url) => Some(check_postgres(&database_url, &data_dir).await),
             Err(_) => None,
         };
     let degraded = postgres
@@ -1981,7 +1981,7 @@ async fn doctor(data_dir: PathBuf) -> Result<(), Box<dyn Error>> {
 
 /// Connectivity, migration drift and RLS coverage for the PostgreSQL control
 /// plane. `doctor` stays diagnostic: it reports the problem instead of failing.
-async fn check_postgres(database_url: &str) -> Value {
+async fn check_postgres(database_url: &str, data_dir: &Path) -> Value {
     let pool = match sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(database_url)
@@ -2027,6 +2027,42 @@ async fn check_postgres(database_url: &str) -> Value {
         .fetch_one(&pool)
         .await
         .unwrap_or(0);
+    // Plugin metadata is shared but package directories are node-local: report
+    // the gap so "installed on another node, missing here" is visible up front
+    // instead of surfacing as a failed plugin load.
+    let mut plugin_installed: i64 = 0;
+    if let Ok(mut transaction) = pool.begin().await {
+        if sqlx::query("SET LOCAL ROLE hpa_platform_admin")
+            .execute(&mut *transaction)
+            .await
+            .is_ok()
+        {
+            plugin_installed = sqlx::query_scalar(
+                "SELECT count(*) FROM hpa_tenant.plugins WHERE status <> 'uninstalled'",
+            )
+            .fetch_one(&mut *transaction)
+            .await
+            .unwrap_or(0);
+        }
+        let _ = transaction.commit().await;
+    }
+    let plugin_dir = data_dir.join("plugins").join("installed");
+    let plugin_local = std::fs::read_dir(&plugin_dir)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .count() as i64
+        })
+        .unwrap_or(0);
+    let mut warnings: Vec<String> = Vec::new();
+    if plugin_installed > plugin_local {
+        warnings.push(format!(
+            "{} plugin(s) are installed in PostgreSQL but their packages are missing under {};              mount the plugins directory on a shared volume when running multiple control-plane nodes",
+            plugin_installed - plugin_local,
+            plugin_dir.display()
+        ));
+    }
     let drift = available - applied;
     pool.close().await;
     json!({
@@ -2039,6 +2075,12 @@ async fn check_postgres(database_url: &str) -> Value {
             "total": forced_rls_tenant + forced_rls_control,
         },
         "tenants": tenants,
+        "plugins": {
+            "installedInPostgres": plugin_installed,
+            "packagesPresentLocally": plugin_local,
+            "packagesMissing": (plugin_installed - plugin_local).max(0),
+        },
+        "warnings": warnings,
     })
 }
 

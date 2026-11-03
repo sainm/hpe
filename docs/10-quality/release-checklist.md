@@ -113,7 +113,7 @@ corepack pnpm run release:verify -- dist-release/hpa-<...>.tar.gz
 
 - 外部 AI 客户端（Claude Code / Codex / Copilot）的真实模型会话调用**未验收**，状态 `BLOCKED_EXTERNAL`。
 - 企业 IdP / CA / Vault / 生产 Collector / 多节点滚动升级**未验收**，同样 `BLOCKED_EXTERNAL`。
-- 企业控制面的租户、成员、配额、SCIM、浏览器会话仍以 SQLite 为权威；PostgreSQL 模式下已切走的是 Workflow/Execution/Trigger、Worker 注册与任务、平台令牌与审计。
+- 企业控制面的租户、成员、配额、SCIM、浏览器会话已切到 PostgreSQL（SQLite 仅单节点模式或缓存）。**PostgreSQL 模式下 `data_dir/plugins` 必须是共享卷**，插件元数据共享但包文件在节点本地；`hpa doctor` 会报告 `packagesMissing`。
 - 调度器为每节点各自 tick + 数据库乐观锁，不是 leader-only 派发；时间同步依赖宿主机 NTP。
 - MCP `2026-07-28` 的官方 conformance 场景尚未提供；已验收的是 `2025-11-25` 核心矩阵 9/9。
 

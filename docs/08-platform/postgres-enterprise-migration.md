@@ -145,6 +145,26 @@ HPA_POSTGRES_URL=postgresql://user@host:5432/db \
 
 **用途**：这是第 5 步「停止双写」的前置条件——没有零漂移就不该关掉 SQLite 写入。
 
+## 4.4 多节点共享前提（部署契约）
+
+切换到 PostgreSQL 后，**节点本地仍保留三类文件**。部署时必须按住户/插件量规划：
+
+| 本地路径 | 内容 | 多节点要求 |
+| --- | --- | --- |
+| `data_dir/plugins/installed/<id>/` | 插件包文件、解包后的handler与资源 | **必须共享**（NFS/对象存储挂载/同一 PV），否则「A 节点安装、B 节点加载失败」 |
+| `data_dir/tenants/<id>/` | 租户 SQLite 缓存与附件 | 可不共享：PG 模式下是可重建缓存，缺失会按需重建 |
+| `data_dir/keys/` 等 | 本地密钥与配置 | 按需：OAuth 签名密钥与会话密钥在 PG/环境变量中，本地文件仅作引导 |
+
+`hpa doctor` 会把这件事显式化：在 PostgreSQL 模式下它比较 `hpa_tenant.plugins` 的安装数与本地 `plugins/installed` 目录数，缺包时输出
+
+```
+"plugins": { "installedInPostgres": 3, "packagesPresentLocally": 1, "packagesMissing": 2 },
+"warnings": ["2 plugin(s) are installed in PostgreSQL but their packages are missing under
+             /data/hpa/plugins/installed; mount the plugins directory on a shared volume ..."]
+```
+
+`status` 不会因此变成 `degraded`（缺包只影响用到它的节点），但工单里应该把它当作部署错误处理。
+
 ## 5. 验证
 
 ```bash
