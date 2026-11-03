@@ -254,6 +254,38 @@ async fn tenants_quotas_and_members_mirror_into_postgres() {
         200,
         "tenant resolved from PostgreSQL on the fresh node"
     );
+    // Quota writes are PostgreSQL-authoritative: the fresh node can update a
+    // tenant it never stored locally.
+    let quota_write = server_b
+        .client
+        .put(server_b.url(&format!("/api/enterprise/quotas/{tenant_id}")))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "maxWorkflows": 21,
+            "maxExecutionsPerDay": 34,
+            "maxSkills": 3,
+            "maxAgents": 2,
+            "maxPlugins": 1,
+            "maxConnections": 4,
+            "maxConcurrentRuns": 2,
+        }))
+        .send()
+        .await
+        .expect("write quota on node b");
+    assert_eq!(
+        quota_write.status(),
+        200,
+        "quota writes must not require a local tenant row"
+    );
+    let mirrored: i64 = sqlx::query_scalar(
+        "SELECT max_executions_per_day FROM hpa_control.quotas WHERE tenant_id = $1",
+    )
+    .bind(&tenant_id)
+    .fetch_one(&pool)
+    .await
+    .expect("quota row after cross-node write");
+    assert_eq!(mirrored, 34, "the other node's write must reach PostgreSQL");
+
     let unknown = server_b
         .client
         .post(server_b.url("/api/enterprise/workers"))

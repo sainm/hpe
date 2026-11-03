@@ -2065,29 +2065,57 @@ async fn put_quota_handler(
             max_connections: request.max_connections,
             max_concurrent_runs: request.max_concurrent_runs,
         };
+        // PostgreSQL is authoritative: a failure here fails the request.
         control
             .upsert_quota(&tenant_id, &quota)
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
-    }
-    let result = sqlx::query(
-        "UPDATE enterprise_quotas SET max_workflows = ?, max_executions_per_day = ?,
-                max_skills = ?, max_agents = ?, max_plugins = ?, max_connections = ?,
-                max_concurrent_runs = ? WHERE tenant_id = ?",
-    )
-    .bind(request.max_workflows)
-    .bind(request.max_executions_per_day)
-    .bind(request.max_skills)
-    .bind(request.max_agents)
-    .bind(request.max_plugins)
-    .bind(request.max_connections)
-    .bind(request.max_concurrent_runs)
-    .bind(&tenant_id)
-    .execute(&state.control)
-    .await
-    .map_err(internal)?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::not_found("tenant quotas not found"));
+        // The local SQLite row is only a cache for single-node reads; a node
+        // that never saw this tenant simply upserts it.
+        let _ = sqlx::query(
+            "INSERT INTO enterprise_quotas
+             (tenant_id, max_workflows, max_executions_per_day, max_skills, max_agents,
+              max_plugins, max_connections, max_concurrent_runs)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id) DO UPDATE SET
+               max_workflows = excluded.max_workflows,
+               max_executions_per_day = excluded.max_executions_per_day,
+               max_skills = excluded.max_skills,
+               max_agents = excluded.max_agents,
+               max_plugins = excluded.max_plugins,
+               max_connections = excluded.max_connections,
+               max_concurrent_runs = excluded.max_concurrent_runs",
+        )
+        .bind(&tenant_id)
+        .bind(request.max_workflows)
+        .bind(request.max_executions_per_day)
+        .bind(request.max_skills)
+        .bind(request.max_agents)
+        .bind(request.max_plugins)
+        .bind(request.max_connections)
+        .bind(request.max_concurrent_runs)
+        .execute(&state.control)
+        .await;
+    } else {
+        let result = sqlx::query(
+            "UPDATE enterprise_quotas SET max_workflows = ?, max_executions_per_day = ?,
+                    max_skills = ?, max_agents = ?, max_plugins = ?, max_connections = ?,
+                    max_concurrent_runs = ? WHERE tenant_id = ?",
+        )
+        .bind(request.max_workflows)
+        .bind(request.max_executions_per_day)
+        .bind(request.max_skills)
+        .bind(request.max_agents)
+        .bind(request.max_plugins)
+        .bind(request.max_connections)
+        .bind(request.max_concurrent_runs)
+        .bind(&tenant_id)
+        .execute(&state.control)
+        .await
+        .map_err(internal)?;
+        if result.rows_affected() == 0 {
+            return Err(ApiError::not_found("tenant quotas not found"));
+        }
     }
     state
         .audit(

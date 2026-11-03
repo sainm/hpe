@@ -23,7 +23,7 @@
 | 平台令牌 | 不写 | **权威** | `postgres_token_store` |
 | 审计 | 不写 | **权威** | 未知租户回退 NULL tenant |
 | 租户 | **权威** | 镜像 + **读取** | 存在性/状态解析已在 PG 模式走 PostgreSQL，未命中回退并自愈 |
-| 配额 | **权威** | 镜像 + **读取** | 读路径已在 PG 模式下走 PostgreSQL |
+| 配额 | 缓存 | **权威** | 读与写都以 PostgreSQL 为准；SQLite 仅作单节点缓存，写失败不回滚 PG |
 | 成员 | **权威** | 镜像（写穿） | 创建/更新/删除同步到 PG |
 | SCIM Group / 映射 | **权威** | 未镜像 | 依赖成员表，翻转时一起处理 |
 | 浏览器会话 | 不写 | **权威** | 读/写/轮换/登出/按租户吊销全部走 PostgreSQL |
@@ -63,7 +63,7 @@
 按依赖顺序，每一步都应独立提交并带 PG 集成测试：
 
 1. ~~**租户读取切 PG**~~（已完成）：`ensure_tenant` / `active_tenants` 的存在性与状态判断改读 `hpa_control.tenants`；写入仍走 SQLite + 镜像。
-2. **配额权威翻转**：删除回退路径，`PUT /quotas` 先写 PG，镜像反向写 SQLite 或直接停写。
+2. ~~**配额权威翻转**~~（已完成）：`PUT /quotas` 先写 PostgreSQL（失败即请求失败），SQLite 降级为本地缓存并允许 upsert（不再要求本机已有租户行）；读取仍以 PG 优先。回退读取路径保留到第 5 步统一切除。
 3. **成员与 SCIM**：`scim.rs` 的 12 处成员查询、Group 映射、`browser_auth::find_member` 一起切；SCIM E2E 必须在 PG 模式下重跑（`pnpm test:scim-e2e`）。
 4. ~~**浏览器会话**~~（已完成）：`hpa_control.sessions` 承接读取、创建、`last_seen` 触碰、refresh 轮换（保留 token_hash + version 双重围栏）、登出、按 id/租户吊销；SQLite 只在 PG 无该行时作为升级窗口回退。**OAuth AS 状态**（`oauth_clients/codes/tokens/consents/signing_keys`）仍未迁移，那是第 4 步剩下的部分。
 5. **停止双写**：删除 SQLite 控制面写入与 `sync_postgres_control`，`enterprise_*` 表只作为历史备份保留。
@@ -82,6 +82,15 @@
 | 租户暂停 | `revoke_tenant_sessions` |
 
 `postgres_session_store` 证明：节点 A 创建的会话，节点 B（空 data dir）用同一 Cookie 通过认证并拿到 `platformAdmin`；节点 B 登出后该行在 PostgreSQL 标记 `revoked_at`，两节点都拒绝；任一节点的 SQLite `enterprise_sessions` 保持 0 行。
+
+### 3.5 配额写入（已完成）
+
+`PUT /api/enterprise/quotas/{tenant}` 在 PG 模式下：
+
+1. 先 `upsert_quota` 到 `hpa_control.quotas`，失败直接返回 500——不再“本地成功、共享状态没变”。
+2. 再把同一份值 upsert 到 `enterprise_quotas` 作为单节点缓存，失败只记日志（该节点可能从未见过这个租户）。
+
+`postgres_control_mirror` 覆盖：空 data dir 的节点为未见过的租户写配额返回 200，另一节点与 PostgreSQL 都读到新值。
 
 ## 4.1 双节点验收
 
