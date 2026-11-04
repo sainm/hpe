@@ -4,7 +4,9 @@
 
 ### Changed
 
-- Phase 25：2026-07-28 MCP MRTR conformance——新增 8 个 `InputRequiredResult` 工具 fixture 与 1 个 prompt fixture，覆盖 elicitation、sampling、roots/list、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get`；`pnpm test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查全部通过，2026 计分 server requirements 达到 37/37（tasks extension 不计分且未实现）。
+- Phase 27：双控制面 + 双 Worker 同版本滚动升级——新增 `test:worker-rolling`：两个控制面共享 PostgreSQL、两个 Worker 经故障切换代理消费 Job；控制面逐个 SIGKILL/替换、Worker 执行中强杀并重启后 6 个 Job 全部成功，重派 `attempts >= 2` 且 `executionId` 不变，21/21 checks；`multi-node-e2e` 10/10、`rolling-restart-e2e` 17/17 回归通过。
+- Phase 26：2026-07-28 MCP tasks extension conformance——`capabilities.extensions` 声明 SEP-2663，补齐 `greet`/`slow_compute`/`failing_job`/`protocol_error_job`/`confirm_delete`/`multi_input`/`test_tool_with_task` fixture、扁平 `CreateTaskResult`、`tasks/get` DetailedTask、空 ack 的 `tasks/update`/`tasks/cancel`、部分输入满足、MRTR 组合、`-32021` gating 与 tasks 方法 `Mcp-Name` 校验；`pnpm test:mcp-conformance:2026-tasks` 覆盖 10 个场景，完整 2026 requirements 达到 193 passed / 0 failed。
+- Phase 25：2026-07-28 MCP MRTR conformance——新增 8 个 `InputRequiredResult` 工具 fixture 与 1 个 prompt fixture，覆盖 elicitation、sampling、roots/list、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get`；`pnpm test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查全部通过，2026 计分 server requirements 达到 37/37（tasks extension 后由 Phase 26 补齐）。
 - Phase 24：2026-07-28 MCP conformance 内容场景——工具图像/音频/嵌入资源/混合内容/进度、Resources/Prompts、completion、caching、JSON Schema 2020-12、标准与自定义 Header（base64 Mcp-Param）全部通过；`pnpm test:mcp-conformance:2026-content` 覆盖 18 个场景。
 - Phase 23：官方 `@modelcontextprotocol/conformance` 升级到 `0.2.0-alpha.12`；新增 requirements 运行模式与 `pnpm test:mcp-conformance:2026`。2025-11-25 核心 9/9、2026-07-28 `server-stateless` 28/28 通过；补齐 per-request `_meta` 校验、-32020/-32022/-32021/-32601 错误与 HTTP 状态、移除方法 404、订阅 acknowledged 首帧与 subscriptionId 标记。
 - Phase 22：Agent 驱动循环每轮、工具执行前、Python 工具服务与审批恢复前续租 Agent 会话租约；租约过期或被接管时新工具副作用不执行，已开始的单次工具调用不中断。
@@ -43,9 +45,10 @@
 
 ### Tests
 
-- 全量 Rust：250 passed / 0 failed / 1 ignored；Clippy `-D warnings` 与 fmt 通过。
-- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**31 / 31 文件（32 / 32 用例）通过**，含远程 Marketplace 签名索引/安装/撤回链路与跨节点配额计数。
-- MCP 官方 conformance：2025-11-25 核心 9/9；2026-07-28 `server-stateless` 28/28、内容/Header 场景 18/18、MRTR 14 场景/40 检查全通过；计分 server requirements 37/37，总报告 162 passed / 29 failed（失败全部在不计分的 tasks extension）。
+- 全量 Rust：252 passed / 0 failed / 1 ignored；Clippy `-D warnings` 与 fmt 通过。
+- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**31 / 31 文件（32 / 32 用例）通过**，含远程 Marketplace 签名索引/安装/撤回链路与跨节点配额计数；`mcp_multinode` 跨节点强停/恢复用例另行通过。
+- 双控制面 + 双 Worker 同版本滚动：`test:worker-rolling` 21/21 checks，`test:multi-node` 10/10、`test:rolling` 17/17；强杀 Worker 后重派 `attempts >= 2` 且 `executionId` 不变。
+- MCP 官方 conformance：2025-11-25 核心 9/9；2026-07-28 完整 requirements **193 passed / 0 failed**，含 37 个计分 server 场景、14 个 MRTR 场景/40 项检查与 10 个 tasks extension 场景（`tasks-status-notifications` 可选跳过；`pnpm test:mcp-conformance:2026-tasks` 44/44 检查通过）。
 - PostgreSQL 备份/恢复：21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致。
 - Web：typecheck、12 Vitest、build；扩展：65 Vitest、7 个 Extension Host 检查、build。
-- 品牌、IR、契约（含运行时路由/方法漂移检查）、文档（182 文件 881 链接）、镜像、OTel、供应链门禁通过。
+- 品牌、IR、契约（含运行时路由/方法漂移检查）、文档（184 文件 892 链接）、镜像、OTel、供应链门禁通过。

@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use hpa_core::compiler::compile_workflow;
@@ -23,6 +23,7 @@ use crate::skills::{SkillService, SkillServiceError};
 
 pub const MODERN_VERSION: &str = "2026-07-28";
 pub const LEGACY_VERSION: &str = "2025-11-25";
+pub const TASKS_EXTENSION: &str = "io.modelcontextprotocol/tasks";
 pub const SUPPORTED_VERSIONS: &[&str] =
     &[MODERN_VERSION, LEGACY_VERSION, "2025-06-18", "2024-11-05"];
 pub const SCOPE_READ: &str = "mcp:read";
@@ -430,10 +431,12 @@ async fn dispatch(
                     "resources": {"subscribe": false, "listChanged": true},
                     "prompts": {"listChanged": true},
                     "completions": {},
-                    "io.modelcontextprotocol/tasks": {
-                        "get": true,
-                        "update": true,
-                        "list": false
+                    "extensions": {
+                        (TASKS_EXTENSION): {
+                            "get": true,
+                            "update": true,
+                            "cancel": true
+                        }
                     }
                 },
                 "serverInfo": server_info(),
@@ -548,19 +551,33 @@ async fn dispatch(
         }
         "tasks/get" => {
             require_scope(auth, SCOPE_READ)?;
+            if era == Era::Modern {
+                require_tasks_extension(params)?;
+            }
             let task_id = params
                 .get("taskId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(-32602, "tasks/get requires taskId"))?;
+            if conformance_mode()
+                && let Some(task) = conformance_task_by_id(task_id)
+            {
+                return Ok(conformance_task_detail(&task));
+            }
             let task = mcp_task(service, task_id).await?;
             Ok(finish(era, task))
         }
         "tasks/update" => {
             require_scope(auth, SCOPE_EXECUTE)?;
+            if era == Era::Modern {
+                require_tasks_extension(params)?;
+            }
             let task_id = params
                 .get("taskId")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(-32602, "tasks/update requires taskId"))?;
+            if conformance_mode() && update_conformance_task(task_id, params, era)? {
+                return Ok(finish(era, json!({})));
+            }
             let update = params
                 .get("update")
                 .and_then(Value::as_object)
@@ -593,6 +610,40 @@ async fn dispatch(
                 .map_err(rpc_db)?;
             let task = mcp_task(service, task_id).await?;
             Ok(finish(era, task))
+        }
+        "tasks/cancel" => {
+            require_scope(auth, SCOPE_EXECUTE)?;
+            if era == Era::Modern {
+                require_tasks_extension(params)?;
+            }
+            let task_id = params
+                .get("taskId")
+                .and_then(Value::as_str)
+                .ok_or_else(|| RpcError::new(-32602, "tasks/cancel requires taskId"))?;
+            if conformance_mode() && cancel_conformance_task(task_id) {
+                return Ok(finish(era, json!({})));
+            }
+            let row = service
+                .db()
+                .get_execution(task_id)
+                .await
+                .map_err(rpc_db)?
+                .ok_or_else(|| RpcError::new(-32602, format!("task `{task_id}` not found")))?;
+            let mut state = crate::db::parse_state(&row).map_err(rpc_db)?;
+            if state.status != hpa_core::runtime::ExecutionStatus::WaitingApproval {
+                return Err(RpcError::new(
+                    -32602,
+                    "task can only be cancelled while waiting for approval",
+                ));
+            }
+            let events = cancel_execution(&mut state)
+                .map_err(|error| RpcError::new(-32603, format!("cannot cancel task: {error}")))?;
+            service
+                .db()
+                .save_execution(&state, &events)
+                .await
+                .map_err(rpc_db)?;
+            Ok(finish(era, json!({})))
         }
         "notifications/initialized" | "notifications/cancelled" => Ok(json!({})),
         other => Err(RpcError::new(
@@ -872,7 +923,101 @@ fn conformance_tool_specs() -> Vec<Value> {
             "_meta": {"hpa/conformanceFixture": true}
         }));
     }
+    specs.extend(task_conformance_tool_specs());
     specs
+}
+
+fn task_conformance_tool_specs() -> Vec<Value> {
+    vec![
+        json!({
+            "name": "greet",
+            "title": "Tasks sync fixture",
+            "description": "Sync-only greeting used by the tasks extension conformance suite.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "forbidden"}
+        }),
+        json!({
+            "name": "slow_compute",
+            "title": "Tasks optional fixture",
+            "description": "Task-supporting computation that sleeps for `seconds`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "seconds": {"type": "integer"},
+                    "label": {"type": "string"}
+                },
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "optional"}
+        }),
+        json!({
+            "name": "failing_job",
+            "title": "Tasks required fixture",
+            "description": "Task-supporting fixture that reports a tool execution error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "required"}
+        }),
+        json!({
+            "name": "protocol_error_job",
+            "title": "Tasks protocol error fixture",
+            "description": "Task-supporting fixture that fails with a protocol-level error.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "optional"}
+        }),
+        json!({
+            "name": "confirm_delete",
+            "title": "Tasks MRTR fixture",
+            "description": "Task-supporting fixture that parks on an elicitation request.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"filename": {"type": "string"}},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "optional"}
+        }),
+        json!({
+            "name": "multi_input",
+            "title": "Tasks multiple input fixture",
+            "description": "Task-supporting fixture with two simultaneous elicitation requests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "optional"}
+        }),
+        json!({
+            "name": "test_tool_with_task",
+            "title": "Tasks MRTR composition fixture",
+            "description": "Gathers elicitation input with MRTR and then escalates to a task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true, "hpa/taskSupport": "required"}
+        }),
+    ]
 }
 
 fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcError> {
@@ -1040,8 +1185,22 @@ fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcE
         name if name.starts_with("test_input_required_result_") => {
             Ok(Some(mrtr_tool_call(name, params, era)?))
         }
+        name if is_task_fixture(name) => Ok(Some(task_fixture_tool_call(name, params, era)?)),
         _ => Ok(None),
     }
+}
+
+fn is_task_fixture(name: &str) -> bool {
+    matches!(
+        name,
+        "greet"
+            | "slow_compute"
+            | "failing_job"
+            | "protocol_error_job"
+            | "confirm_delete"
+            | "multi_input"
+            | "test_tool_with_task"
+    )
 }
 
 fn mrtr_tool_call(name: &str, params: &Value, era: Era) -> Result<Value, RpcError> {
@@ -1488,6 +1647,387 @@ fn mrtr_prompt(params: &Value, era: Era) -> Result<Value, RpcError> {
             }]
         }),
     ))
+}
+
+#[derive(Clone)]
+struct ConformanceTask {
+    id: String,
+    status: String,
+    created_at: String,
+    updated_at: String,
+    ttl_ms: i64,
+    poll_interval_ms: i64,
+    result: Option<Value>,
+    error: Option<Value>,
+    input_requests: BTreeMap<String, Value>,
+    completion_text: Option<String>,
+    completion_is_error: bool,
+}
+
+fn conformance_task_store() -> &'static Mutex<HashMap<String, ConformanceTask>> {
+    static TASKS: OnceLock<Mutex<HashMap<String, ConformanceTask>>> = OnceLock::new();
+    TASKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn new_conformance_task(
+    status: &str,
+    input_requests: BTreeMap<String, Value>,
+    completion_text: Option<String>,
+    completion_is_error: bool,
+) -> ConformanceTask {
+    let now = now_rfc3339();
+    ConformanceTask {
+        id: format!("task_{}", Uuid::now_v7()),
+        status: status.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        ttl_ms: 60_000,
+        poll_interval_ms: 100,
+        result: None,
+        error: None,
+        input_requests,
+        completion_text,
+        completion_is_error,
+    }
+}
+
+fn conformance_task_create_result(task: &ConformanceTask) -> Value {
+    json!({
+        "resultType": "task",
+        "taskId": task.id,
+        "status": task.status,
+        "createdAt": task.created_at,
+        "lastUpdatedAt": task.updated_at,
+        "ttlMs": task.ttl_ms,
+        "pollIntervalMs": task.poll_interval_ms,
+        "_meta": modern_meta(),
+    })
+}
+
+fn conformance_task_detail(task: &ConformanceTask) -> Value {
+    let mut detail = json!({
+        "resultType": "complete",
+        "taskId": task.id,
+        "status": task.status,
+        "createdAt": task.created_at,
+        "lastUpdatedAt": task.updated_at,
+        "ttlMs": task.ttl_ms,
+        "pollIntervalMs": task.poll_interval_ms,
+        "_meta": modern_meta(),
+    });
+    if let Some(result) = &task.result {
+        detail["result"] = result.clone();
+    }
+    if let Some(error) = &task.error {
+        detail["error"] = error.clone();
+    }
+    if !task.input_requests.is_empty() {
+        detail["inputRequests"] = Value::Object(
+            task.input_requests
+                .clone()
+                .into_iter()
+                .collect::<serde_json::Map<String, Value>>(),
+        );
+    }
+    detail
+}
+
+fn store_conformance_task(task: ConformanceTask) -> Value {
+    let create = conformance_task_create_result(&task);
+    if let Ok(mut tasks) = conformance_task_store().lock() {
+        tasks.insert(task.id.clone(), task);
+    }
+    create
+}
+
+fn conformance_task_by_id(task_id: &str) -> Option<ConformanceTask> {
+    conformance_task_store()
+        .lock()
+        .ok()
+        .and_then(|tasks| tasks.get(task_id).cloned())
+}
+
+fn spawn_conformance_task_completion(
+    task_id: String,
+    delay_ms: u64,
+    result: Option<Value>,
+    error: Option<Value>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        let Ok(mut tasks) = conformance_task_store().lock() else {
+            return;
+        };
+        let Some(task) = tasks.get_mut(&task_id) else {
+            return;
+        };
+        if task.status != "working" {
+            return;
+        }
+        task.status = if error.is_some() {
+            "failed"
+        } else {
+            "completed"
+        }
+        .to_string();
+        task.result = result;
+        task.error = error;
+        task.updated_at = now_rfc3339();
+    });
+}
+
+fn tasks_extension_declared(params: &Value) -> bool {
+    params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(|extensions| extensions.get(TASKS_EXTENSION))
+        .is_some_and(Value::is_object)
+}
+
+fn tasks_extension_error() -> RpcError {
+    let mut extensions = serde_json::Map::new();
+    extensions.insert(TASKS_EXTENSION.to_string(), json!({}));
+    let mut required = serde_json::Map::new();
+    required.insert("extensions".to_string(), Value::Object(extensions));
+    RpcError::new(
+        -32021,
+        "the io.modelcontextprotocol/tasks extension is required",
+    )
+    .with_data(json!({"requiredCapabilities": Value::Object(required)}))
+}
+
+pub(crate) fn require_tasks_extension(params: &Value) -> Result<(), RpcError> {
+    if tasks_extension_declared(params) {
+        Ok(())
+    } else {
+        Err(tasks_extension_error())
+    }
+}
+
+fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value, RpcError> {
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    match name {
+        "greet" => {
+            let who = arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("World");
+            Ok(finish(
+                era,
+                json!({
+                    "content": [{"type": "text", "text": format!("Hello, {who}!")}],
+                    "isError": false
+                }),
+            ))
+        }
+        "slow_compute" => {
+            let seconds = arguments
+                .get("seconds")
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .max(0);
+            let label = arguments
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("compute");
+            let text = format!("Computed {label}");
+            if !tasks_extension_declared(params) {
+                return Ok(finish(
+                    era,
+                    json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": false
+                    }),
+                ));
+            }
+            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task_id = task.id.clone();
+            let create = store_conformance_task(task);
+            let result = finish(
+                era,
+                json!({
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false
+                }),
+            );
+            spawn_conformance_task_completion(task_id, seconds as u64 * 1000, Some(result), None);
+            Ok(create)
+        }
+        "failing_job" => {
+            if !tasks_extension_declared(params) {
+                return Err(tasks_extension_error());
+            }
+            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task_id = task.id.clone();
+            let create = store_conformance_task(task);
+            let result = finish(
+                era,
+                json!({
+                    "content": [{"type": "text", "text": "failing_job reported a tool error"}],
+                    "isError": true
+                }),
+            );
+            spawn_conformance_task_completion(task_id, 800, Some(result), None);
+            Ok(create)
+        }
+        "protocol_error_job" => {
+            if !tasks_extension_declared(params) {
+                return Err(tasks_extension_error());
+            }
+            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task_id = task.id.clone();
+            let create = store_conformance_task(task);
+            spawn_conformance_task_completion(
+                task_id,
+                800,
+                None,
+                Some(json!({
+                    "code": -32603,
+                    "message": "protocol_error_job failed"
+                })),
+            );
+            Ok(create)
+        }
+        "confirm_delete" => {
+            if !tasks_extension_declared(params) {
+                return Err(tasks_extension_error());
+            }
+            let filename = arguments
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let mut requests = BTreeMap::new();
+            requests.insert(
+                "confirm_delete".to_string(),
+                elicitation_request_value(&format!("Delete {filename}?"), "confirm", "boolean"),
+            );
+            let task = new_conformance_task(
+                "input_required",
+                requests,
+                Some(format!("Deleted {filename}")),
+                false,
+            );
+            Ok(store_conformance_task(task))
+        }
+        "multi_input" => {
+            if !tasks_extension_declared(params) {
+                return Err(tasks_extension_error());
+            }
+            let mut requests = BTreeMap::new();
+            requests.insert(
+                "first".to_string(),
+                elicitation_request_value("First input?", "name", "string"),
+            );
+            requests.insert(
+                "second".to_string(),
+                elicitation_request_value("Second input?", "name", "string"),
+            );
+            let task = new_conformance_task(
+                "input_required",
+                requests,
+                Some("Both inputs received".to_string()),
+                false,
+            );
+            Ok(store_conformance_task(task))
+        }
+        "test_tool_with_task" => {
+            if !tasks_extension_declared(params) {
+                return Err(tasks_extension_error());
+            }
+            let Some(responses) = mrtr_responses(params)? else {
+                return Ok(mrtr_input_required(
+                    vec![elicitation_request(
+                        "user_name",
+                        "What is your name?",
+                        "name",
+                        "string",
+                    )],
+                    None,
+                ));
+            };
+            let Some(user_name) =
+                elicitation_content(responses, "user_name", "name").and_then(Value::as_str)
+            else {
+                return Ok(mrtr_input_required(
+                    vec![elicitation_request(
+                        "user_name",
+                        "What is your name?",
+                        "name",
+                        "string",
+                    )],
+                    None,
+                ));
+            };
+            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task_id = task.id.clone();
+            let create = store_conformance_task(task);
+            let result = finish(
+                era,
+                json!({
+                    "content": [{"type": "text", "text": format!("Hello, {user_name}!")}],
+                    "isError": false
+                }),
+            );
+            spawn_conformance_task_completion(task_id, 50, Some(result), None);
+            Ok(create)
+        }
+        other => Err(RpcError::new(
+            -32601,
+            format!("unknown tasks fixture `{other}`"),
+        )),
+    }
+}
+
+fn update_conformance_task(task_id: &str, params: &Value, era: Era) -> Result<bool, RpcError> {
+    let Some(mut task) = conformance_task_by_id(task_id) else {
+        return Ok(false);
+    };
+    let answered = params
+        .get("inputResponses")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if !answered.is_empty() {
+        for key in answered.keys() {
+            task.input_requests.remove(key);
+        }
+        task.updated_at = now_rfc3339();
+        if task.input_requests.is_empty() && task.status == "input_required" {
+            task.status = "completed".to_string();
+            if let Some(text) = task.completion_text.clone() {
+                task.result = Some(finish(
+                    era,
+                    json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": task.completion_is_error
+                    }),
+                ));
+            }
+            task.updated_at = now_rfc3339();
+        }
+    }
+    if let Ok(mut tasks) = conformance_task_store().lock() {
+        tasks.insert(task_id.to_string(), task);
+    }
+    Ok(true)
+}
+
+fn cancel_conformance_task(task_id: &str) -> bool {
+    let Ok(mut tasks) = conformance_task_store().lock() else {
+        return false;
+    };
+    let Some(task) = tasks.get_mut(task_id) else {
+        return false;
+    };
+    if matches!(task.status.as_str(), "working" | "input_required") {
+        task.status = "cancelled".to_string();
+        task.updated_at = now_rfc3339();
+    }
+    true
 }
 
 async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<ToolEntry>, RpcError> {
@@ -2714,7 +3254,9 @@ async fn admin_request_with(
     if method != "initialize" && params.get("_meta").is_none() {
         params["_meta"] = json!({
             "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
-            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": { (TASKS_EXTENSION): {} }
+            },
             "io.modelcontextprotocol/clientInfo": {"name": "hpa-local-ui", "version": env!("CARGO_PKG_VERSION")},
         });
     }
@@ -2941,6 +3483,12 @@ mod tests {
         .response
         .expect("discover response");
         assert_eq!(discover["result"]["resultType"], "complete");
+        assert!(
+            discover["result"]["capabilities"]["extensions"]
+                .get(TASKS_EXTENSION)
+                .is_some_and(Value::is_object)
+        );
+        assert!(discover["result"]["capabilities"].get("tasks").is_none());
 
         let list = handle_request(
             &service,
@@ -3356,5 +3904,179 @@ mod tests {
         .expect("prompt complete");
         assert_eq!(prompt_complete["resultType"], "complete");
         assert!(prompt_complete["messages"].is_array());
+    }
+
+    fn tasks_params(declared: bool) -> Value {
+        let capabilities = if declared {
+            json!({"extensions": {(TASKS_EXTENSION): {}}})
+        } else {
+            json!({})
+        };
+        json!({
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": capabilities,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn tasks_extension_gates_and_tracks_fixture_state() {
+        let missing = task_fixture_tool_call("failing_job", &tasks_params(false), Era::Modern)
+            .expect_err("failing_job is task-supporting and requires the extension");
+        assert_eq!(missing.code, -32021);
+        assert_eq!(
+            missing.data.expect("required capability data")["requiredCapabilities"]["extensions"]
+                [TASKS_EXTENSION],
+            json!({})
+        );
+
+        let sync = task_fixture_tool_call("slow_compute", &tasks_params(false), Era::Modern)
+            .expect("sync fallback");
+        assert_eq!(sync["resultType"], "complete");
+        assert!(sync.get("taskId").is_none());
+        assert_eq!(sync["content"][0]["text"], "Computed compute");
+
+        let greet = task_fixture_tool_call(
+            "greet",
+            &json!({"arguments": {"name": "World"}}),
+            Era::Modern,
+        )
+        .expect("greet");
+        assert_eq!(greet["content"][0]["text"], "Hello, World!");
+
+        let create = task_fixture_tool_call(
+            "slow_compute",
+            &json!({
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {(TASKS_EXTENSION): {}}
+                    }
+                },
+                "arguments": {"seconds": 2, "label": "unit"},
+            }),
+            Era::Modern,
+        )
+        .expect("create task");
+        assert_eq!(create["resultType"], "task");
+        assert!(create.get("result").is_none());
+        assert!(create.get("error").is_none());
+        assert!(create.get("inputRequests").is_none());
+        assert!(create.get("requestState").is_none());
+        assert_eq!(create["ttlMs"], json!(60_000));
+        assert_eq!(create["pollIntervalMs"], json!(100));
+        let task_id = create["taskId"].as_str().expect("task id").to_string();
+        let detail = conformance_task_detail(&conformance_task_by_id(&task_id).expect("stored"));
+        assert_eq!(detail["status"], "working");
+        assert!(cancel_conformance_task(&task_id));
+        let cancelled = conformance_task_detail(&conformance_task_by_id(&task_id).expect("stored"));
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled.get("requestState").is_none());
+
+        let multi = task_fixture_tool_call(
+            "multi_input",
+            &json!({
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {(TASKS_EXTENSION): {}}
+                    }
+                },
+                "arguments": {},
+            }),
+            Era::Modern,
+        )
+        .expect("multi input");
+        let multi_id = multi["taskId"].as_str().expect("multi id").to_string();
+        let pending =
+            conformance_task_detail(&conformance_task_by_id(&multi_id).expect("multi stored"));
+        assert_eq!(pending["status"], "input_required");
+        assert_eq!(
+            pending["inputRequests"]
+                .as_object()
+                .expect("requests")
+                .len(),
+            2
+        );
+        assert!(
+            update_conformance_task(
+                &multi_id,
+                &json!({"inputResponses": {"first": {"action": "accept"}}}),
+                Era::Modern,
+            )
+            .expect("partial update")
+        );
+        let partial =
+            conformance_task_detail(&conformance_task_by_id(&multi_id).expect("multi stored"));
+        assert_eq!(partial["status"], "input_required");
+        let remaining = partial["inputRequests"]
+            .as_object()
+            .expect("remaining requests");
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining.contains_key("second"));
+        assert!(
+            update_conformance_task(
+                &multi_id,
+                &json!({"inputResponses": {"second": {"action": "accept"}}}),
+                Era::Modern,
+            )
+            .expect("final update")
+        );
+        let completed =
+            conformance_task_detail(&conformance_task_by_id(&multi_id).expect("multi stored"));
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(
+            completed["result"]["content"][0]["text"],
+            "Both inputs received"
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_mrtr_composition_escalates_to_task() {
+        let params = json!({
+            "_meta": {
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "elicitation": {},
+                    "extensions": {(TASKS_EXTENSION): {}}
+                }
+            },
+            "arguments": {},
+        });
+        let first =
+            task_fixture_tool_call("test_tool_with_task", &params, Era::Modern).expect("round 1");
+        assert_eq!(first["resultType"], "input_required");
+        assert!(first.get("taskId").is_none());
+        assert!(first["inputRequests"].get("user_name").is_some());
+
+        let second = task_fixture_tool_call(
+            "test_tool_with_task",
+            &json!({
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "elicitation": {},
+                        "extensions": {(TASKS_EXTENSION): {}}
+                    }
+                },
+                "arguments": {},
+                "inputResponses": {
+                    "user_name": {"action": "accept", "content": {"name": "Alice"}}
+                }
+            }),
+            Era::Modern,
+        )
+        .expect("round 2");
+        assert_eq!(second["resultType"], "task");
+        assert!(second.get("requestState").is_none());
+        assert!(second.get("inputRequests").is_none());
+        let task_id = second["taskId"].as_str().expect("task id").to_string();
+        for _ in 0..50 {
+            let detail =
+                conformance_task_detail(&conformance_task_by_id(&task_id).expect("stored"));
+            if detail["status"] == "completed" {
+                assert_eq!(detail["result"]["content"][0]["text"], "Hello, Alice!");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("task did not complete");
     }
 }

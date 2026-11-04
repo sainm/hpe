@@ -38,7 +38,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-02 分布式调度、租约与 outbox
 
-> 进度：**IN_PROGRESS**。PostgreSQL transactional outbox、tenant idempotency ledger、Topic Event outbox consumer、Scheduler fencing lease、实际 Scheduler leader 选举/续租/双进程强杀接管、execution owner lease/fenced state commit、Worker heartbeat/lease renewal/stale fencing/re-drive 已实现并通过并发、过期接管和死信测试；`HPA_POSTGRES_RUNTIME=1` 时 trigger facts 与 **Worker Job API（注册、心跳、租约、完成、取消、停用）**均走 PostgreSQL，`postgres_worker_registry` 断言 PostgreSQL 模式下 SQLite 注册表与任务表保持 0 行。真实 Worker daemon 已在 PostgreSQL 控制面上完成租约→执行→写回（见下方证据）；多控制面滚动升级与跨节点 Worker 租约演练仍未验证。契约见 [分布式运行时原语](../08-platform/postgres-distributed-runtime.md)。
+> 进度：**本地验收完成**（2026-11-04）。PostgreSQL transactional outbox、tenant idempotency ledger、Topic Event outbox consumer、Scheduler fencing lease、实际 Scheduler leader 选举/续租/双进程强杀接管、execution owner lease/fenced state commit、Worker heartbeat/lease renewal/stale fencing/re-drive 已实现并通过并发、过期接管和死信测试；`HPA_POSTGRES_RUNTIME=1` 时 trigger facts 与 **Worker Job API（注册、心跳、租约、完成、取消、停用）**均走 PostgreSQL，`postgres_worker_registry` 断言 PostgreSQL 模式下 SQLite 注册表与任务表保持 0 行。真实 Worker daemon 已在 PostgreSQL 控制面上完成租约→执行→写回；[Phase 27](phase-27-worker-rolling-upgrade.md) 新增双控制面 + 双 Worker 同版本滚动演练：控制面逐个替换、Worker 执行中强杀并重启后 6 个 Job 全部成功，重派 `attempts >= 2` 且 `executionId` 不变（21/21 checks）。跨版本滚动仍不支持。契约见 [分布式运行时原语](../08-platform/postgres-distributed-runtime.md)。
 
 交付：
 
@@ -56,7 +56,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-03 分布式 MCP 与事件总线
 
-> 进度：**IN_PROGRESS**。PostgreSQL session/subscription/notification/task 状态、tenant/token/TTL 隔离、sequence 恢复和 task 终态约束已通过集成测试；`HPA_POSTGRES_MCP=1` 时 legacy session、subscription、目录通知、`tasks/get/update` 与 owner-node 命令消费者已切换。双进程测试验证 node-a 强停后由 node-b 提交取消、node-a 重启恢复并触发跨节点 task SSE。持久通知 backlog 使用租户内有界统计，超过 `HPA_MCP_NOTIFICATION_MAX_LAG` 主动断开并通过 `Last-Event-ID` 在保留窗口内重放。Topic Event 已使用 PostgreSQL outbox 异步消费和共享 trigger fire 去重；webhook/schedule/MCP task 尚未统一到同一事件账本。官方 conformance 2025-11-25 核心矩阵 9/9、2026-07-28 `server-stateless` 28/28 与计分 server requirements 37/37 通过；tasks extension（SEP-2663，不计分）与真实客户端仍未完成。契约见 [MCP 持久状态](../06-mcp/persistent-state.md)。
+> 进度：**IN_PROGRESS**。PostgreSQL session/subscription/notification/task 状态、tenant/token/TTL 隔离、sequence 恢复和 task 终态约束已通过集成测试；`HPA_POSTGRES_MCP=1` 时 legacy session、subscription、目录通知、`tasks/get/update` 与 owner-node 命令消费者已切换。双进程测试验证 node-a 强停后由 node-b 提交取消、node-a 重启恢复并触发跨节点 task SSE。持久通知 backlog 使用租户内有界统计，超过 `HPA_MCP_NOTIFICATION_MAX_LAG` 主动断开并通过 `Last-Event-ID` 在保留窗口内重放。Topic Event 已使用 PostgreSQL outbox 异步消费和共享 trigger fire 去重；webhook/schedule/MCP task 尚未统一到同一事件账本。官方 conformance 2025-11-25 核心矩阵 9/9、2026-07-28 完整 requirements 193 passed / 0 failed（含 tasks extension）通过；`notifications/tasks` 推送与真实客户端仍未完成。契约见 [MCP 持久状态](../06-mcp/persistent-state.md)。
 
 交付：
 
@@ -201,6 +201,7 @@ Phase 13 必须保持以下不变量：
 - Execution Lease：每 step 前续租，state/events 提交匹配 holder/token/未过期 lease。lease 过期后节点 B 递增 token 接管，节点 A 的 save/release 失败；空 data_dir 节点可从 PG running execution + workflow snapshot 恢复完成并释放 lease。
 - 发布产物：`pnpm release:pack --profile debug --skip-build` 生成 `hpa-0.1.0-<sha>-darwin-arm64.tar.gz`（包含 `migrations/postgres/`、Web 资源与 CycloneDX SBOM），`pnpm release:verify` 校验压缩包 sha256、逐文件 `SHA256SUMS`，并在临时 data dir 上跑通 `hpa doctor`（status ok）。
 - Hybrid Worker + PostgreSQL 端到端：真实 `hpa worker` daemon 在 `HPA_POSTGRES_RUNTIME=1` 下从 PostgreSQL 领取任务、上报 `start`、执行完成并写回 `hpa_tenant.executions`/`events`，SQLite `enterprise_worker_jobs` 保持 0 行（`postgres_worker_daemon`）。该测试暴露并修复了一个只在 PostgreSQL 出现的缺陷：`remote_executions` 外键要求执行行先存在，而 worker `start` 原先在插入执行行之前就写远端标记，导致守护进程一直 500 重试。
+- 双控制面 + 双 Worker 同版本滚动（Phase 27）：`scripts/worker-rolling-upgrade-e2e.mjs` 用两个共享 PostgreSQL 的控制面、两个 Worker 和 loopback 故障切换代理执行 21/21 checks；控制面逐个 SIGKILL/替换、两 Worker 分别在 job-1/job-4 执行中 SIGKILL 并重启，6 个 Job 全部成功，重派 `attempts >= 2` 且 `executionId` 不变，滚动后两个 Worker 仍 active。`multi-node-e2e` 10/10、`rolling-restart-e2e` 17/17 回归通过。
 - 缓存漂移检查：`hpa db verify-mirror` 比对 PostgreSQL 权威与 SQLite 缓存（租户/配额/成员），输出分类漂移并以非零退出码结束；`postgres_mirror_verify` 证明「缓存收敛后为零 → 直接改 SQLite 报 `member.attrMismatch` → PG→SQLite 缓存重建后归零」。
 - 控制面缓存重建：`HPA_POSTGRES_RUNTIME=1` 下周期任务（`HPA_CONTROL_SYNC_INTERVAL_MS`，默认 30 秒）从 PostgreSQL 全量重建 SQLite 租户/配额/成员缓存并删除多余行；不再把 SQLite 写回 PostgreSQL。`postgres_control_refresh` 验证 SCIM 成员无需重启即出现在 `hpa_control.members`。
 - 配额权威：`PUT /api/enterprise/quotas/{tenant}` 先写 `hpa_control.quotas`（失败即请求失败），SQLite 仅作缓存；`postgres_control_mirror` 验证空 data dir 节点可为未见过的租户写配额，另一节点读到同一值。
@@ -226,7 +227,7 @@ Phase 13 必须保持以下不变量：
 - Event atomicity：execution、start event 与 trigger fire 在同一 PG 事务中提交；重复 trigger fire 的唯一约束会使第二次 execution 一并回滚，最终 execution/fire 各 1，消除“execution 已写入但 fire 未记录”的崩溃窗口。
 - MCP 跨节点任务：`tasks/get/update` 通过 PostgreSQL；node-b 在 node-a 停机期间提交取消命令，node-a 使用相同 node ID 重启后消费命令、更新 execution 与 task，node-b SSE 收到 `notifications/tasks/status_changed`。
 - MCP 慢消费者：真实 PostgreSQL/SSE 测试制造 25 条租户通知并设置 backlog 上限 20，超限连接主动结束；以倒数第 3 条为 `Last-Event-ID` 重连后，最后两条通知按 sequence 重放。租户内统计使用上限子查询，不扫描并物化完整积压。
-- MCP 官方 conformance：`@modelcontextprotocol/conformance@0.2.0-alpha.12` 从 npmmirror 锁定安装；临时 PAT 认证代理下执行 2025-11-25 核心场景 9/9 PASS，2026-07-28 `server-stateless` 28/28、计分 server requirements 37/37（含 14 个 MRTR 场景）PASS（`pnpm test:mcp-conformance:2026`、`test:mcp-conformance:2026-content`、`test:mcp-conformance:2026-mrtr`）。测试工具仅在 `HPA_MCP_CONFORMANCE=1` 的临时 Runtime 出现，常规 `tools/list` 回归断言 `test_*` 不存在。
+- MCP 官方 conformance：`@modelcontextprotocol/conformance@0.2.0-alpha.12` 从 npmmirror 锁定安装；临时 PAT 认证代理下执行 2025-11-25 核心场景 9/9 PASS，2026-07-28 完整 requirements 193 passed / 0 failed（37 计分场景、14 个 MRTR 场景与 10 个 tasks extension 场景），命令见 `pnpm test:mcp-conformance:2026`、`test:mcp-conformance:2026-content`、`test:mcp-conformance:2026-mrtr`、`test:mcp-conformance:2026-tasks`。测试工具仅在 `HPA_MCP_CONFORMANCE=1` 的临时 Runtime 出现，常规 `tools/list` 回归断言 `test_*` 不存在。
 - Event 部分 fan-out：同一 topic 两个订阅者中预投递一个后，携带相同 Event ID 重试只为缺失订阅者创建执行；所有订阅者投递完成后再重试返回 duplicate，避免部分成功阻塞其余订阅者。
 - Remote Marketplace UI：source/publisher/key 只读目录 API、Web 管理面、远程包安装入口通过 Playwright；1440/607 无横向溢出，axe serious/critical=0。VS Code Tree 增加 source/publisher/key/install/scan 管理。HPA 包支持在线 OSV/离线漏洞库、key-based cosign/OCI digest provenance 和持久 SSE 撤回推送；keyless Fulcio/Rekor、Registry attestation 拉取与跨控制面 federation 仍未完成。
 - OSV：真实 `api.osv.dev` 查询 `jinja2@3.1.0`（`HPA_OSV_ECOSYSTEM=PyPI`）返回 10 个 advisory；未知 `plugin_online@1.0.0` 按 name-only 查询返回 clean。在线结果不代表 HPA 包安全结论，生产应配置正确 ecosystem 或使用带 `HPA` ecosystem 的离线快照。

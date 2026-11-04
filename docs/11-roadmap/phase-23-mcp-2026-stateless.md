@@ -38,7 +38,7 @@ pnpm test:mcp-conformance:2026
 HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance
 ```
 
-Phase 23 完成时失败场景集中在 MRTR `input_required`（10 个计分场景）；工具媒体内容、Resources/Prompts、completion、caching、JSON Schema 与 Header 已由 [Phase 24](phase-24-mcp-content-conformance.md) 补齐，MRTR 已由 [Phase 25](phase-25-mcp-mrtr-conformance.md) 补齐；tasks extension 场景不计分且仍未实现。
+Phase 23 完成时失败场景集中在 MRTR `input_required`（10 个计分场景）；工具媒体内容、Resources/Prompts、completion、caching、JSON Schema 与 Header 已由 [Phase 24](phase-24-mcp-content-conformance.md) 补齐，MRTR 已由 [Phase 25](phase-25-mcp-mrtr-conformance.md) 补齐，tasks extension 已由 [Phase 26](phase-26-mcp-tasks-extension.md) 补齐。
 
 门禁：2025-11-25 官方核心 9/9、2026-07-28 `server-stateless` 28/28；全量 Rust 247 passed / 1 ignored；真实 PostgreSQL 18.4 上 31 个 PG 集成测试文件（32 用例）通过；备份演练 21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致；Web 12 Vitest、扩展 65 Vitest + 7 host checks 通过；文档 180 文件 874 链接及品牌/IR/契约/镜像/OTel/供应链门禁通过。
 
@@ -46,4 +46,4 @@ Phase 23 完成时失败场景集中在 MRTR `input_required`（10 个计分场�
 
 - 不实现完整 2026 requirements 的全部 server fixture 与 MRTR 场景（MRTR 已由 Phase 25 完成）。
 - 不改变 2025 legacy 路径或真实 MCP 客户端行为。
-- 不实现 tasks extension（SEP-2663）的官方 conformance 要求；持久 tasks 仍由仓库双节点测试覆盖。
+- 不实现 tasks extension（SEP-2663）的官方 conformance 要求（已由 Phase 26 补齐）；持久 tasks 仍由仓库双节点测试覆盖。

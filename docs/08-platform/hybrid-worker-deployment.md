@@ -357,9 +357,10 @@ Worker 遇到 `human.approval` 时以 `waiting_approval` complete，控制面清
 
 ### 6.3 滚动升级的现实边界
 
-- 控制面是单节点 SQLite，没有多节点滚动升级；跨版本升级必须有停机窗口。
+- SQLite 单节点模式没有多节点滚动升级；跨版本升级必须有停机窗口。
+- `HPA_POSTGRES_RUNTIME=1` 的多控制面模式支持同版本滚动：控制面逐个替换、Worker 执行中强杀并重启后任务可重派。`pnpm test:worker-rolling` 使用两个共享 PostgreSQL 的控制面、两个 Worker 和故障切换代理验证 20 项检查，见 [Phase 27](../11-roadmap/phase-27-worker-rolling-upgrade.md)。
 - 多个 Worker 只有在已经与目标控制面同版本时，才能逐个重启实现“滚动”；先升级部分 Worker、再升级控制面会产生一段无法调度的窗口。
-- 升级 Registry/节点实现时，Job 快照中的 Workflow 仍由 Worker 本地 `hpa-core` 编译；版本不一致会表现为无 Job 或执行失败，而不是自动降级。
+- 跨版本混跑仍不支持：旧 Worker 不会领取新控制面 Job，反之亦然；升级 Registry/节点实现时，Job 快照中的 Workflow 仍由 Worker 本地 `hpa-core` 编译，版本不一致会表现为无 Job 或执行失败，而不是自动降级。
 
 ### 6.4 备份与恢复
 

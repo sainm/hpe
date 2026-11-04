@@ -176,6 +176,7 @@ const runtime = spawn(
     env: {
       ...process.env,
       HPA_MCP_CONFORMANCE: "1",
+      HPA_MCP_RATE_LIMIT: process.env.HPA_MCP_RATE_LIMIT || "100000",
     },
     stdio: ["ignore", "pipe", "pipe"],
   },
@@ -266,6 +267,7 @@ try {
           process.env.HPA_CONFORMANCE_SPEC_VERSION || "2025-11-25",
           "--output-dir",
           outputDir,
+          ...(process.env.HPA_CONFORMANCE_FORCE === "1" ? ["--force"] : []),
         ],
       );
       process.stdout.write(result.stdout);

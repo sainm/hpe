@@ -1,6 +1,6 @@
 # PostgreSQL 分布式运行时原语
 
-> 状态：**P13-02 IN_PROGRESS**。事务 outbox、幂等账本、Scheduler fencing lease、实际 Scheduler leader 选举/续租/故障接管、execution owner lease/fencing、Worker Job lease/re-drive 已在 PostgreSQL 18 实现并通过真实双进程测试；Workflow/Execution/Trigger 已可选 PG 路由，但 Worker Job API 仍使用 SQLite，完整多控制面滚动升级仍属于外部环境待验证项。
+> 状态：**P13-02 本地验收完成**（2026-11-04）。事务 outbox、幂等账本、Scheduler fencing lease、实际 Scheduler leader 选举/续租/故障接管、execution owner lease/fencing、Worker Job lease/re-drive 已在 PostgreSQL 18 实现并通过真实双进程测试；Workflow/Execution/Trigger 已可选 PG 路由，Worker Job API 也已切到 PostgreSQL；[Phase 27](../11-roadmap/phase-27-worker-rolling-upgrade.md) 的双控制面 + 双 Worker 同版本滚动/强杀演练 21/21 checks 通过。跨版本滚动与真实外部负载均衡/mTLS 仍不在本地验收范围。
 
 ## 1. 语义
 
@@ -157,7 +157,7 @@ ORDER BY updated_at;
 ## 10. 尚未完成
 
 - Scheduler 已接入 leader coordination；Workflow/Trigger/Execution、Worker Job、Enterprise、Agent、Skill、MCP、Connector 与 Plugin 元数据在 `HPA_POSTGRES_RUNTIME=1` 时均使用 PostgreSQL 权威。
-- 尚无真实两台控制面、两台 Worker 的滚动升级/强杀演练。
+- 双控制面 + 双 Worker 同版本滚动/强杀已由 [Phase 27](../11-roadmap/phase-27-worker-rolling-upgrade.md) 覆盖（21/21 checks）；跨版本滚动和真实外部负载均衡/VIP/mTLS 仍需生产环境验收。
 - Topic Event 已接 PostgreSQL outbox；Webhook、schedule 与 MCP task 仍使用各自记录，尚未成为一张统一事件账本。
 - 尚无 Redis Stream 适配器；PostgreSQL queue 是当前选定的“等价可靠队列”，容量上限和多区域复制需在 P13-06 压测。
 - 外部副作用仍需业务系统提供自己的幂等键；outbox 只保证平台记录和投递可恢复。

@@ -957,7 +957,9 @@ async fn tenant_isolation_and_admin_boundary() {
 
     let mcp_meta = json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        },
         "io.modelcontextprotocol/clientInfo": {"name": "tenant-test", "version": "1"}
     });
     let alpha_mcp: Value = server
@@ -1003,6 +1005,7 @@ async fn tenant_isolation_and_admin_boundary() {
         .bearer_auth(&alpha_pat)
         .header("MCP-Protocol-Version", "2026-07-28")
         .header("Mcp-Method", "tasks/get")
+        .header("Mcp-Name", &task_id)
         .json(&json!({
             "jsonrpc": "2.0",
             "id": 22,

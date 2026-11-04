@@ -1,6 +1,6 @@
 # Phase 24：MCP 2026-07-28 内容与 Header conformance
 
-> 状态：**本地验收完成**（2026-11-04）。补齐工具媒体内容、Resources/Prompts、completion、caching、JSON Schema 2020-12 与 Header 校验场景；MRTR 与 tasks extension 仍待后续阶段。
+> 状态：**本地验收完成**（2026-11-04）。补齐工具媒体内容、Resources/Prompts、completion、caching、JSON Schema 2020-12 与 Header 校验场景；MRTR 与 tasks extension 由后续 Phase 25/26 补齐。
 
 ## 1. 范围
 
@@ -29,12 +29,12 @@ pnpm test:mcp-conformance:2026-content
 
 `test:mcp-conformance:2026-content` 覆盖 18 个场景：tools 媒体内容与进度、resources 列表/读取/模板、prompts 四种读取、completion、caching、JSON Schema 2020-12、标准 Header 与自定义 Header 校验；全部 0 failed。
 
-Phase 24 完成时完整 2026 requirements 为 **142 passed / 39 failed**；剩余失败集中在 MRTR `input_required`（10 个计分场景）与 tasks extension（不计分）。MRTR 已由 [Phase 25](phase-25-mcp-mrtr-conformance.md) 补齐，计分 server 场景现为 37/37。
+Phase 24 完成时完整 2026 requirements 为 **142 passed / 39 failed**；剩余失败集中在 MRTR `input_required`（10 个计分场景）与 tasks extension（不计分）。MRTR 已由 [Phase 25](phase-25-mcp-mrtr-conformance.md) 补齐，tasks extension 已由 [Phase 26](phase-26-mcp-tasks-extension.md) 补齐；完整 requirements 现为 193 passed / 0 failed。
 
 门禁：2025-11-25 官方核心 9/9、2026-07-28 `server-stateless` 28/28、内容场景 18/18；全量 Rust 247 passed / 1 ignored；真实 PostgreSQL 上 31 个 PG 集成测试文件（32 用例）通过；备份演练 21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致；Web 12 Vitest、扩展 65 Vitest + 7 host checks；文档 181 文件 877 链接及品牌/IR/契约/镜像/OTel/供应链门禁通过。
 
 ## 4. 非目标
 
 - 不实现 MRTR `InputRequiredResult` fixture（已由 Phase 25 完成）。
-- 不实现 tasks extension（SEP-2663）官方场景。
+- 不实现 tasks extension（SEP-2663）官方场景（已由 Phase 26 完成）。
 - 不把 conformance fixture 暴露到常规 Runtime。

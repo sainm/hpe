@@ -1,6 +1,6 @@
 # MCP 持久状态与跨节点通知
 
-> 状态：**P13-03 IN_PROGRESS**。PostgreSQL session/subscription/notification/task 存储、跨节点 `tasks/get/update`、owner-node 命令消费者、双进程 SSE 与节点强停恢复、慢消费者背压和重放、Topic Event outbox、官方 2025-11-25 核心 conformance、2026-07-28 `server-stateless` 28/28 与计分 server requirements 37/37 已实现；tasks extension（SEP-2663，不计分）、webhook/schedule/task 统一事件账本和真实外部客户端仍未完成。
+> 状态：**P13-03 IN_PROGRESS**。PostgreSQL session/subscription/notification/task 存储、跨节点 `tasks/get/update`、owner-node 命令消费者、双进程 SSE 与节点强停恢复、慢消费者背压和重放、Topic Event outbox、官方 2025-11-25 核心 conformance、2026-07-28 完整 conformance（含 MRTR 与 tasks extension）已实现；webhook/schedule/task 统一事件账本、`notifications/tasks` 推送和真实外部客户端仍未完成。
 
 ## 1. 数据边界
 
@@ -80,11 +80,11 @@ HPA_POSTGRES_TEST_URL='postgresql://localhost:5432/hpa_p13_test' \
 - 两个独立 `hpa serve` 进程共享 PostgreSQL：node-b 订阅 `tasksChanged`，node-a 创建审批等待任务；强停 node-a 后由 node-b 提交取消，node-a 使用相同 `HPA_NODE_ID` 重启后完成取消并触发 node-b SSE。
 - SSE 积压从 25 条超过测试上限 20 时连接结束；以倒数第 3 条为 `Last-Event-ID` 重连后，最后两条持久通知按 sequence 重放。
 - backlog 统计受 tenant/token 订阅边界和数量上限保护；其他租户不能探测订阅积压。
-- `pnpm test:mcp-conformance` 运行官方 `@modelcontextprotocol/conformance@0.2.0-alpha.12` 2025-11-25 核心 server 场景；`pnpm test:mcp-conformance:2026` 运行 2026-07-28 `server-stateless` 28/28 PASS；`test:mcp-conformance:2026-mrtr` 覆盖 14 个 MRTR 场景、40 项检查全部通过，计分 server requirements 37/37。
+- `pnpm test:mcp-conformance` 运行官方 `@modelcontextprotocol/conformance@0.2.0-alpha.12` 2025-11-25 核心 server 场景；`pnpm test:mcp-conformance:2026` 运行 2026-07-28 `server-stateless` 28/28 PASS；`test:mcp-conformance:2026-mrtr` 覆盖 14 个 MRTR 场景、40 项检查全部通过；`test:mcp-conformance:2026-tasks` 覆盖 10 个 tasks extension 场景，完整 requirements 193 passed / 0 failed。
 
 ## 5. 尚未完成
 
 - 当前跨节点通知是 PostgreSQL 持久 sequence + 有界轮询，不是 `LISTEN/NOTIFY` 或 Redis Stream 低延迟推送；正确性不依赖内存 channel。
 - Topic Event 已使用 PostgreSQL outbox + shared trigger fire 去重；webhook、schedule 和 task 仍使用各自持久记录，尚未统一到一张幂等事件账本。
-- tasks extension（SEP-2663）不计分且未实现；2026 计分 server 场景已全部通过，但任务信封、状态通知与任务 fixture 不能宣称官方扩展 conformance。
+- tasks extension 的 conformance fixture 使用进程内任务状态；生产持久任务仍由 PostgreSQL task 投影与 execution handle 承担，`notifications/tasks` 推送未实现（官方场景当前跳过）。
 - 事件总线统一账本和至少两个真实外部客户端尚未验证。

@@ -1,6 +1,6 @@
 # Phase 25：MCP 2026-07-28 MRTR conformance
 
-> 状态：**本地验收完成**（2026-11-04）。SEP-2322 `InputRequiredResult` 的 14 个官方场景全部通过，2026-07-28 计分 server requirements 达到 37/37；tasks extension（SEP-2663）仍未实现且不计分。
+> 状态：**本地验收完成**（2026-11-04）。SEP-2322 `InputRequiredResult` 的 14 个官方场景全部通过，2026-07-28 计分 server requirements 达到 37/37；Phase 25 完成时 tasks extension（SEP-2663）尚未实现，后由 [Phase 26](phase-26-mcp-tasks-extension.md) 补齐。
 
 ## 1. 范围
 
@@ -30,7 +30,7 @@ HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance
 ```
 
 - `test:mcp-conformance:2026-mrtr`：14 个场景、40 项检查全部 SUCCESS，0 failed、0 warnings，包含 wire schema 校验。
-- 完整 2026-07-28 requirements：37/37 计分 server 场景通过；总计 **162 passed / 29 failed**，29 个失败全部位于不计分的 tasks extension（9 个场景失败，`tasks-status-notifications` 通过），命令返回 `ok: true`。
+- 完整 2026-07-28 requirements：37/37 计分 server 场景通过；Phase 25 完成时总计 **162 passed / 29 failed**，29 个失败全部位于当时未实现的 tasks extension；Phase 26 补齐后为 **193 passed / 0 failed**。
 - 2025-11-25 核心矩阵重跑 9/9；`server-stateless` 28/28；内容/Header 场景 18/18。
 - 全量 Rust：250 passed / 0 failed / 1 ignored；Clippy `-D warnings` 与 fmt 通过。
 - 真实 PostgreSQL 18.4：31 个测试文件（32 用例）全部通过；备份演练恢复到临时库后 21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致。
@@ -38,6 +38,6 @@ HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance
 
 ## 4. 非目标
 
-- 不实现 tasks extension（SEP-2663）的 fixture、任务信封、状态通知与取消语义；官方将其列为不计分扩展，当前 9 个场景失败保留在报告中，不用跳过或隐藏失败来换取表面全绿。
+- 不实现 tasks extension（SEP-2663）的 fixture、任务信封、状态通知与取消语义（已由 Phase 26 完成）；官方将其列为不计分扩展，其余场景未通过时不跳过或隐藏失败。
 - 不把 conformance fixture 暴露到常规 Runtime，也不改变生产 MRTR 审批的数据库状态机。
 - 不宣称真实外部 AI 客户端已完成模型工具调用；该部分仍为 `BLOCKED_EXTERNAL`。

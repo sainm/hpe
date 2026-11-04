@@ -70,6 +70,7 @@ pnpm test:mcp-conformance
 pnpm test:mcp-conformance:2026
 pnpm test:mcp-conformance:2026-content
 pnpm test:mcp-conformance:2026-mrtr
+pnpm test:mcp-conformance:2026-tasks
 ```
 
 脚本建立临时 Runtime、PAT，并通过只监听 loopback 的认证代理运行官方 server 场景。当前 2025-11-25 核心矩阵 9/9 场景 PASS：
@@ -90,12 +91,14 @@ pnpm test:mcp-conformance:2026-mrtr
 
 MRTR fixture 覆盖 8 个工具与 1 个 prompt：elicitation、sampling、`roots/list`、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get`；`test:mcp-conformance:2026-mrtr` 的 14 个场景、40 项检查全部 SUCCESS（0 failed、0 warnings）。
 
-完整 2026 requirements 可通过 `HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance` 运行；工具媒体内容、Resources/Prompts、completion、caching、JSON Schema、Header 与 MRTR 已由专项脚本覆盖，计分 server 场景 37/37。总报告为 162 passed / 29 failed，失败全部位于不计分的 tasks extension（SEP-2663）。
+tasks extension fixture 覆盖 `greet`、`slow_compute`、`failing_job`、`protocol_error_job`、`confirm_delete`、`multi_input` 与 `test_tool_with_task`；`test:mcp-conformance:2026-tasks` 的 10 个场景 0 failed，9 个有检查场景合计 44/44（`tasks-status-notifications` 被套件标记为可选跳过）。
+
+完整 2026 requirements 可通过 `HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance` 运行；工具媒体内容、Resources/Prompts、completion、caching、JSON Schema、Header、MRTR 与 tasks extension 已由专项脚本覆盖，完整报告 **193 passed / 0 failed**。
 
 ## 7. 已知边界
 
 - OAuth AS/PKCE/DCR 已由 Phase 10 提供；设置 `HPA_POSTGRES_MCP=1` 后 session/subscription/task 持久化，notification 支持跨节点轮询、慢消费者断开和 sequence 重放。未启用时仍为单进程内存路径。
 - legacy 会话在 PostgreSQL 模式可跨重启保留；未启用 PostgreSQL 时只存在内存，重启后需要重新 initialize。
-- 2026-07-28 官方计分 server requirements 37/37 已通过（含 MRTR 14 场景）；tasks extension 不计分且未实现，见 [Phase 25](../11-roadmap/phase-25-mcp-mrtr-conformance.md)。
+- 2026-07-28 官方 conformance 完整报告 193 passed / 0 failed，包含 37 个计分 server 场景与 10 个 tasks extension 场景；`notifications/tasks` 推送仍为可选且未实现，见 [Phase 26](../11-roadmap/phase-26-mcp-tasks-extension.md)。
 - 管理 API 依赖 loopback；生产需增加本地登录/CSRF 防护。
 - 外部客户端真实模型会话中的工具调用尚未在本机自动验证。

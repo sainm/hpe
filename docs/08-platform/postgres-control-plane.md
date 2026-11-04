@@ -207,5 +207,5 @@ Phase 13 基线不提供自动 down migration。企业数据删除不可逆，�
 
 - Workflow/Execution/Event/Artifact/Trigger Repository、Worker Job、企业控制面、浏览器会话、OAuth AS、Agent 版本/会话/事件/审批/工具调用、Skill 包/版本/运行、MCP PAT/审批/审计/服务器、Connector 定义/连接/审计与 Plugin/Marketplace 元数据已有显式 PostgreSQL 路由并验证跨节点读取；剩余是真实企业 IdP、HA/read replica 与对象存储等外部验收。
 - SQLite→PostgreSQL 数据导入已有幂等实现；PostgreSQL→SQLite 控制缓存由周期任务重建；本机主备 `pnpm test:ha` 已完成，但跨主机网络/VIP、自动故障检测与在线 PITR 仍未验收；插件包文件跨节点同步仍未实现。
-- 对象存储、只读副本、在线 PITR 与真实 HA 演练仍属 P13-02/P13-06；并发迁移锁与连接重试已完成（见 3.1），同版本滚动重启由 `pnpm test:rolling` 覆盖，跨版本升级仍为人工项。
+- 对象存储、只读副本、在线 PITR 与真实 HA 演练仍属 P13-02/P13-06；并发迁移锁与连接重试已完成（见 3.1），同版本滚动重启由 `pnpm test:rolling` 与 `pnpm test:worker-rolling` 覆盖，跨版本升级仍为人工项。
 - 本文件中的 PASS 只适用于 schema/RLS/migration 基线，不适用于完整 P13-01 或 Phase 13。

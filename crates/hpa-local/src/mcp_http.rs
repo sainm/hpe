@@ -1258,11 +1258,12 @@ async fn handle_mcp(
             }
             Ok(None) => {}
             Err(error) => {
-                return json_error(
+                return json_error_data(
                     StatusCode::BAD_REQUEST,
                     Some(request_id),
                     error.code,
                     error.message,
+                    error.data,
                 );
             }
         }
@@ -1606,10 +1607,13 @@ async fn persistent_task_result(
     method: &str,
     request: &Value,
 ) -> Result<Option<Value>, RpcError> {
+    let params = request.get("params").unwrap_or(&Value::Null);
+    if era == Era::Modern {
+        crate::mcp::require_tasks_extension(params)?;
+    }
     let Some(store) = state.persistent_store(auth) else {
         return Ok(None);
     };
-    let params = request.get("params").unwrap_or(&Value::Null);
     let task_id = params
         .get("taskId")
         .and_then(Value::as_str)
@@ -1707,6 +1711,10 @@ fn validate_modern_headers(headers: &HeaderMap, request: &Value, method: &str) -
         "resources/read" => request
             .get("params")
             .and_then(|params| params.get("uri"))
+            .and_then(Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => request
+            .get("params")
+            .and_then(|params| params.get("taskId"))
             .and_then(Value::as_str),
         _ => None,
     };

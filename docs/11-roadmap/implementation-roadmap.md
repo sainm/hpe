@@ -288,11 +288,19 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 ## 8r. Phase 24：MCP 2026-07-28 内容与 Header conformance
 
-> 状态：**本地验收完成**（2026-11-04）。工具图像/音频/嵌入资源/混合内容/进度、Resources/Prompts、completion、caching、JSON Schema 2020-12 与 Header（含 base64 Mcp-Param）场景通过；`test:mcp-conformance:2026-content` 18 个场景 0 failed。Phase 24 完成时完整 requirements 剩余 MRTR 与 tasks extension，MRTR 已由 Phase 25 补齐。完整契约见 [Phase 24 MCP content](phase-24-mcp-content-conformance.md)。
+> 状态：**本地验收完成**（2026-11-04）。工具图像/音频/嵌入资源/混合内容/进度、Resources/Prompts、completion、caching、JSON Schema 2020-12 与 Header（含 base64 Mcp-Param）场景通过；`test:mcp-conformance:2026-content` 18 个场景 0 failed。Phase 24 完成时完整 requirements 剩余 MRTR 与 tasks extension，MRTR 由 Phase 25 补齐、tasks extension 由 Phase 26 补齐。完整契约见 [Phase 24 MCP content](phase-24-mcp-content-conformance.md)。
 
 ## 8s. Phase 25：MCP 2026-07-28 MRTR conformance
 
-> 状态：**本地验收完成**（2026-11-04）。SEP-2322 `InputRequiredResult` 的 elicitation/sampling/roots、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get` 场景全部通过；`test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查 0 failed。2026-07-28 计分 server requirements 达到 37/37（总计 162 passed / 29 failed，失败全部在不计分的 tasks extension）。完整契约见 [Phase 25 MRTR](phase-25-mcp-mrtr-conformance.md)。
+> 状态：**本地验收完成**（2026-11-04）。SEP-2322 `InputRequiredResult` 的 elicitation/sampling/roots、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get` 场景全部通过；`test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查 0 failed。2026-07-28 计分 server requirements 达到 37/37（Phase 25 完成时总计 162 passed / 29 failed，失败全部在不计分的 tasks extension，后由 Phase 26 补齐）。完整契约见 [Phase 25 MRTR](phase-25-mcp-mrtr-conformance.md)。
+
+## 8t. Phase 26：MCP 2026-07-28 tasks extension conformance
+
+> 状态：**本地验收完成**（2026-11-04）。SEP-2663 tasks extension 的 capability 协商、扁平 `CreateTaskResult`、`tasks/get` DetailedTask、`tasks/update`/`tasks/cancel` 空 ack、部分输入满足、MRTR 组合、`-32021` gating、`tasks/result|list` `-32601` 与 tasks 方法 `Mcp-Name` 校验全部通过；`test:mcp-conformance:2026-tasks` 覆盖 10 个场景。完整 2026 requirements 达到 **193 passed / 0 failed**。完整契约见 [Phase 26 tasks](phase-26-mcp-tasks-extension.md)。
+
+## 8u. Phase 27：双控制面 + 双 Worker 滚动升级
+
+> 状态：**本地验收完成**（2026-11-04）。两个控制面共享 PostgreSQL、两个 Worker 经故障切换代理消费 Job；控制面逐个替换、Worker 分别执行中强杀并重启后，6 个 Job 全部成功，重派 `attempts >= 2` 且 `executionId` 不变。`test:worker-rolling` 21/21 checks，`test:multi-node` 10/10、`test:rolling` 17/17 回归通过。完整契约见 [Phase 27 滚动升级](phase-27-worker-rolling-upgrade.md)。
 
 ## 9. 依赖/顺序
 

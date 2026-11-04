@@ -112,7 +112,9 @@ fn copy_tree(source: &Path, target: &Path) {
 fn modern_meta() -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": MODERN,
-        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        },
         "io.modelcontextprotocol/clientInfo": {"name": "multi-node-test", "version": "1"}
     })
 }
@@ -129,12 +131,18 @@ async fn mcp_post(
         .bearer_auth(token)
         .header("MCP-Protocol-Version", MODERN)
         .header("Mcp-Method", method);
-    if method == "tools/call"
-        && let Some(name) = payload
+    let name_source = match method {
+        "tools/call" => payload
             .get("params")
             .and_then(|params| params.get("name"))
-            .and_then(Value::as_str)
-    {
+            .and_then(Value::as_str),
+        "tasks/get" | "tasks/update" | "tasks/cancel" => payload
+            .get("params")
+            .and_then(|params| params.get("taskId"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    if let Some(name) = name_source {
         builder = builder.header("Mcp-Name", name);
     }
     builder.json(&payload).send().await.expect("MCP request")
