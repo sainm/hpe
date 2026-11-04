@@ -142,6 +142,7 @@
 - [Phase 25 MCP 2026-07-28 MRTR conformance](11-roadmap/phase-25-mcp-mrtr-conformance.md)
 - [Phase 26 MCP 2026-07-28 tasks extension conformance](11-roadmap/phase-26-mcp-tasks-extension.md)
 - [Phase 27 双控制面 + 双 Worker 滚动升级](11-roadmap/phase-27-worker-rolling-upgrade.md)
+- [Phase 28 MCP notifications/tasks 推送](11-roadmap/phase-28-task-notifications.md)
 - [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI

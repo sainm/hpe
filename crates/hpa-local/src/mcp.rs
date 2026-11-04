@@ -483,7 +483,7 @@ async fn dispatch(
         }
         "tools/call" => {
             if conformance_mode()
-                && let Some(result) = conformance_tool_call(params, era)?
+                && let Some(result) = conformance_tool_call(params, era, &auth.tenant_id)?
             {
                 return Ok(result);
             }
@@ -1020,7 +1020,11 @@ fn task_conformance_tool_specs() -> Vec<Value> {
     ]
 }
 
-fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcError> {
+fn conformance_tool_call(
+    params: &Value,
+    era: Era,
+    tenant_id: &str,
+) -> Result<Option<Value>, RpcError> {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return Ok(None);
     };
@@ -1185,7 +1189,9 @@ fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcE
         name if name.starts_with("test_input_required_result_") => {
             Ok(Some(mrtr_tool_call(name, params, era)?))
         }
-        name if is_task_fixture(name) => Ok(Some(task_fixture_tool_call(name, params, era)?)),
+        name if is_task_fixture(name) => {
+            Ok(Some(task_fixture_tool_call(name, params, era, tenant_id)?))
+        }
         _ => Ok(None),
     }
 }
@@ -1651,6 +1657,7 @@ fn mrtr_prompt(params: &Value, era: Era) -> Result<Value, RpcError> {
 
 #[derive(Clone)]
 struct ConformanceTask {
+    tenant_id: String,
     id: String,
     status: String,
     created_at: String,
@@ -1670,6 +1677,7 @@ fn conformance_task_store() -> &'static Mutex<HashMap<String, ConformanceTask>> 
 }
 
 fn new_conformance_task(
+    tenant_id: &str,
     status: &str,
     input_requests: BTreeMap<String, Value>,
     completion_text: Option<String>,
@@ -1677,6 +1685,7 @@ fn new_conformance_task(
 ) -> ConformanceTask {
     let now = now_rfc3339();
     ConformanceTask {
+        tenant_id: tenant_id.to_string(),
         id: format!("task_{}", Uuid::now_v7()),
         status: status.to_string(),
         created_at: now.clone(),
@@ -1732,10 +1741,33 @@ fn conformance_task_detail(task: &ConformanceTask) -> Value {
     detail
 }
 
+fn task_notification_payload(task: &ConformanceTask) -> Value {
+    let mut payload = json!({
+        "taskId": task.id,
+        "status": task.status,
+        "updatedAt": task.updated_at,
+    });
+    if let Some(result) = &task.result {
+        payload["result"] = result.clone();
+    }
+    if let Some(error) = &task.error {
+        payload["error"] = error.clone();
+    }
+    payload
+}
+
 fn store_conformance_task(task: ConformanceTask) -> Value {
+    let notification = task_notification_payload(&task);
+    let tenant_id = task.tenant_id.clone();
     let create = conformance_task_create_result(&task);
-    if let Ok(mut tasks) = conformance_task_store().lock() {
+    let stored = if let Ok(mut tasks) = conformance_task_store().lock() {
         tasks.insert(task.id.clone(), task);
+        true
+    } else {
+        false
+    };
+    if stored {
+        crate::mcp_http::notify_task_changed(&tenant_id, notification);
     }
     create
 }
@@ -1773,6 +1805,10 @@ fn spawn_conformance_task_completion(
         task.result = result;
         task.error = error;
         task.updated_at = now_rfc3339();
+        let notification = task_notification_payload(task);
+        let tenant_id = task.tenant_id.clone();
+        drop(tasks);
+        crate::mcp_http::notify_task_changed(&tenant_id, notification);
     });
 }
 
@@ -1805,7 +1841,12 @@ pub(crate) fn require_tasks_extension(params: &Value) -> Result<(), RpcError> {
     }
 }
 
-fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value, RpcError> {
+fn task_fixture_tool_call(
+    name: &str,
+    params: &Value,
+    era: Era,
+    tenant_id: &str,
+) -> Result<Value, RpcError> {
     let arguments = params
         .get("arguments")
         .cloned()
@@ -1844,7 +1885,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
                     }),
                 ));
             }
-            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task = new_conformance_task(tenant_id, "working", BTreeMap::new(), None, false);
             let task_id = task.id.clone();
             let create = store_conformance_task(task);
             let result = finish(
@@ -1861,7 +1902,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
             if !tasks_extension_declared(params) {
                 return Err(tasks_extension_error());
             }
-            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task = new_conformance_task(tenant_id, "working", BTreeMap::new(), None, false);
             let task_id = task.id.clone();
             let create = store_conformance_task(task);
             let result = finish(
@@ -1878,7 +1919,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
             if !tasks_extension_declared(params) {
                 return Err(tasks_extension_error());
             }
-            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task = new_conformance_task(tenant_id, "working", BTreeMap::new(), None, false);
             let task_id = task.id.clone();
             let create = store_conformance_task(task);
             spawn_conformance_task_completion(
@@ -1906,6 +1947,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
                 elicitation_request_value(&format!("Delete {filename}?"), "confirm", "boolean"),
             );
             let task = new_conformance_task(
+                tenant_id,
                 "input_required",
                 requests,
                 Some(format!("Deleted {filename}")),
@@ -1927,6 +1969,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
                 elicitation_request_value("Second input?", "name", "string"),
             );
             let task = new_conformance_task(
+                tenant_id,
                 "input_required",
                 requests,
                 Some("Both inputs received".to_string()),
@@ -1962,7 +2005,7 @@ fn task_fixture_tool_call(name: &str, params: &Value, era: Era) -> Result<Value,
                     None,
                 ));
             };
-            let task = new_conformance_task("working", BTreeMap::new(), None, false);
+            let task = new_conformance_task(tenant_id, "working", BTreeMap::new(), None, false);
             let task_id = task.id.clone();
             let create = store_conformance_task(task);
             let result = finish(
@@ -1991,10 +2034,13 @@ fn update_conformance_task(task_id: &str, params: &Value, era: Era) -> Result<bo
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    let mut changed = false;
     if !answered.is_empty() {
+        let before = task.input_requests.len();
         for key in answered.keys() {
             task.input_requests.remove(key);
         }
+        changed = task.input_requests.len() != before;
         task.updated_at = now_rfc3339();
         if task.input_requests.is_empty() && task.status == "input_required" {
             task.status = "completed".to_string();
@@ -2008,10 +2054,16 @@ fn update_conformance_task(task_id: &str, params: &Value, era: Era) -> Result<bo
                 ));
             }
             task.updated_at = now_rfc3339();
+            changed = true;
         }
     }
+    let notification = changed.then(|| task_notification_payload(&task));
+    let tenant_id = task.tenant_id.clone();
     if let Ok(mut tasks) = conformance_task_store().lock() {
         tasks.insert(task_id.to_string(), task);
+    }
+    if let Some(notification) = notification {
+        crate::mcp_http::notify_task_changed(&tenant_id, notification);
     }
     Ok(true)
 }
@@ -2023,10 +2075,15 @@ fn cancel_conformance_task(task_id: &str) -> bool {
     let Some(task) = tasks.get_mut(task_id) else {
         return false;
     };
-    if matches!(task.status.as_str(), "working" | "input_required") {
-        task.status = "cancelled".to_string();
-        task.updated_at = now_rfc3339();
+    if !matches!(task.status.as_str(), "working" | "input_required") {
+        return true;
     }
+    task.status = "cancelled".to_string();
+    task.updated_at = now_rfc3339();
+    let notification = task_notification_payload(task);
+    let tenant_id = task.tenant_id.clone();
+    drop(tasks);
+    crate::mcp_http::notify_task_changed(&tenant_id, notification);
     true
 }
 
@@ -3922,8 +3979,9 @@ mod tests {
 
     #[tokio::test]
     async fn tasks_extension_gates_and_tracks_fixture_state() {
-        let missing = task_fixture_tool_call("failing_job", &tasks_params(false), Era::Modern)
-            .expect_err("failing_job is task-supporting and requires the extension");
+        let missing =
+            task_fixture_tool_call("failing_job", &tasks_params(false), Era::Modern, "local")
+                .expect_err("failing_job is task-supporting and requires the extension");
         assert_eq!(missing.code, -32021);
         assert_eq!(
             missing.data.expect("required capability data")["requiredCapabilities"]["extensions"]
@@ -3931,8 +3989,9 @@ mod tests {
             json!({})
         );
 
-        let sync = task_fixture_tool_call("slow_compute", &tasks_params(false), Era::Modern)
-            .expect("sync fallback");
+        let sync =
+            task_fixture_tool_call("slow_compute", &tasks_params(false), Era::Modern, "local")
+                .expect("sync fallback");
         assert_eq!(sync["resultType"], "complete");
         assert!(sync.get("taskId").is_none());
         assert_eq!(sync["content"][0]["text"], "Computed compute");
@@ -3941,6 +4000,7 @@ mod tests {
             "greet",
             &json!({"arguments": {"name": "World"}}),
             Era::Modern,
+            "local",
         )
         .expect("greet");
         assert_eq!(greet["content"][0]["text"], "Hello, World!");
@@ -3956,6 +4016,7 @@ mod tests {
                 "arguments": {"seconds": 2, "label": "unit"},
             }),
             Era::Modern,
+            "local",
         )
         .expect("create task");
         assert_eq!(create["resultType"], "task");
@@ -3984,6 +4045,7 @@ mod tests {
                 "arguments": {},
             }),
             Era::Modern,
+            "local",
         )
         .expect("multi input");
         let multi_id = multi["taskId"].as_str().expect("multi id").to_string();
@@ -4041,8 +4103,8 @@ mod tests {
             },
             "arguments": {},
         });
-        let first =
-            task_fixture_tool_call("test_tool_with_task", &params, Era::Modern).expect("round 1");
+        let first = task_fixture_tool_call("test_tool_with_task", &params, Era::Modern, "local")
+            .expect("round 1");
         assert_eq!(first["resultType"], "input_required");
         assert!(first.get("taskId").is_none());
         assert!(first["inputRequests"].get("user_name").is_some());
@@ -4062,6 +4124,7 @@ mod tests {
                 }
             }),
             Era::Modern,
+            "local",
         )
         .expect("round 2");
         assert_eq!(second["resultType"], "task");

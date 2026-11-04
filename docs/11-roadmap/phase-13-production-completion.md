@@ -56,7 +56,7 @@ Phase 13 必须保持以下不变量：
 
 ### P13-03 分布式 MCP 与事件总线
 
-> 进度：**IN_PROGRESS**。PostgreSQL session/subscription/notification/task 状态、tenant/token/TTL 隔离、sequence 恢复和 task 终态约束已通过集成测试；`HPA_POSTGRES_MCP=1` 时 legacy session、subscription、目录通知、`tasks/get/update` 与 owner-node 命令消费者已切换。双进程测试验证 node-a 强停后由 node-b 提交取消、node-a 重启恢复并触发跨节点 task SSE。持久通知 backlog 使用租户内有界统计，超过 `HPA_MCP_NOTIFICATION_MAX_LAG` 主动断开并通过 `Last-Event-ID` 在保留窗口内重放。Topic Event 已使用 PostgreSQL outbox 异步消费和共享 trigger fire 去重；webhook/schedule/MCP task 尚未统一到同一事件账本。官方 conformance 2025-11-25 核心矩阵 9/9、2026-07-28 完整 requirements 193 passed / 0 failed（含 tasks extension）通过；`notifications/tasks` 推送与真实客户端仍未完成。契约见 [MCP 持久状态](../06-mcp/persistent-state.md)。
+> 进度：**IN_PROGRESS**。PostgreSQL session/subscription/notification/task 状态、tenant/token/TTL 隔离、sequence 恢复和 task 终态约束已通过集成测试；`HPA_POSTGRES_MCP=1` 时 legacy session、subscription、目录通知、`tasks/get/update` 与 owner-node 命令消费者已切换。双进程测试验证 node-a 强停后由 node-b 提交取消、node-a 重启恢复并触发跨节点 task SSE。持久通知 backlog 使用租户内有界统计，超过 `HPA_MCP_NOTIFICATION_MAX_LAG` 主动断开并通过 `Last-Event-ID` 在保留窗口内重放。[Phase 28](phase-28-task-notifications.md) 已补齐 `subscriptions/listen` 的 `notifications/tasks` 推送（内存 fixture 与 PostgreSQL 持久任务统一方法）。Topic Event 已使用 PostgreSQL outbox 异步消费和共享 trigger fire 去重；webhook/schedule/MCP task 尚未统一到同一事件账本。官方 conformance 2025-11-25 核心矩阵 9/9、2026-07-28 完整 requirements 193 passed / 0 failed（含 tasks extension）通过；真实客户端仍未完成。契约见 [MCP 持久状态](../06-mcp/persistent-state.md)。
 
 交付：
 
@@ -225,7 +225,7 @@ Phase 13 必须保持以下不变量：
 - PostgreSQL Topic Event Bus：`HPA_POSTGRES_EVENT_BUS=1` 下 API 只返回 202 queued，outbox 由 consumer 领取后标记 processed；同 payload duplicate、不同 payload conflict，PG trigger fire/execution 最终都只有 1 条。
 - Event Bus 双控制面：发布节点设置 consumer=0，消费节点使用独立空 data_dir；消费节点从 PG workflow_versions 读取冻结 IR，执行 outbox 并产生唯一 PG trigger fire/execution。
 - Event atomicity：execution、start event 与 trigger fire 在同一 PG 事务中提交；重复 trigger fire 的唯一约束会使第二次 execution 一并回滚，最终 execution/fire 各 1，消除“execution 已写入但 fire 未记录”的崩溃窗口。
-- MCP 跨节点任务：`tasks/get/update` 通过 PostgreSQL；node-b 在 node-a 停机期间提交取消命令，node-a 使用相同 node ID 重启后消费命令、更新 execution 与 task，node-b SSE 收到 `notifications/tasks/status_changed`。
+- MCP 跨节点任务：`tasks/get/update` 通过 PostgreSQL；node-b 在 node-a 停机期间提交取消命令，node-a 使用相同 node ID 重启后消费命令、更新 execution 与 task，node-b SSE 收到 `notifications/tasks`。
 - MCP 慢消费者：真实 PostgreSQL/SSE 测试制造 25 条租户通知并设置 backlog 上限 20，超限连接主动结束；以倒数第 3 条为 `Last-Event-ID` 重连后，最后两条通知按 sequence 重放。租户内统计使用上限子查询，不扫描并物化完整积压。
 - MCP 官方 conformance：`@modelcontextprotocol/conformance@0.2.0-alpha.12` 从 npmmirror 锁定安装；临时 PAT 认证代理下执行 2025-11-25 核心场景 9/9 PASS，2026-07-28 完整 requirements 193 passed / 0 failed（37 计分场景、14 个 MRTR 场景与 10 个 tasks extension 场景），命令见 `pnpm test:mcp-conformance:2026`、`test:mcp-conformance:2026-content`、`test:mcp-conformance:2026-mrtr`、`test:mcp-conformance:2026-tasks`。测试工具仅在 `HPA_MCP_CONFORMANCE=1` 的临时 Runtime 出现，常规 `tools/list` 回归断言 `test_*` 不存在。
 - Event 部分 fan-out：同一 topic 两个订阅者中预投递一个后，携带相同 Event ID 重试只为缺失订阅者创建执行；所有订阅者投递完成后再重试返回 duplicate，避免部分成功阻塞其余订阅者。

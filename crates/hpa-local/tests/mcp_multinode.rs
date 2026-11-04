@@ -411,7 +411,7 @@ async fn durable_task_cancel_and_sse_cross_two_mcp_nodes() {
             .expect("task SSE")
             .expect("task SSE chunk");
         observed.push_str(&String::from_utf8_lossy(&chunk));
-        if observed.contains("notifications/tasks/status_changed")
+        if observed.contains("notifications/tasks")
             && observed.contains(&task_id)
             && observed.contains("\"status\":\"cancelled\"")
         {
@@ -419,7 +419,7 @@ async fn durable_task_cancel_and_sse_cross_two_mcp_nodes() {
         }
     }
     assert!(
-        observed.contains("notifications/tasks/status_changed")
+        observed.contains("notifications/tasks")
             && observed.contains(&task_id)
             && observed.contains("\"status\":\"cancelled\""),
         "missing cross-node task notification: {observed}"

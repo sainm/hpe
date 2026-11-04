@@ -99,6 +99,6 @@ tasks extension fixture 覆盖 `greet`、`slow_compute`、`failing_job`、`proto
 
 - OAuth AS/PKCE/DCR 已由 Phase 10 提供；设置 `HPA_POSTGRES_MCP=1` 后 session/subscription/task 持久化，notification 支持跨节点轮询、慢消费者断开和 sequence 重放。未启用时仍为单进程内存路径。
 - legacy 会话在 PostgreSQL 模式可跨重启保留；未启用 PostgreSQL 时只存在内存，重启后需要重新 initialize。
-- 2026-07-28 官方 conformance 完整报告 193 passed / 0 failed，包含 37 个计分 server 场景与 10 个 tasks extension 场景；`notifications/tasks` 推送仍为可选且未实现，见 [Phase 26](../11-roadmap/phase-26-mcp-tasks-extension.md)。
+- 2026-07-28 官方 conformance 完整报告 193 passed / 0 failed，包含 37 个计分 server 场景与 10 个 tasks extension 场景；`subscriptions/listen` 的 `notifications/tasks` 已支持内存 fixture 与 PostgreSQL 持久任务，见 [Phase 28](../11-roadmap/phase-28-task-notifications.md)。
 - 管理 API 依赖 loopback；生产需增加本地登录/CSRF 防护。
 - 外部客户端真实模型会话中的工具调用尚未在本机自动验证。

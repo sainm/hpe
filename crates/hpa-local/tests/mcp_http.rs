@@ -509,3 +509,124 @@ async fn http_gateway_supports_modern_legacy_and_auth() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+#[tokio::test]
+async fn conformance_task_status_notifications_are_streamed() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind")
+        .local_addr()
+        .expect("addr")
+        .port();
+    let data_dir = std::env::temp_dir().join(format!("hpa-mcp-notify-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+    let token_json: Value = serde_json::from_str(&run_cli(
+        &data_dir,
+        &["mcp", "token", "create", "task-notify"],
+    ))
+    .expect("token json");
+    let token = token_json["token"].as_str().expect("token").to_string();
+
+    let mut server = Command::new(binary());
+    server
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .args(["serve", "--port", &port.to_string()])
+        .env("HPA_MCP_CONFORMANCE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child: Child = server.spawn().expect("spawn server");
+    wait_for_health(port).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .expect("http client");
+    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {
+            "extensions": {"io.modelcontextprotocol/tasks": {}}
+        },
+        "io.modelcontextprotocol/clientInfo": {"name": "task-notify", "version": "1"},
+    });
+
+    let mut subscription = client
+        .post(&endpoint)
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "subscriptions/listen")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "subscriptions/listen",
+            "params": {
+                "_meta": meta.clone(),
+                "subscriptions": {"tasksChanged": true}
+            }
+        }))
+        .send()
+        .await
+        .expect("subscribe");
+    assert_eq!(subscription.status(), 200);
+    let initial = subscription
+        .chunk()
+        .await
+        .expect("subscription stream")
+        .expect("subscription initial event");
+    assert!(String::from_utf8_lossy(&initial).contains("subscriptionId"));
+
+    let call = client
+        .post(&endpoint)
+        .bearer_auth(&token)
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "slow_compute")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "_meta": meta,
+                "name": "slow_compute",
+                "arguments": {"seconds": 1, "label": "notify"}
+            }
+        }))
+        .send()
+        .await
+        .expect("task call");
+    assert_eq!(call.status(), 200);
+    let call_body: Value = call.json().await.expect("task call json");
+    let task_id = call_body["result"]["taskId"]
+        .as_str()
+        .expect("task id")
+        .to_string();
+
+    let mut observed = String::new();
+    for _ in 0..40 {
+        let chunk = tokio::time::timeout(Duration::from_secs(3), subscription.chunk())
+            .await
+            .expect("task notification timeout")
+            .expect("task notification")
+            .expect("task notification chunk");
+        observed.push_str(&String::from_utf8_lossy(&chunk));
+        if observed.contains("notifications/tasks")
+            && observed.contains(&task_id)
+            && observed.contains("\"status\":\"working\"")
+            && observed.contains("\"status\":\"completed\"")
+        {
+            break;
+        }
+    }
+    assert!(
+        observed.contains("notifications/tasks")
+            && observed.contains(&task_id)
+            && observed.contains("\"status\":\"working\"")
+            && observed.contains("\"status\":\"completed\"")
+            && observed.contains("io.modelcontextprotocol/subscriptionId"),
+        "missing task status notifications: {observed}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&data_dir);
+}

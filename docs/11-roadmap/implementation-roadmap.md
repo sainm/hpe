@@ -302,6 +302,10 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 > 状态：**本地验收完成**（2026-11-04）。两个控制面共享 PostgreSQL、两个 Worker 经故障切换代理消费 Job；控制面逐个替换、Worker 分别执行中强杀并重启后，6 个 Job 全部成功，重派 `attempts >= 2` 且 `executionId` 不变。`test:worker-rolling` 21/21 checks，`test:multi-node` 10/10、`test:rolling` 17/17 回归通过。完整契约见 [Phase 27 滚动升级](phase-27-worker-rolling-upgrade.md)。
 
+## 8v. Phase 28：MCP `notifications/tasks` 推送
+
+> 状态：**本地验收完成**（2026-11-04）。`subscriptions/listen` 的 `tasksChanged` 订阅在内存 fixture 与 PostgreSQL 持久任务上统一发送 SEP-2663 `notifications/tasks`，覆盖 `working`/`input_required`/`completed`/`failed`/`cancelled` 与 subscriptionId；新增内存 SSE 测试并更新跨节点断言。完整契约见 [Phase 28 任务通知](phase-28-task-notifications.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid

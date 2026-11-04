@@ -1,6 +1,6 @@
 # MCP 持久状态与跨节点通知
 
-> 状态：**P13-03 IN_PROGRESS**。PostgreSQL session/subscription/notification/task 存储、跨节点 `tasks/get/update`、owner-node 命令消费者、双进程 SSE 与节点强停恢复、慢消费者背压和重放、Topic Event outbox、官方 2025-11-25 核心 conformance、2026-07-28 完整 conformance（含 MRTR 与 tasks extension）已实现；webhook/schedule/task 统一事件账本、`notifications/tasks` 推送和真实外部客户端仍未完成。
+> 状态：**P13-03 IN_PROGRESS**。PostgreSQL session/subscription/notification/task 存储、跨节点 `tasks/get/update`、owner-node 命令消费者、双进程 SSE 与节点强停恢复、慢消费者背压和重放、Topic Event outbox、`notifications/tasks` 推送、官方 2025-11-25 核心 conformance、2026-07-28 完整 conformance（含 MRTR 与 tasks extension）已实现；webhook/schedule/task 统一事件账本和真实外部客户端仍未完成。
 
 ## 1. 数据边界
 
@@ -86,5 +86,5 @@ HPA_POSTGRES_TEST_URL='postgresql://localhost:5432/hpa_p13_test' \
 
 - 当前跨节点通知是 PostgreSQL 持久 sequence + 有界轮询，不是 `LISTEN/NOTIFY` 或 Redis Stream 低延迟推送；正确性不依赖内存 channel。
 - Topic Event 已使用 PostgreSQL outbox + shared trigger fire 去重；webhook、schedule 和 task 仍使用各自持久记录，尚未统一到一张幂等事件账本。
-- tasks extension 的 conformance fixture 使用进程内任务状态；生产持久任务仍由 PostgreSQL task 投影与 execution handle 承担，`notifications/tasks` 推送未实现（官方场景当前跳过）。
+- tasks extension 的 conformance fixture 使用进程内任务状态；生产持久任务仍由 PostgreSQL task 投影与 execution handle 承担。`subscriptions/listen` 的 `notifications/tasks` 已覆盖内存 fixture 与持久任务；官方场景仍跳过，通知本身是可选能力。
 - 事件总线统一账本和至少两个真实外部客户端尚未验证。

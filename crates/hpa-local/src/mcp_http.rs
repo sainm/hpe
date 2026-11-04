@@ -48,6 +48,7 @@ const MODERN_REMOVED_METHODS: &[&str] = &[
 struct CatalogChange {
     tenant_id: String,
     kind: String,
+    payload: Option<Value>,
 }
 
 fn catalog_changes() -> &'static broadcast::Sender<CatalogChange> {
@@ -325,6 +326,7 @@ pub(crate) fn notify_catalog_changed(tenant_id: &str, kind: &str) {
     let _ = catalog_changes().send(CatalogChange {
         tenant_id: tenant_id.to_string(),
         kind: kind.to_string(),
+        payload: None,
     });
     if let Some(pool) = persistent_pool().get().cloned() {
         let tenant_id = tenant_id.to_string();
@@ -340,6 +342,27 @@ pub(crate) fn notify_catalog_changed(tenant_id: &str, kind: &str) {
                     kind,
                     %error,
                     "failed to persist MCP catalog notification"
+                );
+            }
+        });
+    }
+}
+
+pub(crate) fn notify_task_changed(tenant_id: &str, payload: Value) {
+    let _ = catalog_changes().send(CatalogChange {
+        tenant_id: tenant_id.to_string(),
+        kind: "tasks".to_string(),
+        payload: Some(payload.clone()),
+    });
+    if let Some(pool) = persistent_pool().get().cloned() {
+        let tenant_id = tenant_id.to_string();
+        tokio::spawn(async move {
+            let store = PostgresMcpStore::new(pool, tenant_id.clone(), "task-notifier");
+            if let Err(error) = store.publish_notification("tasks", &payload).await {
+                tracing::error!(
+                    tenant_id,
+                    %error,
+                    "failed to persist MCP task notification"
                 );
             }
         });
@@ -661,6 +684,10 @@ fn catalog_stream(
                                 .get("promptsListChanged")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false),
+                            "tasks" => requested
+                                .get("tasksChanged")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
                             _ => false,
                         };
                         if !enabled {
@@ -670,6 +697,7 @@ fn catalog_stream(
                             "tools" => "notifications/tools/list_changed",
                             "resources" => "notifications/resources/list_changed",
                             "prompts" => "notifications/prompts/list_changed",
+                            "tasks" => "notifications/tasks",
                             _ => continue,
                         };
                         let mut meta = json!({
@@ -679,13 +707,16 @@ fn catalog_stream(
                             meta["io.modelcontextprotocol/subscriptionId"] =
                                 subscription_ref.clone();
                         }
+                        let mut params = change.payload.unwrap_or_else(|| json!({}));
+                        if !params.is_object() {
+                            params = json!({"value": params});
+                        }
+                        params["_meta"] = meta;
                         let event = Event::default().event("message").data(
                             json!({
                                 "jsonrpc": "2.0",
                                 "method": method,
-                                "params": {
-                                    "_meta": meta
-                                }
+                                "params": params
                             })
                             .to_string(),
                         );
@@ -815,7 +846,7 @@ fn persistent_notification_event(
         "tools" => "notifications/tools/list_changed",
         "resources" => "notifications/resources/list_changed",
         "prompts" => "notifications/prompts/list_changed",
-        "tasks" => "notifications/tasks/status_changed",
+        "tasks" => "notifications/tasks",
         other => {
             tracing::warn!(kind = other, "unknown MCP notification kind");
             "notifications/unknown"

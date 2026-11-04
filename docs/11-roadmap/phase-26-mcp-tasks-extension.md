@@ -42,5 +42,5 @@ HPA_CONFORMANCE_REQUIREMENTS=2026-07-28 pnpm test:mcp-conformance
 ## 4. 非目标
 
 - 不把 conformance fixture 暴露到常规 Runtime，也不把进程内任务存储用于生产持久任务。
-- 不实现 `notifications/tasks` 的 subscriptions/listen 推送；官方场景当前跳过，通知仍为可选。
+- 不实现 `notifications/tasks` 的 subscriptions/listen 推送（已由 [Phase 28](phase-28-task-notifications.md) 完成）；官方场景当前跳过，通知仍为可选。
 - 不改变真实外部 AI 客户端验收状态；仍为 `BLOCKED_EXTERNAL`。
