@@ -508,6 +508,28 @@ impl AgentRuntime {
         self.leases.lock().await.get(session_id).copied()
     }
 
+    async fn ensure_session_lease(&self, session_id: &str) -> Result<(), AgentError> {
+        let Some(store) = self.db.postgres_agent() else {
+            return Ok(());
+        };
+        let Some(token) = self.session_lease_token(session_id).await else {
+            return Err(AgentError::Lease(format!(
+                "agent session `{session_id}` has no active lease"
+            )));
+        };
+        let renewed = store
+            .renew_agent_lease(session_id, &self.node_id, token, self.lease_ttl_ms)
+            .await
+            .map_err(|error| AgentError::Lease(error.to_string()))?;
+        if !renewed {
+            self.leases.lock().await.remove(session_id);
+            return Err(AgentError::Lease(format!(
+                "agent session `{session_id}` lease lost"
+            )));
+        }
+        Ok(())
+    }
+
     async fn require_lease(&self, session_id: &str) -> Result<bool, AgentError> {
         if self.db.postgres_agent().is_none() {
             return Ok(false);
@@ -720,6 +742,7 @@ impl AgentRuntime {
             if state.status.is_terminal() || state.status == AgentStatus::WaitingApproval {
                 break;
             }
+            self.ensure_session_lease(session_id).await?;
             if now_ms().saturating_sub(state.started_ms) > definition.limits.timeout_ms {
                 self.finish_with_error(
                     &mut state,
@@ -858,7 +881,10 @@ impl AgentRuntime {
                         self.persist(session_id, &state).await?;
                         break;
                     }
-                    let outcome = self.execute_tool(&tool, &args).await?;
+                    let outcome = {
+                        self.ensure_session_lease(session_id).await?;
+                        self.execute_tool(&tool, &args).await?
+                    };
                     self.apply_tool_outcome(&mut state, session_id, &tool, outcome)
                         .await?;
                     state.pending_action = None;
@@ -1028,6 +1054,7 @@ impl AgentRuntime {
             .await?;
             self.persist(session_id, state).await?;
         }
+        self.ensure_session_lease(session_id).await?;
         let config = self.python.clone().ok_or_else(|| {
             AgentError::Invalid(
                 "Python planner requires HPA_AI_WORKER_BIN and a configured tool endpoint"
@@ -1902,6 +1929,12 @@ impl AgentRuntime {
                 }
             }
         } else {
+            if let Err(error) = self.ensure_session_lease(&request.session_id).await {
+                let response =
+                    tool_response(&request.call_id, "failed", None, Some(error.to_string()));
+                self.finish_tool_ledger(&request, &response).await?;
+                return Ok(response);
+            }
             match self.execute_tool(&request.tool, &request.arguments).await {
                 Ok(outcome) => {
                     let status = if outcome.is_error {
@@ -2144,6 +2177,7 @@ impl AgentRuntime {
                 "pending action is not a tool call".to_string(),
             ));
         };
+        self.ensure_session_lease(session_id).await?;
         let outcome = self.execute_tool(&tool, &arguments).await?;
         self.apply_tool_outcome(&mut state, session_id, &tool, outcome)
             .await?;
@@ -2171,6 +2205,7 @@ impl AgentRuntime {
         definition: &AgentDefinition,
         approval_id: &str,
     ) -> Result<AgentSessionRow, AgentError> {
+        self.ensure_session_lease(session_id).await?;
         let action = state
             .pending_action
             .clone()

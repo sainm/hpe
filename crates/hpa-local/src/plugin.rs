@@ -1680,13 +1680,13 @@ impl PluginService {
             .collect())
     }
 
-    pub async fn install_remote_package(
+    async fn remote_package_row(
         &self,
         source_id: &str,
         plugin_id: &str,
         version: &str,
-    ) -> Result<Value, PluginError> {
-        let package = if let Some(store) = self.db.postgres_plugin() {
+    ) -> Result<RemoteMarketplacePackageRow, PluginError> {
+        let row = if let Some(store) = self.db.postgres_plugin() {
             store
                 .remote_package(source_id, plugin_id, version)
                 .await
@@ -1702,14 +1702,40 @@ impl PluginService {
             .bind(version)
             .fetch_optional(&self.db.pool)
             .await?
-        }
-        .ok_or_else(|| PluginError::NotFound("remote package not found".to_string()))?;
+        };
+        row.ok_or_else(|| PluginError::NotFound("remote package not found".to_string()))
+    }
+
+    pub async fn install_remote_package(
+        &self,
+        source_id: &str,
+        plugin_id: &str,
+        version: &str,
+    ) -> Result<Value, PluginError> {
+        let mut package = self
+            .remote_package_row(source_id, plugin_id, version)
+            .await?;
         if package.review_status != "approved" || package.withdrawn_at.is_some() {
             return Err(PluginError::Forbidden(
                 "remote package is not approved or was withdrawn".to_string(),
             ));
         }
-        let bytes = tokio::fs::read(&package.package_path).await?;
+        let bytes = match tokio::fs::read(&package.package_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.refresh_marketplace_source(source_id).await?;
+                package = self
+                    .remote_package_row(source_id, plugin_id, version)
+                    .await?;
+                if package.review_status != "approved" || package.withdrawn_at.is_some() {
+                    return Err(PluginError::Forbidden(
+                        "remote package is not approved or was withdrawn".to_string(),
+                    ));
+                }
+                tokio::fs::read(&package.package_path).await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         let actual = format!("{:x}", Sha256::digest(&bytes));
         if actual != package.package_sha256 {
             return Err(PluginError::Signature(

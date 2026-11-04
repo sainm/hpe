@@ -133,6 +133,13 @@
 - [Phase 16 Connector 元数据 PostgreSQL 权威](11-roadmap/phase-16-connector-postgres.md)
 - [Phase 17 Plugin 元数据 PostgreSQL 权威](11-roadmap/phase-17-plugin-postgres.md)
 - [Phase 18 Agent 会话 owner lease](11-roadmap/phase-18-agent-lease.md)
+- [Phase 19 远程 Marketplace 全链路](11-roadmap/phase-19-remote-marketplace.md)
+- [Phase 20 PG 模式配额计数收口](11-roadmap/phase-20-quota-counts.md)
+- [Phase 21 配额门禁覆盖所有创建入口](11-roadmap/phase-21-quota-entrypoints.md)
+- [Phase 22 Agent 工具副作用租约守卫](11-roadmap/phase-22-agent-tool-lease.md)
+- [Phase 23 MCP 2026-07-28 server-stateless conformance](11-roadmap/phase-23-mcp-2026-stateless.md)
+- [Phase 24 MCP 2026-07-28 内容与 Header conformance](11-roadmap/phase-24-mcp-content-conformance.md)
+- [Phase 25 MCP 2026-07-28 MRTR conformance](11-roadmap/phase-25-mcp-mrtr-conformance.md)
 - [国内依赖下载源](13-tech-stack/domestic-download-mirrors.md)
 
 ### 09 UI

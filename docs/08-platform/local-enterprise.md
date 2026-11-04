@@ -154,14 +154,15 @@ RBAC 只有四个动作，按请求方法与路径近似映射：
 | `maxExecutionsPerDay` | 1000 | `POST .../executions` 的当日 `started_at`；以及 Agent 当日会话 |
 | `maxSkills` | 100 | `POST /skills/import`，统计去重后的 Skill |
 | `maxAgents` | 100 | `POST /agents` |
-| `maxPlugins` | 50 | `POST /plugins/install`，排除 `uninstalled` |
-| `maxConnections` | 100 | `POST /connections` |
+| `maxPlugins` | 50 | `POST /plugins/install`、`/plugins/sample` 与本地/远程 Marketplace 安装，排除 `uninstalled` |
+| `maxConnections` | 100 | `POST /connections`、`/connectors/sample` |
 | `maxConcurrentRuns` | 8 | 启动执行时统计 `running` + `waiting_approval` |
 
 - 只有 `POST`/`PUT` 会进入检查；实际只对上述 `POST` 路径计数，`PUT` 不触发配额分支。
 - 日计数按 UTC 日期前缀匹配；Agent 会话没有独立配额字段，复用 `maxExecutionsPerDay`。
 - 超限返回 429：资源数/日计数为 `TENANT_QUOTA`，并发为 `TENANT_CONCURRENCY`。
 - 配额是资源限制，不是权限；即使角色允许，也可能被配额拒绝。
+- `HPA_POSTGRES_RUNTIME=1` 时插件与连接计数读 `hpa_tenant.plugins` / `hpa_tenant.connections`，跨节点一致；SQLite 单节点模式仍读本地表。
 - 配额可通过 `PUT /api/enterprise/quotas/{tenant_id}` 即时调整，无需重启。值为 0 表示不允许该资源。
 
 ## 7. 审计

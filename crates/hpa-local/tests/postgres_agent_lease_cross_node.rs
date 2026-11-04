@@ -249,6 +249,18 @@ async fn agent_session_leases_prevent_cross_node_interruption() {
         .expect("lease exists");
     assert_eq!(lease.owner, "node-a");
     assert_eq!(lease.token, 1);
+    assert!(
+        store
+            .renew_agent_lease(&live_session, "node-a", 1, 30_000)
+            .await
+            .expect("holder renew")
+    );
+    assert!(
+        !store
+            .renew_agent_lease(&live_session, "node-b", 1, 30_000)
+            .await
+            .expect("foreign renew")
+    );
     let events = store
         .list_agent_events(&live_session, 10)
         .await
@@ -300,6 +312,18 @@ async fn agent_session_leases_prevent_cross_node_interruption() {
         .expect("expired lease can be taken over");
     assert_eq!(takeover.owner, "node-b");
     assert_eq!(takeover.token, 2);
+    assert!(
+        !store
+            .renew_agent_lease(&expired_session, "node-a", 1, 300)
+            .await
+            .expect("stale renew")
+    );
+    assert!(
+        store
+            .renew_agent_lease(&expired_session, "node-b", 2, 300)
+            .await
+            .expect("takeover renew")
+    );
     let mut expired_row = store
         .get_agent_session(&expired_session)
         .await
@@ -373,11 +397,14 @@ async fn agent_session_leases_prevent_cross_node_interruption() {
         "name": "Lease Probe",
         "version": "1.0.0",
         "description": "Deterministic lease release probe",
-        "instructions": "Reply without tools.",
-        "tools": [],
+        "instructions": "List workflows, then reply.",
+        "tools": ["workflow.list"],
         "planner": {
             "kind": "deterministic",
-            "plan": [{"kind": "respond", "output": {"ok": true}}]
+            "plan": [
+                {"kind": "tool", "tool": "workflow.list", "arguments": {}},
+                {"kind": "respond", "output": {"ok": true}}
+            ]
         },
         "limits": {
             "maxSteps": 2,

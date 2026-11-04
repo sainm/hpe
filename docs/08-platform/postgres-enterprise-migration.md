@@ -201,6 +201,7 @@ node scripts/scim-e2e.mjs                                  # 需要运行中的�
 - `postgres_mcp_meta_cross_node`：A 创建 MCP PAT，B 列表可见并用它通过 `/mcp` 认证，A 读到 B 写入的审计；B 吊销后 A 立即 401；审批决定/一次性消费/过期、服务器 upsert/list/delete 与 stats 跨节点一致；SQLite MCP 表 0 行。
 - `postgres_connector_cross_node`：A/B 共享内置 Connector 定义；A 建样例连接，B 读取、更新、测试，A 读到更新的连接与 B 写入的审计；A 删除后 B 列表消失；定义幂等/冻结/所有权与 SQLite 0 行均有断言。
 - `postgres_plugin_cross_node`：A 安装样例插件，B 读取插件/包/能力/贡献的 Connector；B 停用、A 启用；A 发布 Marketplace，B 审核/评分/撤回；发布者与来源/key 跨节点可见，撤销跨节点生效；远程包与插件 MCP server 存储级验证；A 卸载后 B 读到 uninstalled；SQLite 插件表 0 行。
+- `postgres_quota_counts`：设置 `maxPlugins=1` / `maxConnections=1` 后，A 创建样例插件与连接，B 的第二个插件安装/连接创建返回 429；PG 计数为 1/1；提高配额后 B 立即成功并计数 2/2；SQLite 表 0 行。
 - `postgres_control_mirror`：跨节点配额与租户读取、空 data dir 节点为未见租户注册 Worker。
 
 ## 6. 风险

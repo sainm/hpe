@@ -451,6 +451,19 @@ impl PostgresPluginStore {
         rows.iter().map(plugin_from_row).collect()
     }
 
+    pub async fn count_plugins(&self) -> Result<i64, PostgresPluginError> {
+        let mut transaction = self.begin().await?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM hpa_tenant.plugins
+             WHERE tenant_id = $1 AND status != 'uninstalled'",
+        )
+        .bind(&self.tenant_id)
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(count)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_plugin_summary(
         &self,

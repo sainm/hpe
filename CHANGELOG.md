@@ -4,6 +4,13 @@
 
 ### Changed
 
+- Phase 25：2026-07-28 MCP MRTR conformance——新增 8 个 `InputRequiredResult` 工具 fixture 与 1 个 prompt fixture，覆盖 elicitation、sampling、roots/list、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get`；`pnpm test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查全部通过，2026 计分 server requirements 达到 37/37（tasks extension 不计分且未实现）。
+- Phase 24：2026-07-28 MCP conformance 内容场景——工具图像/音频/嵌入资源/混合内容/进度、Resources/Prompts、completion、caching、JSON Schema 2020-12、标准与自定义 Header（base64 Mcp-Param）全部通过；`pnpm test:mcp-conformance:2026-content` 覆盖 18 个场景。
+- Phase 23：官方 `@modelcontextprotocol/conformance` 升级到 `0.2.0-alpha.12`；新增 requirements 运行模式与 `pnpm test:mcp-conformance:2026`。2025-11-25 核心 9/9、2026-07-28 `server-stateless` 28/28 通过；补齐 per-request `_meta` 校验、-32020/-32022/-32021/-32601 错误与 HTTP 状态、移除方法 404、订阅 acknowledged 首帧与 subscriptionId 标记。
+- Phase 22：Agent 驱动循环每轮、工具执行前、Python 工具服务与审批恢复前续租 Agent 会话租约；租约过期或被接管时新工具副作用不执行，已开始的单次工具调用不中断。
+- Phase 21：`maxPlugins` 配额覆盖 `/plugins/sample` 与本地/远程 Marketplace 安装，`maxConnections` 覆盖 `/connectors/sample`；配额为 0 时这些入口统一 429，避免绕过 Phase 20 的计数修复。
+- Phase 20：`HPA_POSTGRES_RUNTIME=1` 时 `maxPlugins` 与 `maxConnections` 配额改为按 `hpa_tenant.plugins` / `hpa_tenant.connections` 计数，修复此前仍查 SQLite 导致跨节点配额被绕过；本地 SQLite 模式不变。
+- Phase 19：远程 Marketplace 全链路打通——未缓存包的节点在远程安装时自动刷新来源并重建本地缓存；签名索引、包哈希、发布者 key、插件签名、批准/撤回状态在刷新后重新校验；撤回刷新会停用已安装版本并阻止再次安装。包缓存仍为节点本地，元数据继续走 PostgreSQL。
 - Phase 18：Agent 主动执行增加 PostgreSQL 会话 owner lease（`lease_owner/lease_token/lease_expires_at`，migration `0020`）；start/drive/approval resume 获取租约，persist/emit 按 holder+token+未过期围栏，终态或等待审批释放；`recover` 跳过仍被其他节点持有的 running 会话，只接管过期会话，旧 token 写入失败；本地 SQLite 模式不变。
 - Phase 17：插件生命周期、本地/远程 Marketplace 与信任元数据（plugin_packages、plugins、plugin_capabilities、plugin_events、plugin_market_listings、plugin_reviews、publishers/sources/remote_packages、marketplace_event_stream）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威；插件贡献的 MCP server 与 Connector 分别走 Phase 15/16 存储，支持跨节点安装状态、启停、审核、评分、撤回与信任 key 管理；插件包文件、签名私钥与安装目录仍在节点本地，SQLite 单节点模式与插件 CLI/UI 保持不变。
 - Phase 16：Connector 定义、连接与审计（connector_definitions、connections、connector_audit）在 `HPA_POSTGRES_RUNTIME=1` 时以 PostgreSQL 为权威；节点启动幂等注册内置连接器，支持跨节点创建/读取/更新/测试/删除连接与审计，插件启停/卸载的 Connector 贡献走同一路径，SQLite 单节点模式与执行引擎保持不变。
@@ -36,8 +43,9 @@
 
 ### Tests
 
-- 全量 Rust：所有非 ignored 用例通过，1 ignored；Clippy `-D warnings` 与 fmt 通过。
-- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**29 / 29 文件（30 / 30 用例）通过**。
+- 全量 Rust：250 passed / 0 failed / 1 ignored；Clippy `-D warnings` 与 fmt 通过。
+- 真实 PostgreSQL 18.4 上 `pnpm test:postgres` 文件级隔离运行：**31 / 31 文件（32 / 32 用例）通过**，含远程 Marketplace 签名索引/安装/撤回链路与跨节点配额计数。
+- MCP 官方 conformance：2025-11-25 核心 9/9；2026-07-28 `server-stateless` 28/28、内容/Header 场景 18/18、MRTR 14 场景/40 检查全通过；计分 server requirements 37/37，总报告 162 passed / 29 failed（失败全部在不计分的 tasks extension）。
 - PostgreSQL 备份/恢复：21 个 migration、71 个业务关系、68 张 FORCE RLS 表一致。
-- Web：typecheck、12 Vitest、build；扩展：65 Vitest、build。
-- 品牌、IR、契约（含 109 个运行时路由/方法漂移检查）、文档（175 文件 861 链接）、镜像、OTel、供应链门禁通过。
+- Web：typecheck、12 Vitest、build；扩展：65 Vitest、7 个 Extension Host 检查、build。
+- 品牌、IR、契约（含运行时路由/方法漂移检查）、文档（182 文件 881 链接）、镜像、OTel、供应链门禁通过。

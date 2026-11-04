@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const binary = process.env.HPA_BINARY || path.join(root, "target", "debug", "hpa");
+const requirements = process.env.HPA_CONFORMANCE_REQUIREMENTS?.trim();
+const conformanceOverride = process.env.HPA_CONFORMANCE_BIN?.trim();
 const scenarios = (
   process.env.HPA_CONFORMANCE_SCENARIOS ||
   [
@@ -219,44 +221,73 @@ try {
   if (probeBody?.result?.protocolVersion !== "2025-11-25") {
     throw new Error(`conformance proxy probe returned invalid initialize: ${JSON.stringify(probeBody)}`);
   }
-  const conformance = path.join(
-    root,
-    "node_modules",
-    ".bin",
-    process.platform === "win32" ? "conformance.cmd" : "conformance",
-  );
-  for (const scenario of scenarios) {
-    const outputDir = path.join(resultRoot, scenario);
-    const result = await runProcess(
-      conformance,
-      [
-        "server",
-        "--url",
-        `http://127.0.0.1:${proxyPort}/mcp`,
-        "--scenario",
-        scenario,
-        "--spec-version",
-        process.env.HPA_CONFORMANCE_SPEC_VERSION || "2025-11-25",
-        "--output-dir",
-        outputDir,
-      ],
+  const conformance =
+    conformanceOverride ||
+    path.join(
+      root,
+      "node_modules",
+      ".bin",
+      process.platform === "win32" ? "conformance.cmd" : "conformance",
     );
+  if (requirements) {
+    const label = `requirements-${requirements}`;
+    const outputDir = path.join(resultRoot, label);
+    const result = await runProcess(conformance, [
+      "server",
+      "--url",
+      `http://127.0.0.1:${proxyPort}/mcp`,
+      "--requirements",
+      requirements,
+      "--output-dir",
+      outputDir,
+    ]);
     process.stdout.write(result.stdout);
     process.stderr.write(result.stderr);
     results.push({
-      scenario,
+      scenario: label,
       status: result.status,
       outputDir: path.relative(root, outputDir),
     });
     if (result.status !== 0) {
-      throw new Error(`MCP conformance scenario ${scenario} failed`);
+      throw new Error(`MCP conformance requirements ${requirements} failed`);
+    }
+  } else {
+    for (const scenario of scenarios) {
+      const outputDir = path.join(resultRoot, scenario);
+      const result = await runProcess(
+        conformance,
+        [
+          "server",
+          "--url",
+          `http://127.0.0.1:${proxyPort}/mcp`,
+          "--scenario",
+          scenario,
+          "--spec-version",
+          process.env.HPA_CONFORMANCE_SPEC_VERSION || "2025-11-25",
+          "--output-dir",
+          outputDir,
+        ],
+      );
+      process.stdout.write(result.stdout);
+      process.stderr.write(result.stderr);
+      results.push({
+        scenario,
+        status: result.status,
+        outputDir: path.relative(root, outputDir),
+      });
+      if (result.status !== 0) {
+        throw new Error(`MCP conformance scenario ${scenario} failed`);
+      }
     }
   }
   console.log(
     JSON.stringify(
       {
         ok: true,
-        specVersion: process.env.HPA_CONFORMANCE_SPEC_VERSION || "2025-11-25",
+        specVersion:
+          requirements ||
+          process.env.HPA_CONFORMANCE_SPEC_VERSION ||
+          "2025-11-25",
         results,
         resultRoot: path.relative(root, resultRoot),
       },

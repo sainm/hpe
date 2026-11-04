@@ -55,6 +55,10 @@ pub enum DbError {
     PostgresSkill(String),
     #[error("PostgreSQL MCP metadata error: {0}")]
     PostgresMcpMeta(String),
+    #[error("PostgreSQL connector error: {0}")]
+    PostgresConnector(String),
+    #[error("PostgreSQL plugin error: {0}")]
+    PostgresPlugin(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -3263,6 +3267,32 @@ impl Db {
             return store.count_agents().await.map_err(Self::map_postgres_agent);
         }
         Ok(sqlx::query_scalar("SELECT COUNT(*) FROM agents")
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    pub async fn plugin_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_plugin.as_ref() {
+            return store
+                .count_plugins()
+                .await
+                .map_err(|error| DbError::PostgresPlugin(error.to_string()));
+        }
+        Ok(
+            sqlx::query_scalar("SELECT COUNT(*) FROM plugins WHERE status != 'uninstalled'")
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn connector_connection_count(&self) -> DbResult<i64> {
+        if let Some(store) = self.postgres_connector.as_ref() {
+            return store
+                .count_connections()
+                .await
+                .map_err(|error| DbError::PostgresConnector(error.to_string()));
+        }
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM connections")
             .fetch_one(&self.pool)
             .await?)
     }

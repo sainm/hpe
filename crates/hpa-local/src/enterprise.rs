@@ -1188,20 +1188,12 @@ impl EnterpriseState {
             ("skills", db.skill_count().await?, quota.max_skills)
         } else if method == "POST" && path == "/agents" {
             ("agents", db.agent_count().await?, quota.max_agents)
-        } else if method == "POST" && path == "/plugins/install" {
-            (
-                "plugins",
-                count_query(
-                    db,
-                    "SELECT COUNT(*) FROM plugins WHERE status != 'uninstalled'",
-                )
-                .await?,
-                quota.max_plugins,
-            )
-        } else if method == "POST" && path == "/connections" {
+        } else if is_plugin_create_request(method, path) {
+            ("plugins", db.plugin_count().await?, quota.max_plugins)
+        } else if is_connection_create_request(method, path) {
             (
                 "connections",
-                count_query(db, "SELECT COUNT(*) FROM connections").await?,
+                db.connector_connection_count().await?,
                 quota.max_connections,
             )
         } else if is_execution_create_request(method, path) {
@@ -4290,6 +4282,17 @@ fn is_execution_create_request(method: &str, path: &str) -> bool {
     method == "POST" && (path.ends_with("/executions") || path.ends_with("/retry"))
 }
 
+fn is_plugin_create_request(method: &str, path: &str) -> bool {
+    method == "POST"
+        && (path == "/plugins/install"
+            || path == "/plugins/sample"
+            || (path.starts_with("/marketplace/") && path.ends_with("/install")))
+}
+
+fn is_connection_create_request(method: &str, path: &str) -> bool {
+    method == "POST" && matches!(path, "/connections" | "/connectors/sample")
+}
+
 fn role_allows(role: &str, action: &str) -> bool {
     match role {
         "owner" | "admin" | "developer" | "publisher" => true,
@@ -4560,13 +4563,6 @@ async fn audit_rows(
             })
         })
         .collect())
-}
-
-async fn count_query(db: &Db, query: &'static str) -> Result<i64, ApiError> {
-    sqlx::query_scalar(query)
-        .fetch_one(&db.pool)
-        .await
-        .map_err(internal)
 }
 
 async fn ensure_control_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {

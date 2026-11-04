@@ -240,6 +240,17 @@ impl PostgresConnectorStore {
         rows.iter().map(connection_from_row).collect()
     }
 
+    pub async fn count_connections(&self) -> Result<i64, PostgresConnectorError> {
+        let mut transaction = self.begin().await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM hpa_tenant.connections WHERE tenant_id = $1")
+                .bind(&self.tenant_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+        transaction.commit().await?;
+        Ok(count)
+    }
+
     pub async fn connection(
         &self,
         id: &str,

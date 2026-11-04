@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use hpa_core::compiler::compile_workflow;
@@ -309,15 +310,15 @@ fn validate_modern(params: &Value) -> Result<(), RpcError> {
     let meta = params
         .get("_meta")
         .and_then(Value::as_object)
-        .ok_or_else(|| RpcError::new(-32600, "missing request `_meta`"))?;
+        .ok_or_else(|| RpcError::new(-32602, "missing request `_meta`"))?;
     let version = meta
         .get("io.modelcontextprotocol/protocolVersion")
         .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::new(-32600, "missing protocol version in `_meta`"))?;
+        .ok_or_else(|| RpcError::new(-32602, "missing protocol version in `_meta`"))?;
     if version != MODERN_VERSION {
         return Err(
-            RpcError::new(-32001, format!("unsupported protocol version `{version}`"))
-                .with_data(json!({"supportedVersions": SUPPORTED_VERSIONS})),
+            RpcError::new(-32022, format!("unsupported protocol version `{version}`"))
+                .with_data(json!({"requested": version, "supported": SUPPORTED_VERSIONS})),
         );
     }
     if !meta
@@ -325,7 +326,7 @@ fn validate_modern(params: &Value) -> Result<(), RpcError> {
         .is_some_and(Value::is_object)
     {
         return Err(RpcError::new(
-            -32600,
+            -32602,
             "missing clientCapabilities in `_meta`",
         ));
     }
@@ -428,6 +429,7 @@ async fn dispatch(
                     "tools": {"listChanged": true},
                     "resources": {"subscribe": false, "listChanged": true},
                     "prompts": {"listChanged": true},
+                    "completions": {},
                     "io.modelcontextprotocol/tasks": {
                         "get": true,
                         "update": true,
@@ -470,10 +472,10 @@ async fn dispatch(
         "tools/list" => {
             require_scope(auth, SCOPE_READ)?;
             let tools = build_tools(service, auth).await?;
-            let mut specs = tool_specs(&tools, tool_name_style);
-            if conformance_mode() {
-                specs.extend(conformance_tool_specs());
-            }
+            let mut specs = conformance_mode()
+                .then(conformance_tool_specs)
+                .unwrap_or_default();
+            specs.extend(tool_specs(&tools, tool_name_style));
             Ok(finish_list(era, json!({"tools": specs})))
         }
         "tools/call" => {
@@ -504,7 +506,12 @@ async fn dispatch(
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(-32602, "resources/read requires a uri"))?;
             let content = read_resource(service, auth, uri).await?;
-            Ok(finish(era, json!({"contents": [content]})))
+            let mut result = json!({"contents": [content]});
+            if era == Era::Modern {
+                result["cacheScope"] = json!("private");
+                result["ttlMs"] = json!(30000);
+            }
+            Ok(finish(era, result))
         }
         "prompts/list" => {
             require_scope(auth, SCOPE_READ)?;
@@ -517,9 +524,27 @@ async fn dispatch(
                 .get("name")
                 .and_then(Value::as_str)
                 .ok_or_else(|| RpcError::new(-32602, "prompts/get requires a name"))?;
+            if conformance_mode()
+                && era == Era::Modern
+                && name == "test_input_required_result_prompt"
+            {
+                return mrtr_prompt(params, era);
+            }
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             let result = get_prompt(service, auth, name, &arguments).await?;
             Ok(finish(era, result))
+        }
+        "completion/complete" => {
+            require_scope(auth, SCOPE_READ)?;
+            Ok(finish(
+                era,
+                json!({
+                    "completion": {
+                        "values": [],
+                        "hasMore": false
+                    }
+                }),
+            ))
         }
         "tasks/get" => {
             require_scope(auth, SCOPE_READ)?;
@@ -583,8 +608,12 @@ fn conformance_mode() -> bool {
         .unwrap_or(false)
 }
 
+const CONFORMANCE_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const CONFORMANCE_WAV: &str = "UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=";
+
 fn conformance_tool_specs() -> Vec<Value> {
-    vec![
+    let mut specs = vec![
         json!({
             "name": "test_simple_text",
             "title": "Conformance simple text",
@@ -619,7 +648,231 @@ fn conformance_tool_specs() -> Vec<Value> {
             },
             "_meta": {"hpa/conformanceFixture": true}
         }),
-    ]
+        json!({
+            "name": "test_missing_capability",
+            "title": "Conformance missing capability",
+            "description": "Requires sampling and returns MissingRequiredClientCapabilityError when undeclared.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_streaming_elicitation",
+            "title": "Conformance streaming elicitation",
+            "description": "Returns a deterministic result for response-stream checks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_logging_tool",
+            "title": "Conformance logging tool",
+            "description": "Returns a result without emitting log messages unless a logLevel is supplied.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_trigger_tool_change",
+            "title": "Conformance tool change trigger",
+            "description": "Returns a deterministic result for catalog-change subscription checks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            },
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_image_content",
+            "title": "Conformance image content",
+            "description": "Returns image content for conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_audio_content",
+            "title": "Conformance audio content",
+            "description": "Returns audio content for conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_embedded_resource",
+            "title": "Conformance embedded resource",
+            "description": "Returns embedded resource content for conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_multiple_content_types",
+            "title": "Conformance mixed content",
+            "description": "Returns text, image and resource content for conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_tool_with_progress",
+            "title": "Conformance progress tool",
+            "description": "Returns text and reports progress when a progressToken is provided.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "json_schema_2020_12_tool",
+            "title": "Conformance JSON Schema 2020-12",
+            "description": "Tool with JSON Schema 2020-12 features",
+            "inputSchema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "$defs": {
+                    "address": {
+                        "$anchor": "addressDef",
+                        "type": "object",
+                        "properties": {
+                            "street": {"type": "string"},
+                            "city": {"type": "string"}
+                        }
+                    }
+                },
+                "properties": {
+                    "name": {"type": "string"},
+                    "address": {"$ref": "#/$defs/address"},
+                    "contactMethod": {"type": "string", "enum": ["phone", "email"]},
+                    "phone": {"type": "string"},
+                    "email": {"type": "string"}
+                },
+                "allOf": [{"anyOf": [{"required": ["phone"]}, {"required": ["email"]}]}],
+                "if": {"properties": {"contactMethod": {"const": "phone"}}, "required": ["contactMethod"]},
+                "then": {"required": ["phone"]},
+                "else": {"required": ["email"]},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+        json!({
+            "name": "test_custom_headers",
+            "title": "Conformance custom headers",
+            "description": "Validates Mcp-Param custom header forwarding for conformance tests.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "string", "x-mcp-header": "Value"}
+                },
+                "required": ["value"],
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }),
+    ];
+    for (name, description) in [
+        (
+            "test_input_required_result_elicitation",
+            "Returns an InputRequiredResult for elicitation and completes after the retry.",
+        ),
+        (
+            "test_input_required_result_sampling",
+            "Returns an InputRequiredResult for sampling and completes after the retry.",
+        ),
+        (
+            "test_input_required_result_list_roots",
+            "Returns an InputRequiredResult for roots/list and completes after the retry.",
+        ),
+        (
+            "test_input_required_result_request_state",
+            "Returns an InputRequiredResult with an integrity-protected requestState.",
+        ),
+        (
+            "test_input_required_result_multiple_inputs",
+            "Returns an InputRequiredResult with elicitation, sampling and roots/list requests.",
+        ),
+        (
+            "test_input_required_result_multi_round",
+            "Returns successive InputRequiredResults with evolving requestState.",
+        ),
+        (
+            "test_input_required_result_tampered_state",
+            "Returns an InputRequiredResult whose requestState rejects tampering.",
+        ),
+        (
+            "test_input_required_result_capabilities",
+            "Returns InputRequiredResults filtered by the client capabilities.",
+        ),
+    ] {
+        specs.push(json!({
+            "name": name,
+            "title": name,
+            "description": description,
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+            "_meta": {"hpa/conformanceFixture": true}
+        }));
+    }
+    specs
 }
 
 fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcError> {
@@ -647,8 +900,594 @@ fn conformance_tool_call(params: &Value, era: Era) -> Result<Option<Value>, RpcE
                 "isError": true
             }),
         ))),
+        "test_missing_capability" => {
+            let declared = params
+                .get("_meta")
+                .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+                .and_then(|capabilities| capabilities.get("sampling"))
+                .is_some_and(Value::is_object);
+            if declared {
+                return Ok(Some(finish(
+                    era,
+                    json!({
+                        "content": [{
+                            "type": "text",
+                            "text": "Sampling capability declared"
+                        }],
+                        "isError": false
+                    }),
+                )));
+            }
+            Err(
+                RpcError::new(-32021, "sampling capability was not declared")
+                    .with_data(json!({"requiredCapabilities": {"sampling": {}}})),
+            )
+        }
+        "test_streaming_elicitation" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Streaming elicitation conformance fixture"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_logging_tool" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Logging conformance fixture"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_trigger_tool_change" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Catalog change conformance fixture"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_image_content" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "image",
+                    "data": CONFORMANCE_PNG,
+                    "mimeType": "image/png"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_audio_content" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "audio",
+                    "data": CONFORMANCE_WAV,
+                    "mimeType": "audio/wav"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_embedded_resource" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "resource",
+                    "resource": {
+                        "uri": "test://embedded-resource",
+                        "mimeType": "text/plain",
+                        "text": "This is an embedded resource content."
+                    }
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_multiple_content_types" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [
+                    {"type": "text", "text": "Multiple content types test:"},
+                    {"type": "image", "data": CONFORMANCE_PNG, "mimeType": "image/png"},
+                    {
+                        "type": "resource",
+                        "resource": {
+                            "uri": "test://mixed-content-resource",
+                            "mimeType": "application/json",
+                            "text": "{\"test\":\"data\",\"value\":123}"
+                        }
+                    }
+                ],
+                "isError": false
+            }),
+        ))),
+        "test_tool_with_progress" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Progress conformance fixture completed"
+                }],
+                "isError": false
+            }),
+        ))),
+        "json_schema_2020_12_tool" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "JSON Schema 2020-12 conformance fixture"
+                }],
+                "isError": false
+            }),
+        ))),
+        "test_custom_headers" => Ok(Some(finish(
+            era,
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "Custom header conformance fixture"
+                }],
+                "isError": false
+            }),
+        ))),
+        name if name.starts_with("test_input_required_result_") => {
+            Ok(Some(mrtr_tool_call(name, params, era)?))
+        }
         _ => Ok(None),
     }
+}
+
+fn mrtr_tool_call(name: &str, params: &Value, era: Era) -> Result<Value, RpcError> {
+    match name {
+        "test_input_required_result_elicitation" => mrtr_elicitation(params, era),
+        "test_input_required_result_sampling" => mrtr_sampling(params, era),
+        "test_input_required_result_list_roots" => mrtr_list_roots(params, era),
+        "test_input_required_result_request_state" => mrtr_request_state(params, era),
+        "test_input_required_result_multiple_inputs" => mrtr_multiple_inputs(params, era),
+        "test_input_required_result_multi_round" => mrtr_multi_round(params, era),
+        "test_input_required_result_tampered_state" => mrtr_tampered_state(params, era),
+        "test_input_required_result_capabilities" => mrtr_capabilities(params, era),
+        other => Err(RpcError::new(
+            -32601,
+            format!("unknown input_required fixture `{other}`"),
+        )),
+    }
+}
+
+fn mrtr_secret() -> &'static str {
+    static SECRET: OnceLock<String> = OnceLock::new();
+    SECRET.get_or_init(|| format!("mrtr-{}", Uuid::now_v7()))
+}
+
+fn mrtr_tag(payload: &str) -> String {
+    let key = mrtr_secret().as_bytes();
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for index in 0..64 {
+        inner_pad[index] ^= block[index];
+        outer_pad[index] ^= block[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(payload.as_bytes());
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner);
+    format!("{:x}", outer.finalize())
+}
+
+fn mrtr_equal(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
+fn mrtr_state(label: &str) -> String {
+    let payload = format!("{label}.{}", Uuid::now_v7());
+    let tag = mrtr_tag(&payload);
+    format!("{payload}.{tag}")
+}
+
+fn mrtr_state_valid(state: Option<&str>, label: &str) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    let Some((payload, tag)) = state.rsplit_once('.') else {
+        return false;
+    };
+    if !payload.starts_with(&format!("{label}.")) {
+        return false;
+    }
+    mrtr_equal(&mrtr_tag(payload), tag)
+}
+
+fn mrtr_responses(params: &Value) -> Result<Option<&serde_json::Map<String, Value>>, RpcError> {
+    match params.get("inputResponses") {
+        None => Ok(None),
+        Some(Value::Object(responses)) => Ok(Some(responses)),
+        Some(_) => Err(RpcError::new(-32602, "inputResponses must be an object")),
+    }
+}
+
+fn elicitation_request_value(message: &str, property: &str, kind: &str) -> Value {
+    let mut properties = serde_json::Map::new();
+    properties.insert(property.to_string(), json!({"type": kind}));
+    json!({
+        "method": "elicitation/create",
+        "params": {
+            "message": message,
+            "requestedSchema": {
+                "type": "object",
+                "properties": properties,
+                "required": [property]
+            }
+        }
+    })
+}
+
+fn elicitation_request(key: &str, message: &str, property: &str, kind: &str) -> (String, Value) {
+    (
+        key.to_string(),
+        elicitation_request_value(message, property, kind),
+    )
+}
+
+fn mrtr_input_required(requests: Vec<(String, Value)>, state: Option<String>) -> Value {
+    let mut result = json!({
+        "resultType": "input_required",
+        "inputRequests": Value::Object(requests.into_iter().collect()),
+        "_meta": modern_meta(),
+    });
+    if let Some(state) = state {
+        result["requestState"] = json!(state);
+    }
+    result
+}
+
+fn mrtr_complete_text(era: Era, text: String) -> Value {
+    finish(
+        era,
+        json!({
+            "content": [{"type": "text", "text": text}],
+            "isError": false
+        }),
+    )
+}
+
+fn elicitation_content<'a>(
+    responses: &'a serde_json::Map<String, Value>,
+    key: &str,
+    field: &str,
+) -> Option<&'a Value> {
+    responses
+        .get(key)
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("content"))
+        .and_then(Value::as_object)
+        .and_then(|content| content.get(field))
+}
+
+fn mrtr_elicitation(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || elicitation_request("user_name", "What is your name?", "name", "string");
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    let Some(name) = elicitation_content(responses, "user_name", "name").and_then(Value::as_str)
+    else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    Ok(mrtr_complete_text(era, format!("Hello, {name}!")))
+}
+
+fn sampling_request(key: &str, prompt: &str, max_tokens: i64) -> (String, Value) {
+    (
+        key.to_string(),
+        json!({
+            "method": "sampling/createMessage",
+            "params": {
+                "messages": [{
+                    "role": "user",
+                    "content": {"type": "text", "text": prompt}
+                }],
+                "maxTokens": max_tokens
+            }
+        }),
+    )
+}
+
+fn roots_request(key: &str) -> (String, Value) {
+    (
+        key.to_string(),
+        json!({"method": "roots/list", "params": {}}),
+    )
+}
+
+fn mrtr_sampling(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || sampling_request("capital_question", "What is the capital of France?", 100);
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    let Some(text) = responses
+        .get("capital_question")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("content"))
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    Ok(mrtr_complete_text(
+        era,
+        format!("Sampling response: {text}"),
+    ))
+}
+
+fn mrtr_list_roots(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || roots_request("client_roots");
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    let Some(roots) = responses
+        .get("client_roots")
+        .and_then(Value::as_object)
+        .and_then(|response| response.get("roots"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    let uris = roots
+        .iter()
+        .filter_map(|root| root.get("uri").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    Ok(mrtr_complete_text(
+        era,
+        format!("Client roots: {}", uris.join(", ")),
+    ))
+}
+
+fn mrtr_request_state(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || elicitation_request("confirm", "Please confirm", "ok", "boolean");
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(
+            vec![request()],
+            Some(mrtr_state("request-state")),
+        ));
+    };
+    if !mrtr_state_valid(
+        params.get("requestState").and_then(Value::as_str),
+        "request-state",
+    ) {
+        return Err(RpcError::new(
+            -32602,
+            "requestState failed integrity verification",
+        ));
+    }
+    if responses
+        .get("confirm")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        return Ok(mrtr_input_required(
+            vec![request()],
+            Some(mrtr_state("request-state")),
+        ));
+    }
+    Ok(mrtr_complete_text(era, "state-ok: confirmed".to_string()))
+}
+
+fn mrtr_multiple_requests() -> Vec<(String, Value)> {
+    vec![
+        elicitation_request("user_name", "What is your name?", "name", "string"),
+        sampling_request("greeting", "Generate a greeting", 50),
+        roots_request("client_roots"),
+    ]
+}
+
+fn mrtr_multiple_inputs(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(
+            mrtr_multiple_requests(),
+            Some(mrtr_state("multiple-inputs")),
+        ));
+    };
+    if !mrtr_state_valid(
+        params.get("requestState").and_then(Value::as_str),
+        "multiple-inputs",
+    ) {
+        return Err(RpcError::new(
+            -32602,
+            "requestState failed integrity verification",
+        ));
+    }
+    let missing = mrtr_multiple_requests()
+        .into_iter()
+        .filter(|(key, _)| responses.get(key).and_then(Value::as_object).is_none())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Ok(mrtr_input_required(
+            missing,
+            Some(mrtr_state("multiple-inputs")),
+        ));
+    }
+    Ok(mrtr_complete_text(
+        era,
+        "All input requests answered".to_string(),
+    ))
+}
+
+fn mrtr_multi_round(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let state = params.get("requestState").and_then(Value::as_str);
+    let step1 = || elicitation_request("step1", "Step 1: What is your name?", "name", "string");
+    let step2 = || {
+        elicitation_request(
+            "step2",
+            "Step 2: What is your favorite color?",
+            "color",
+            "string",
+        )
+    };
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(
+            vec![step1()],
+            Some(mrtr_state("multi-round-1")),
+        ));
+    };
+    if mrtr_state_valid(state, "multi-round-1") {
+        if responses.get("step1").and_then(Value::as_object).is_none() {
+            return Ok(mrtr_input_required(
+                vec![step1()],
+                Some(mrtr_state("multi-round-1")),
+            ));
+        }
+        return Ok(mrtr_input_required(
+            vec![step2()],
+            Some(mrtr_state("multi-round-2")),
+        ));
+    }
+    if mrtr_state_valid(state, "multi-round-2") {
+        if responses.get("step2").and_then(Value::as_object).is_none() {
+            return Ok(mrtr_input_required(
+                vec![step2()],
+                Some(mrtr_state("multi-round-2")),
+            ));
+        }
+        let color = elicitation_content(responses, "step2", "color").and_then(Value::as_str);
+        return Ok(mrtr_complete_text(
+            era,
+            format!("Favorite color: {}", color.unwrap_or_default()),
+        ));
+    }
+    Err(RpcError::new(
+        -32602,
+        "requestState failed integrity verification",
+    ))
+}
+
+fn mrtr_tampered_state(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || elicitation_request("confirm", "Please confirm", "ok", "boolean");
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(
+            vec![request()],
+            Some(mrtr_state("tampered")),
+        ));
+    };
+    if !mrtr_state_valid(
+        params.get("requestState").and_then(Value::as_str),
+        "tampered",
+    ) {
+        return Err(RpcError::new(
+            -32602,
+            "requestState failed integrity verification",
+        ));
+    }
+    if responses
+        .get("confirm")
+        .and_then(Value::as_object)
+        .is_none()
+    {
+        return Ok(mrtr_input_required(
+            vec![request()],
+            Some(mrtr_state("tampered")),
+        ));
+    }
+    Ok(mrtr_complete_text(
+        era,
+        "Signed requestState accepted".to_string(),
+    ))
+}
+
+fn mrtr_capabilities(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let capabilities = params
+        .get("_meta")
+        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"))
+        .and_then(Value::as_object);
+    let declared = |name: &str| {
+        capabilities
+            .and_then(|capabilities| capabilities.get(name))
+            .is_some_and(Value::is_object)
+    };
+    let mut requests = Vec::new();
+    if declared("elicitation") {
+        requests.push(elicitation_request(
+            "user_name",
+            "What is your name?",
+            "name",
+            "string",
+        ));
+    }
+    if declared("sampling") {
+        requests.push(sampling_request("greeting", "Generate a greeting", 50));
+    }
+    if declared("roots") {
+        requests.push(roots_request("client_roots"));
+    }
+    let Some(responses) = mrtr_responses(params)? else {
+        if requests.is_empty() {
+            return Ok(mrtr_complete_text(
+                era,
+                "No input capabilities were declared".to_string(),
+            ));
+        }
+        return Ok(mrtr_input_required(requests, None));
+    };
+    let missing = requests
+        .into_iter()
+        .filter(|(key, _)| responses.get(key).and_then(Value::as_object).is_none())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Ok(mrtr_input_required(missing, None));
+    }
+    Ok(mrtr_complete_text(
+        era,
+        "Declared capabilities answered".to_string(),
+    ))
+}
+
+fn mrtr_prompt(params: &Value, era: Era) -> Result<Value, RpcError> {
+    let request = || {
+        elicitation_request(
+            "user_context",
+            "What context should the prompt use?",
+            "context",
+            "string",
+        )
+    };
+    let Some(responses) = mrtr_responses(params)? else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    let Some(context) =
+        elicitation_content(responses, "user_context", "context").and_then(Value::as_str)
+    else {
+        return Ok(mrtr_input_required(vec![request()], None));
+    };
+    Ok(finish(
+        era,
+        json!({
+            "description": "Prompt built from MRTR input.",
+            "messages": [{
+                "role": "user",
+                "content": {"type": "text", "text": format!("Prompt context: {context}")}
+            }]
+        }),
+    ))
 }
 
 async fn build_tools(service: &McpService, auth: &AuthContext) -> Result<Vec<ToolEntry>, RpcError> {
@@ -1370,12 +2209,26 @@ async fn list_resources(service: &McpService, auth: &AuthContext) -> Result<Vec<
             "mimeType": artifact.mime_type,
         }));
     }
+    if conformance_mode() {
+        resources.push(json!({
+            "uri": "test://static-text",
+            "name": "Conformance static text",
+            "description": "Static text resource for conformance tests.",
+            "mimeType": "text/plain"
+        }));
+        resources.push(json!({
+            "uri": "test://static-binary",
+            "name": "Conformance static binary",
+            "description": "Static binary resource for conformance tests.",
+            "mimeType": "image/png"
+        }));
+    }
     Ok(resources)
 }
 
 fn resource_templates(auth: &AuthContext) -> Vec<Value> {
     let tenant = auth.tenant_id.as_str();
-    vec![
+    let mut templates = vec![
         json!({
             "uriTemplate": format!("hpa://tenant/{tenant}/skills/{{skillId}}/versions/{{version}}"),
             "name": "Published skill snapshot",
@@ -1396,7 +2249,15 @@ fn resource_templates(auth: &AuthContext) -> Vec<Value> {
             "name": "Execution artifact",
             "mimeType": "application/json",
         }),
-    ]
+    ];
+    if conformance_mode() {
+        templates.push(json!({
+            "uriTemplate": "test://template/{id}/data",
+            "name": "Conformance resource template",
+            "mimeType": "application/json",
+        }));
+    }
+    templates
 }
 
 async fn read_resource(
@@ -1404,6 +2265,37 @@ async fn read_resource(
     auth: &AuthContext,
     uri: &str,
 ) -> Result<Value, RpcError> {
+    if conformance_mode() {
+        if uri == "test://static-text" {
+            return Ok(json!({
+                "uri": uri,
+                "mimeType": "text/plain",
+                "text": "This is the content of the static text resource."
+            }));
+        }
+        if uri == "test://static-binary" {
+            return Ok(json!({
+                "uri": uri,
+                "mimeType": "image/png",
+                "blob": CONFORMANCE_PNG
+            }));
+        }
+        if let Some(rest) = uri.strip_prefix("test://template/")
+            && let Some(id) = rest.strip_suffix("/data")
+            && !id.is_empty()
+        {
+            return Ok(json!({
+                "uri": uri,
+                "mimeType": "application/json",
+                "text": json!({
+                    "id": id,
+                    "templateTest": true,
+                    "data": format!("Data for ID: {id}")
+                })
+                .to_string()
+            }));
+        }
+    }
     let rest = uri
         .strip_prefix("hpa://tenant/")
         .ok_or_else(|| RpcError::new(-32602, "unsupported resource uri"))?;
@@ -1518,6 +2410,41 @@ async fn list_prompts(service: &McpService, _auth: &AuthContext) -> Result<Vec<V
         "description": "Review a published workflow IR for risks and gaps.",
         "arguments": [{"name": "workflowId", "description": "Workflow id", "required": true}],
     }));
+    if conformance_mode() {
+        prompts.push(json!({
+            "name": "test_simple_prompt",
+            "title": "Conformance simple prompt",
+            "description": "Simple prompt for conformance tests.",
+            "arguments": [],
+        }));
+        prompts.push(json!({
+            "name": "test_prompt_with_arguments",
+            "title": "Conformance parameterized prompt",
+            "description": "Parameterized prompt for conformance tests.",
+            "arguments": [
+                {"name": "arg1", "description": "First argument", "required": true},
+                {"name": "arg2", "description": "Second argument", "required": true}
+            ],
+        }));
+        prompts.push(json!({
+            "name": "test_prompt_with_embedded_resource",
+            "title": "Conformance embedded resource prompt",
+            "description": "Prompt with embedded resource for conformance tests.",
+            "arguments": [{"name": "resourceUri", "description": "Resource URI", "required": true}],
+        }));
+        prompts.push(json!({
+            "name": "test_prompt_with_image",
+            "title": "Conformance image prompt",
+            "description": "Prompt with image content for conformance tests.",
+            "arguments": [],
+        }));
+        prompts.push(json!({
+            "name": "test_input_required_result_prompt",
+            "title": "Conformance input-required prompt",
+            "description": "Prompt that requests elicitation input via InputRequiredResult.",
+            "arguments": [],
+        }));
+    }
     Ok(prompts)
 }
 
@@ -1527,6 +2454,87 @@ async fn get_prompt(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, RpcError> {
+    if conformance_mode() {
+        match name {
+            "test_simple_prompt" => {
+                return Ok(json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {"type": "text", "text": "This is a simple prompt for testing."}
+                    }]
+                }));
+            }
+            "test_prompt_with_arguments" => {
+                let arg1 = arguments
+                    .get("arg1")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let arg2 = arguments
+                    .get("arg2")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                return Ok(json!({
+                    "messages": [{
+                        "role": "user",
+                        "content": {
+                            "type": "text",
+                            "text": format!("Prompt with arguments: arg1='{arg1}', arg2='{arg2}'")
+                        }
+                    }]
+                }));
+            }
+            "test_prompt_with_embedded_resource" => {
+                let resource_uri = arguments
+                    .get("resourceUri")
+                    .and_then(Value::as_str)
+                    .unwrap_or("test://example-resource");
+                return Ok(json!({
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "resource",
+                                "resource": {
+                                    "uri": resource_uri,
+                                    "mimeType": "text/plain",
+                                    "text": "Embedded resource content for testing."
+                                }
+                            }
+                        },
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": "Please process the embedded resource above."
+                            }
+                        }
+                    ]
+                }));
+            }
+            "test_prompt_with_image" => {
+                return Ok(json!({
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "image",
+                                "data": CONFORMANCE_PNG,
+                                "mimeType": "image/png"
+                            }
+                        },
+                        {
+                            "role": "user",
+                            "content": {
+                                "type": "text",
+                                "text": "Please analyze the image above."
+                            }
+                        }
+                    ]
+                }));
+            }
+            _ => {}
+        }
+    }
     if let Some(skill_name) = name.strip_prefix("skill.") {
         let skill = service
             .db()
@@ -2132,5 +3140,221 @@ mod tests {
         .expect("second");
         assert_eq!(second["result"]["isError"], false, "{second}");
         assert_eq!(second["result"]["resultType"], "complete");
+    }
+
+    fn mrtr_params(extra: Value) -> Value {
+        let mut params = extra;
+        if params.get("_meta").is_none() {
+            params["_meta"] = json!({
+                "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "sampling": {},
+                    "elicitation": {},
+                    "roots": {"listChanged": true}
+                },
+            });
+        }
+        params
+    }
+
+    #[test]
+    fn mrtr_elicitation_retries_and_ignores_extra_keys() {
+        let first = mrtr_tool_call(
+            "test_input_required_result_elicitation",
+            &mrtr_params(json!({})),
+            Era::Modern,
+        )
+        .expect("first");
+        assert_eq!(first["resultType"], "input_required");
+        assert_eq!(
+            first["inputRequests"]["user_name"]["method"],
+            "elicitation/create"
+        );
+        assert!(first.get("requestState").is_none());
+
+        let missing = mrtr_tool_call(
+            "test_input_required_result_elicitation",
+            &mrtr_params(json!({"inputResponses": {"wrong_key": {"action": "accept"}}})),
+            Era::Modern,
+        )
+        .expect("missing");
+        assert_eq!(missing["resultType"], "input_required");
+
+        let complete = mrtr_tool_call(
+            "test_input_required_result_elicitation",
+            &mrtr_params(json!({
+                "inputResponses": {
+                    "user_name": {"action": "accept", "content": {"name": "Alice"}},
+                    "unexpected": {"action": "accept", "content": {"foo": "bar"}}
+                }
+            })),
+            Era::Modern,
+        )
+        .expect("complete");
+        assert_eq!(complete["resultType"], "complete");
+        assert_eq!(complete["content"][0]["text"], "Hello, Alice!");
+
+        let invalid = mrtr_tool_call(
+            "test_input_required_result_elicitation",
+            &mrtr_params(json!({"inputResponses": {"user_name": 42}})),
+            Era::Modern,
+        )
+        .expect("invalid shape re-requests");
+        assert_eq!(invalid["resultType"], "input_required");
+
+        let null = mrtr_tool_call(
+            "test_input_required_result_elicitation",
+            &mrtr_params(json!({"inputResponses": null})),
+            Era::Modern,
+        )
+        .expect_err("null inputResponses is a protocol error");
+        assert_eq!(null.code, -32602);
+    }
+
+    #[test]
+    fn mrtr_request_state_is_signed_and_multi_round_evolves() {
+        let first = mrtr_tool_call(
+            "test_input_required_result_request_state",
+            &mrtr_params(json!({})),
+            Era::Modern,
+        )
+        .expect("first");
+        let state = first["requestState"].as_str().expect("state").to_string();
+        let complete = mrtr_tool_call(
+            "test_input_required_result_request_state",
+            &mrtr_params(json!({
+                "inputResponses": {"confirm": {"action": "accept", "content": {"ok": true}}},
+                "requestState": state
+            })),
+            Era::Modern,
+        )
+        .expect("complete");
+        assert_eq!(complete["resultType"], "complete");
+        assert!(
+            complete["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("state-ok")
+        );
+
+        let tampered_first = mrtr_tool_call(
+            "test_input_required_result_tampered_state",
+            &mrtr_params(json!({})),
+            Era::Modern,
+        )
+        .expect("tampered first");
+        let tampered_state = tampered_first["requestState"]
+            .as_str()
+            .expect("tampered state")
+            .to_string();
+        let rejected = mrtr_tool_call(
+            "test_input_required_result_tampered_state",
+            &mrtr_params(json!({
+                "inputResponses": {"confirm": {"action": "accept", "content": {"ok": true}}},
+                "requestState": format!("{tampered_state}-TAMPERED")
+            })),
+            Era::Modern,
+        )
+        .expect_err("tampered state must be rejected");
+        assert_eq!(rejected.code, -32602);
+
+        let round1 = mrtr_tool_call(
+            "test_input_required_result_multi_round",
+            &mrtr_params(json!({})),
+            Era::Modern,
+        )
+        .expect("round 1");
+        assert_eq!(round1["resultType"], "input_required");
+        let state1 = round1["requestState"]
+            .as_str()
+            .expect("state 1")
+            .to_string();
+        let round2 = mrtr_tool_call(
+            "test_input_required_result_multi_round",
+            &mrtr_params(json!({
+                "inputResponses": {"step1": {"action": "accept", "content": {"name": "Alice"}}},
+                "requestState": state1
+            })),
+            Era::Modern,
+        )
+        .expect("round 2");
+        assert_eq!(round2["resultType"], "input_required");
+        assert!(round2["inputRequests"]["step2"].is_object());
+        let state2 = round2["requestState"].as_str().expect("state 2");
+        assert_ne!(state1, state2);
+        let round3 = mrtr_tool_call(
+            "test_input_required_result_multi_round",
+            &mrtr_params(json!({
+                "inputResponses": {"step2": {"action": "accept", "content": {"color": "blue"}}},
+                "requestState": state2
+            })),
+            Era::Modern,
+        )
+        .expect("round 3");
+        assert_eq!(round3["resultType"], "complete");
+    }
+
+    #[test]
+    fn mrtr_multiple_inputs_capabilities_and_prompt() {
+        let multiple = mrtr_tool_call(
+            "test_input_required_result_multiple_inputs",
+            &mrtr_params(json!({})),
+            Era::Modern,
+        )
+        .expect("multiple");
+        let methods = ["user_name", "greeting", "client_roots"]
+            .iter()
+            .map(|key| multiple["inputRequests"][key]["method"].as_str().unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(methods.len(), 3);
+        let state = multiple["requestState"].as_str().expect("state");
+        let complete = mrtr_tool_call(
+            "test_input_required_result_multiple_inputs",
+            &mrtr_params(json!({
+                "inputResponses": {
+                    "user_name": {"action": "accept", "content": {"name": "Alice"}},
+                    "greeting": {"role": "assistant", "content": {"type": "text", "text": "hi"}},
+                    "client_roots": {"roots": [{"uri": "file:///test/root", "name": "Test Root"}]}
+                },
+                "requestState": state
+            })),
+            Era::Modern,
+        )
+        .expect("multiple complete");
+        assert_eq!(complete["resultType"], "complete");
+
+        let capabilities = mrtr_tool_call(
+            "test_input_required_result_capabilities",
+            &mrtr_params(json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {"sampling": {}}
+                }
+            })),
+            Era::Modern,
+        )
+        .expect("capabilities");
+        assert_eq!(capabilities["resultType"], "input_required");
+        let requests = capabilities["inputRequests"]
+            .as_object()
+            .expect("input requests");
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .values()
+                .all(|request| { request["method"] != "elicitation/create" })
+        );
+
+        let prompt = mrtr_prompt(&mrtr_params(json!({})), Era::Modern).expect("prompt first");
+        assert_eq!(prompt["resultType"], "input_required");
+        let prompt_complete = mrtr_prompt(
+            &mrtr_params(json!({
+                "inputResponses": {"user_context": {"action": "accept", "content": {"context": "test context"}}}
+            })),
+            Era::Modern,
+        )
+        .expect("prompt complete");
+        assert_eq!(prompt_complete["resultType"], "complete");
+        assert!(prompt_complete["messages"].is_array());
     }
 }

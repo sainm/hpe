@@ -45,8 +45,10 @@ HPA_POSTGRES_TEST_URL=postgresql://user@host:5432/db \
 - 同 token 的 A 写入成功，B 的伪造写入失败；B 在租约有效期内无法获取。
 - 短 TTL 过期后 B 接管，token 递增；A 的旧 token 写入失败，B 的新 token 写入成功。
 - 释放后启动节点 C；C 接管过期/空闲会话并把状态改为 interrupted、写入 `agent.interrupted` 事件；A 的 live 会话仍保持 running。
-- 节点 C 通过 HTTP API 创建/发布/运行一个无工具 Agent，运行完成后其会话租约已释放。
+- 节点 C 通过 HTTP API 创建/发布/运行一个包含 `workflow.list` 工具调用的 Agent，运行完成后其会话租约已释放。
 - 终态会话拒绝迟到的 fenced 写入。
+
+工具执行前的续租守卫见 [Phase 22](phase-22-agent-tool-lease.md)。
 - 两节点 SQLite Agent 表保持 0 行。
 
 门禁：当前全量 Rust/Web/Extension/PostgreSQL 结果以 [Phase 13–18 状态台账](../10-quality/phase-13-18-status.md) 为准；PostgreSQL 备份演练覆盖 21 个 migration 与 42 张 `hpa_tenant` + 26 张 `hpa_control` FORCE RLS 表。

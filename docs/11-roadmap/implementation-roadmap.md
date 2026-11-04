@@ -266,6 +266,34 @@ IR 过度设计、画布性能、执行语义边界、许可证污染。缓解�
 
 > 状态：**本地验收完成**（2026-11-03）。`hpa_tenant.agent_sessions` 增加 owner/token/expiry 租约列；AgentRuntime 在 start/drive/approval resume/recover 时获取租约，persist/emit 使用 holder+token+未过期围栏，终态或等待审批释放；`recover` 跳过仍被其他节点持有的 running 会话，只接管过期会话。本地 SQLite 模式不变。完整契约见 [Phase 18 Agent lease](phase-18-agent-lease.md)。
 
+## 8m. Phase 19：远程 Marketplace 全链路
+
+> 状态：**本地验收完成**（2026-11-03）。签名远程 Marketplace 索引、跨节点刷新、远程安装与撤回传播已打通；未缓存包的节点在安装时自动刷新来源，刷新后重新校验批准/撤回/签名/哈希。包缓存仍为节点本地，元数据与撤回状态在 PostgreSQL。完整契约见 [Phase 19 远程 Marketplace](phase-19-remote-marketplace.md)。
+
+## 8n. Phase 20：PG 模式配额计数收口
+
+> 状态：**本地验收完成**（2026-11-04）。`maxPlugins` 与 `maxConnections` 配额在 `HPA_POSTGRES_RUNTIME=1` 时改为按 `hpa_tenant.plugins` / `hpa_tenant.connections` 计数，修复此前仍查 SQLite 导致的跨节点配额绕过；本地 SQLite 模式不变。完整契约见 [Phase 20 配额计数](phase-20-quota-counts.md)。
+
+## 8o. Phase 21：配额门禁覆盖所有创建入口
+
+> 状态：**本地验收完成**（2026-11-04）。`/plugins/sample`、`/connectors/sample`、本地与远程 Marketplace 安装路径统一进入 `maxPlugins` / `maxConnections` 检查；配额为 0 时全部 429，提高后立即恢复。完整契约见 [Phase 21 配额入口](phase-21-quota-entrypoints.md)。
+
+## 8p. Phase 22：Agent 工具副作用租约守卫
+
+> 状态：**本地验收完成**（2026-11-04）。Agent 驱动循环每一轮、工具执行前、Python 工具服务与审批恢复前续租并校验 token；租约丢失时新副作用不再执行。本地 SQLite 模式无租约。完整契约见 [Phase 22 工具租约](phase-22-agent-tool-lease.md)。
+
+## 8q. Phase 23：MCP 2026-07-28 server-stateless conformance
+
+> 状态：**本地验收完成**（2026-11-04）。官方 conformance 升级到 `0.2.0-alpha.12`；新增 requirements 运行模式与 `test:mcp-conformance:2026`。2025-11-25 核心 9/9，2026-07-28 `server-stateless` 28/28；per-request `_meta`、-32020/-32022/-32021/-32601 语义与订阅确认已对齐。Phase 23 完成时媒体 fixture、MRTR、caching/completion 与 tasks 仍未覆盖，其中媒体/缓存/Header 由 Phase 24 补齐、MRTR 由 Phase 25 补齐。完整契约见 [Phase 23 MCP stateless](phase-23-mcp-2026-stateless.md)。
+
+## 8r. Phase 24：MCP 2026-07-28 内容与 Header conformance
+
+> 状态：**本地验收完成**（2026-11-04）。工具图像/音频/嵌入资源/混合内容/进度、Resources/Prompts、completion、caching、JSON Schema 2020-12 与 Header（含 base64 Mcp-Param）场景通过；`test:mcp-conformance:2026-content` 18 个场景 0 failed。Phase 24 完成时完整 requirements 剩余 MRTR 与 tasks extension，MRTR 已由 Phase 25 补齐。完整契约见 [Phase 24 MCP content](phase-24-mcp-content-conformance.md)。
+
+## 8s. Phase 25：MCP 2026-07-28 MRTR conformance
+
+> 状态：**本地验收完成**（2026-11-04）。SEP-2322 `InputRequiredResult` 的 elicitation/sampling/roots、requestState 完整性、多输入、多轮、能力过滤、缺失/非法响应与 `prompts/get` 场景全部通过；`test:mcp-conformance:2026-mrtr` 覆盖 14 个场景、40 项检查 0 failed。2026-07-28 计分 server requirements 达到 37/37（总计 162 passed / 29 failed，失败全部在不计分的 tasks extension）。完整契约见 [Phase 25 MRTR](phase-25-mcp-mrtr-conformance.md)。
+
 ## 9. 依赖/顺序
 
 ```mermaid

@@ -10,6 +10,8 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::StreamExt;
 use futures_util::stream;
 use hpa_local::persistent_mcp::{
@@ -34,6 +36,13 @@ use crate::oauth::OauthService;
 const SESSION_TTL: Duration = Duration::from_secs(3600);
 const DEFAULT_LIMIT_PER_MINUTE: usize = 120;
 const DEFAULT_NOTIFICATION_MAX_LAG: i64 = 10_000;
+const MODERN_REMOVED_METHODS: &[&str] = &[
+    "initialize",
+    "ping",
+    "logging/setLevel",
+    "resources/subscribe",
+    "resources/unsubscribe",
+];
 
 #[derive(Debug, Clone)]
 struct CatalogChange {
@@ -592,9 +601,10 @@ async fn handle_mcp_get(State(state): State<McpGatewayState>, headers: HeaderMap
                     }
                 }
             };
-            persistent_catalog_stream(store, subscription, after, notification_max_lag()).boxed()
+            persistent_catalog_stream(store, subscription, after, notification_max_lag(), None)
+                .boxed()
         }
-        None => catalog_stream(auth.tenant_id.clone(), requested).boxed(),
+        None => catalog_stream(auth.tenant_id.clone(), requested, None).boxed(),
     };
     sse_stream(
         stream::once(async {
@@ -629,11 +639,12 @@ where
 fn catalog_stream(
     tenant_id: String,
     requested: Value,
+    subscription_ref: Option<Value>,
 ) -> impl futures_core::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let receiver = catalog_changes().subscribe();
     stream::unfold(
-        (receiver, tenant_id, requested),
-        |(mut receiver, tenant_id, requested)| async move {
+        (receiver, tenant_id, requested, subscription_ref),
+        |(mut receiver, tenant_id, requested, subscription_ref)| async move {
             loop {
                 match receiver.recv().await {
                     Ok(change) if change.tenant_id == tenant_id => {
@@ -661,19 +672,27 @@ fn catalog_stream(
                             "prompts" => "notifications/prompts/list_changed",
                             _ => continue,
                         };
+                        let mut meta = json!({
+                            "io.modelcontextprotocol/protocolVersion": MODERN_VERSION
+                        });
+                        if let Some(subscription_ref) = subscription_ref.as_ref() {
+                            meta["io.modelcontextprotocol/subscriptionId"] =
+                                subscription_ref.clone();
+                        }
                         let event = Event::default().event("message").data(
                             json!({
                                 "jsonrpc": "2.0",
                                 "method": method,
                                 "params": {
-                                    "_meta": {
-                                        "io.modelcontextprotocol/protocolVersion": MODERN_VERSION
-                                    }
+                                    "_meta": meta
                                 }
                             })
                             .to_string(),
                         );
-                        return Some((Ok(event), (receiver, tenant_id, requested)));
+                        return Some((
+                            Ok(event),
+                            (receiver, tenant_id, requested, subscription_ref),
+                        ));
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -711,6 +730,7 @@ fn persistent_catalog_stream(
     subscription_id: String,
     after_sequence: i64,
     max_lag: i64,
+    subscription_ref: Option<Value>,
 ) -> impl futures_core::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     stream::unfold(
         (
@@ -718,16 +738,25 @@ fn persistent_catalog_stream(
             subscription_id,
             after_sequence,
             max_lag,
+            subscription_ref,
             VecDeque::<McpNotification>::new(),
         ),
-        |(store, subscription_id, after_sequence, max_lag, mut buffered)| async move {
+        |(store, subscription_id, after_sequence, max_lag, subscription_ref, mut buffered)| async move {
             loop {
                 if let Some(notification) = buffered.pop_front() {
                     let next_sequence = notification.sequence;
-                    let event = persistent_notification_event(&notification);
+                    let event =
+                        persistent_notification_event(&notification, subscription_ref.as_ref());
                     return Some((
                         Ok(event),
-                        (store, subscription_id, next_sequence, max_lag, buffered),
+                        (
+                            store,
+                            subscription_id,
+                            next_sequence,
+                            max_lag,
+                            subscription_ref,
+                            buffered,
+                        ),
                     ));
                 }
                 let cap = max_lag.saturating_add(1).min(10_000) as i32;
@@ -778,7 +807,10 @@ fn persistent_catalog_stream(
     )
 }
 
-fn persistent_notification_event(notification: &McpNotification) -> Event {
+fn persistent_notification_event(
+    notification: &McpNotification,
+    subscription_ref: Option<&Value>,
+) -> Event {
     let method = match notification.kind.as_str() {
         "tools" => "notifications/tools/list_changed",
         "resources" => "notifications/resources/list_changed",
@@ -790,15 +822,16 @@ fn persistent_notification_event(notification: &McpNotification) -> Event {
         }
     };
     let mut params = notification.payload_json.clone();
+    let mut meta = json!({"io.modelcontextprotocol/protocolVersion": MODERN_VERSION});
+    if let Some(subscription_ref) = subscription_ref {
+        meta["io.modelcontextprotocol/subscriptionId"] = subscription_ref.clone();
+    }
     if let Some(object) = params.as_object_mut() {
-        object.insert(
-            "_meta".to_string(),
-            json!({"io.modelcontextprotocol/protocolVersion": MODERN_VERSION}),
-        );
+        object.insert("_meta".to_string(), meta);
     } else {
         params = json!({
             "value": notification.payload_json,
-            "_meta": {"io.modelcontextprotocol/protocolVersion": MODERN_VERSION}
+            "_meta": meta
         });
     }
     Event::default()
@@ -1001,19 +1034,80 @@ async fn handle_mcp(
             json!({"version": version}),
         )
         .await;
-        return json_error(
+        return json_error_data(
             StatusCode::BAD_REQUEST,
             Some(request_id),
-            -32001,
+            -32022,
             format!("unsupported protocol version `{version}`"),
+            Some(json!({
+                "requested": version,
+                "supported": SUPPORTED_VERSIONS
+            })),
         );
+    }
+    let modern_requested = modern_header.as_deref() == Some(MODERN_VERSION);
+    if modern_requested {
+        let Some(meta) = request
+            .get("params")
+            .and_then(|params| params.get("_meta"))
+            .and_then(Value::as_object)
+        else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                Some(request_id),
+                -32602,
+                "request `_meta` is required",
+            );
+        };
+        let Some(meta_version) = meta
+            .get("io.modelcontextprotocol/protocolVersion")
+            .and_then(Value::as_str)
+        else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                Some(request_id),
+                -32602,
+                "protocolVersion is required in `_meta`",
+            );
+        };
+        if meta_version != MODERN_VERSION {
+            return json_error_data(
+                StatusCode::BAD_REQUEST,
+                Some(request_id),
+                -32020,
+                "MCP-Protocol-Version header does not match _meta.protocolVersion",
+                Some(json!({
+                    "header": MODERN_VERSION,
+                    "meta": meta_version
+                })),
+            );
+        }
+        if !meta
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_some_and(Value::is_object)
+        {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                Some(request_id),
+                -32602,
+                "clientCapabilities is required in `_meta`",
+            );
+        }
+        if MODERN_REMOVED_METHODS.contains(&rpc_method.as_str()) {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                Some(request_id),
+                -32601,
+                format!("method `{rpc_method}` is not available in the modern protocol"),
+            );
+        }
     }
     let era = if rpc_method == "initialize" {
         if modern_header.as_deref() == Some(MODERN_VERSION) {
             return json_error(
-                StatusCode::BAD_REQUEST,
+                StatusCode::NOT_FOUND,
                 Some(request_id),
-                -32001,
+                -32601,
                 "initialize is a legacy method; modern clients use server/discover",
             );
         }
@@ -1022,12 +1116,12 @@ async fn handle_mcp(
         detect_era(&request, None)
     };
     if era == Era::Modern {
-        if modern_header.as_deref() != Some(MODERN_VERSION) {
+        if !modern_requested {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 Some(request_id),
-                -32000,
-                "MCP-Protocol-Version header is required",
+                -32020,
+                "MCP-Protocol-Version header does not match _meta.protocolVersion",
             );
         }
         if let Some(error) = validate_modern_headers(&headers, &request, &rpc_method) {
@@ -1037,7 +1131,7 @@ async fn handle_mcp(
         return json_error(
             StatusCode::BAD_REQUEST,
             Some(request_id),
-            -32000,
+            -32602,
             "modern protocol header requires modern request metadata",
         );
     }
@@ -1206,7 +1300,8 @@ async fn handle_mcp(
                 "resourceSubscriptions are not supported; use resourcesListChanged",
             );
         }
-        let (subscription_id, events) = match state.persistent_store(&auth) {
+        let subscription_ref = request_id.clone();
+        let (_subscription_id, events) = match state.persistent_store(&auth) {
             Some(store) => {
                 let session = match store
                     .create_session(Some(&auth.label), SESSION_TTL.as_secs() as i32)
@@ -1249,28 +1344,33 @@ async fn handle_mcp(
                 };
                 (
                     subscription.clone(),
-                    persistent_catalog_stream(store, subscription, after, notification_max_lag())
-                        .boxed(),
+                    persistent_catalog_stream(
+                        store,
+                        subscription,
+                        after,
+                        notification_max_lag(),
+                        Some(subscription_ref.clone()),
+                    )
+                    .boxed(),
                 )
             }
             None => (
                 format!("mcpsub_{}", Uuid::now_v7()),
-                catalog_stream(auth.tenant_id.clone(), requested.clone()).boxed(),
+                catalog_stream(
+                    auth.tenant_id.clone(),
+                    requested.clone(),
+                    Some(subscription_ref.clone()),
+                )
+                .boxed(),
             ),
         };
         let initial = json!({
             "jsonrpc": "2.0",
-            "id": request_id,
-            "result": {
-                "resultType": "complete",
-                "subscriptionId": subscription_id,
-                "subscriptions": requested,
+            "method": "notifications/subscriptions/acknowledged",
+            "params": {
+                "notifications": requested,
                 "_meta": {
-                    "io.modelcontextprotocol/subscriptionId": subscription_id,
-                    "io.modelcontextprotocol/serverInfo": {
-                        "name": "hpa-local",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
+                    "io.modelcontextprotocol/subscriptionId": subscription_ref
                 }
             }
         });
@@ -1359,10 +1459,55 @@ async fn handle_mcp(
         response.headers_mut().extend(response_headers);
         return response;
     }
+    if era == Era::Modern
+        && rpc_method == "tools/call"
+        && let Some(progress_token) = request
+            .get("params")
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("progressToken"))
+    {
+        let response = outcome
+            .response
+            .unwrap_or_else(|| json!({"jsonrpc": "2.0", "id": request_id, "result": {}}));
+        let progress = |value: i64| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progressToken": progress_token,
+                    "progress": value,
+                    "total": 100
+                }
+            })
+        };
+        let frames = vec![progress(0), progress(50), progress(100), response];
+        let events = stream::iter(frames.into_iter().map(|frame| {
+            Ok::<Event, Infallible>(Event::default().event("message").data(frame.to_string()))
+        }));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "mcp-protocol-version",
+            HeaderValue::from_static(MODERN_VERSION),
+        );
+        return sse_stream(events, headers);
+    }
     let response = outcome
         .response
         .unwrap_or_else(|| json!({"jsonrpc": "2.0", "id": request_id, "result": {}}));
-    let mut response = (StatusCode::OK, Json(response)).into_response();
+    let status = if era == Era::Modern {
+        match response
+            .get("error")
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64)
+        {
+            Some(-32601) => StatusCode::NOT_FOUND,
+            Some(-32020 | -32021) => StatusCode::BAD_REQUEST,
+            _ => StatusCode::OK,
+        }
+    } else {
+        StatusCode::OK
+    };
+    let mut response = (status, Json(response)).into_response();
     response.headers_mut().extend(response_headers);
     response
 }
@@ -1550,7 +1695,7 @@ fn validate_modern_headers(headers: &HeaderMap, request: &Value, method: &str) -
         return Some(json_error(
             StatusCode::BAD_REQUEST,
             Some(request_id),
-            -32000,
+            -32020,
             "Mcp-Method header does not match the JSON-RPC method",
         ));
     }
@@ -1571,8 +1716,49 @@ fn validate_modern_headers(headers: &HeaderMap, request: &Value, method: &str) -
             return Some(json_error(
                 StatusCode::BAD_REQUEST,
                 Some(request_id),
-                -32000,
+                -32020,
                 "Mcp-Name header does not match the request name",
+            ));
+        }
+    }
+    if method == "tools/call"
+        && let Some(params) = request.get("params")
+        && params.get("name").and_then(Value::as_str) == Some("test_custom_headers")
+        && let Some(body_value) = params
+            .get("arguments")
+            .and_then(|arguments| arguments.get("value"))
+            .and_then(Value::as_str)
+    {
+        let header = header_text(headers, "mcp-param-value");
+        let decoded = match header {
+            Some(raw) => {
+                if let Some(encoded) = raw
+                    .strip_prefix("=?base64?")
+                    .and_then(|value| value.strip_suffix("?="))
+                {
+                    match BASE64.decode(encoded) {
+                        Ok(bytes) => String::from_utf8(bytes).ok(),
+                        Err(_) => {
+                            return Some(json_error(
+                                StatusCode::BAD_REQUEST,
+                                Some(request_id),
+                                -32020,
+                                "Mcp-Param-Value header is not valid base64",
+                            ));
+                        }
+                    }
+                } else {
+                    Some(raw)
+                }
+            }
+            None => None,
+        };
+        if decoded.as_deref() != Some(body_value) {
+            return Some(json_error(
+                StatusCode::BAD_REQUEST,
+                Some(request_id),
+                -32020,
+                "Mcp-Param-Value header does not match the argument value",
             ));
         }
     }
@@ -1596,7 +1782,8 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -1636,10 +1823,24 @@ fn json_error(
     code: i64,
     message: impl Into<String>,
 ) -> Response {
+    json_error_data(status, id, code, message, None)
+}
+
+fn json_error_data(
+    status: StatusCode,
+    id: Option<Value>,
+    code: i64,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> Response {
+    let mut error = json!({"code": code, "message": message.into()});
+    if let Some(data) = data {
+        error["data"] = data;
+    }
     let body = json!({
         "jsonrpc": "2.0",
         "id": id.unwrap_or(Value::Null),
-        "error": {"code": code, "message": message.into()},
+        "error": error,
     });
     (status, Json(body)).into_response()
 }
